@@ -923,9 +923,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     ns = p.parse_args(argv)
     with FakeH3Stack(ns.fault, debug_body=ns.debug_body, host=ns.host) as stack:
-        print(f"webapp   {stack.app_url}\nproxy    {stack.proxy_url}\nproveedor {stack.fake_url}")
+        print(f"webapp     {stack.app_url}\nproxy      {stack.proxy_url}\nproveedor  {stack.fake_url}")
         for fault in ns.fault:
-            print(f"fallo    {fault}: {FAULTS[fault]}")
+            print(f"fallo      {fault}: {FAULTS[fault]}")
         print(f"\nuv run python dev/e2e_h3.py --app-url {stack.app_url} --fake-url {stack.fake_url}", flush=True)
         with contextlib.suppress(KeyboardInterrupt):
             threading.Event().wait()
