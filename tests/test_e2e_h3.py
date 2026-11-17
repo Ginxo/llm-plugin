@@ -435,5 +435,103 @@ class FullRunTest(unittest.TestCase):
             self.assertEqual(e2e_h3.main(argv), 1)
 
 
+class FaultsTest(unittest.TestCase):
+    """Cada fallo inyectado en la pila simulada hace fallar el paso que lo comprueba (código 1)."""
+
+    def run_fault(self, *faults: str, extra: tuple[str, ...] = ()) -> dict[str, dict]:
+        with fake_h3_stack.FakeH3Stack(faults=set(faults)) as stack:
+            code, steps, out = run_e2e(stack, *extra)
+        self.assertEqual(code, 1, out)
+        return steps
+
+    def assert_failed(self, steps: dict[str, dict], prefix: str, *fragments: str) -> None:
+        chosen = {n: s for n, s in steps.items() if n.startswith(prefix)}
+        self.assertTrue(chosen, prefix)
+        for name, step in chosen.items():
+            self.assertEqual(step["status"], "FALLO", f"{name}: {step['detail']}")
+            for fragment in fragments:
+                self.assertIn(fragment, step["detail"], name)
+
+    def assert_ok(self, steps: dict[str, dict], *prefixes: str) -> None:
+        for prefix in prefixes:
+            self.assertEqual(statuses(steps, prefix), {"OK"}, prefix)
+
+    def test_value_in_clear_to_provider(self) -> None:
+        steps = self.run_fault("leak")
+        self.assert_failed(steps, "4.", "en claro")
+        self.assert_failed(steps, "5.", "en claro")
+        self.assert_failed(steps, "10.", "en claro")
+        self.assert_ok(steps, "7.")
+
+    def test_token_not_restored(self) -> None:
+        steps = self.run_fault("no-rehydrate")
+        self.assert_failed(steps, "4.", "[[DNI_001]]")
+        self.assert_failed(steps, "5.", "[[DNI_001]]")
+        self.assert_ok(steps, "7.", "10.")
+
+    def test_responses_full_copies_not_restored(self) -> None:
+        steps = self.run_fault("responses-done-unrestored")
+        for name in ("4.6", "5.6"):
+            self.assert_failed(steps, name, "response.completed", "sin restaurar")
+        self.assert_ok(steps, "4.1", "4.2", "4.3", "4.4", "4.5", "5.1", "5.5")
+
+    def test_invalid_tool_json(self) -> None:
+        steps = self.run_fault("bad-tool-json")
+        for name in ("5.2", "5.3", "5.4", "5.5", "5.6"):
+            self.assert_failed(steps, name, "JSON inválido")
+        self.assert_ok(steps, "4.", "5.1")
+
+    def test_verification_not_clean(self) -> None:
+        steps = self.run_fault("warning")
+        self.assert_failed(steps, "6.", "WARNING")
+        self.assert_ok(steps, "4.", "5.")
+
+    def test_turn_not_in_webapp(self) -> None:
+        steps = self.run_fault("no-trace", extra=("--trace-timeout", "0.3"))
+        self.assert_failed(steps, "6.", "no aparece")
+        self.assert_failed(steps, "8.1", "no aparece")
+        self.assertEqual(statuses(steps, "8.4"), {"SALTADO"})
+
+    def test_ai_ip_off_in_privada(self) -> None:
+        steps = self.run_fault("aiip-off")
+        self.assert_failed(steps, "2a.", "ai_ip_enabled")
+        for prefix in ("4.", "5.", "6.", "8.", "9.", "10."):
+            self.assertEqual(statuses(steps, prefix), {"SALTADO"}, prefix)
+
+    def test_bypass_changes_body(self) -> None:
+        steps = self.run_fault("bypass-mutates")
+        self.assert_failed(steps, "7.", "no es idéntico", "baas_e2e")
+        self.assert_ok(steps, "4.", "5.")
+
+    def test_deleted_conversation_not_blocked(self) -> None:
+        steps = self.run_fault("delete-not-blocking")
+        for name in ("8.1", "8.2", "8.3"):
+            self.assert_failed(steps, name, "se esperaba 403", "el proveedor recibió el turno")
+
+    def test_deleted_conversation_wrong_error(self) -> None:
+        steps = self.run_fault("delete-wrong-code")
+        self.assert_failed(steps, "8.1", "eliminada")
+        self.assert_failed(steps, "8.2", "baas_conversation_deleted")
+        self.assert_failed(steps, "8.3", "baas_conversation_deleted")
+
+    def test_webapp_does_not_delete(self) -> None:
+        steps = self.run_fault("delete-not-removed")
+        self.assert_failed(steps, "8.1", "se esperaba 404")
+
+    def test_blocked_turn_recreates_conversation(self) -> None:
+        steps = self.run_fault("blocked-emits-events")
+        self.assert_ok(steps, "8.1", "8.2", "8.3")
+        self.assert_failed(steps, "8.4", "reaparece")
+
+    def test_fresh_conversation_blocked(self) -> None:
+        steps = self.run_fault("fresh-blocked")
+        self.assert_ok(steps, "8.1", "8.2", "8.3", "8.4")
+        self.assert_failed(steps, "9.", "HTTP 403")
+
+    def test_unknown_fault_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            fake_h3_stack.FakeH3Stack(faults={"no-existe"})
+
+
 if __name__ == "__main__":
     unittest.main()
