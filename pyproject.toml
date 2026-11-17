@@ -36,6 +36,8 @@ ignore = [
 # El plugin lanza procesos a propósito (CLI de Claude Code, intérprete del script verificado)
 "scripts/**" = ["S603", "S607"]
 "tests/**" = ["S105", "S106", "S108", "S603", "S607", "S310"]
+# La prueba de H3 se escribe con `unittest` (biblioteca estándar): sus aserciones son las de TestCase
+"tests/test_e2e_h3.py" = ["PT009", "PT027"]
 "dev/**" = ["S603", "S607", "T201"]
 "tools/**" = ["T201"]
 
