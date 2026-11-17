@@ -159,7 +159,7 @@ class Reply:
 
 
 def _fail_on_error_event(event: Any, where: str) -> None:
-    if isinstance(event, dict) and (event.get("type") in ("error", "response.failed") or "error" in event):
+    if isinstance(event, dict) and (event.get("type") in ("error", "response.failed") or event.get("error")):
         raise StepError(f"{where}: el stream trae un error: {json.dumps(event, ensure_ascii=False)[:300]}")
 
 
@@ -736,7 +736,7 @@ class E2E:
     # 2a y 2b
     def handshake(self, email: str, key: str, org: str, *, ai_ip: bool) -> dict[str, Any]:
         res = http("POST", f"{self.args.app_url}/api/v1/plugin/handshake", headers={"Authorization": f"Bearer {key}"},
-                   timeout=self.args.timeout)  # fmt: skip
+                   payload={}, timeout=self.args.timeout)  # fmt: skip
         check(res.status == 200, f"handshake de {email} → HTTP {res.status}: {snippet(res.body, 200)}")
         orgs = {o.get("slug"): o for o in (res.json() or {}).get("organizations") or [] if isinstance(o, dict)}
         check(org in orgs, f"{email} no tiene la organización «{org}» (¿seed-dev de H3?): {sorted(map(str, orgs))}")

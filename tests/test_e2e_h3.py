@@ -203,6 +203,19 @@ class ExtractReplyTest(unittest.TestCase):
         )
         self.assertTrue(all(where for where, _ in reply.texts))
 
+    def test_error_events_fail_but_null_error_does_not(self) -> None:
+        ok = [{"choices": [{"index": 0, "delta": {"content": RESTORED}}], "error": None}]
+        self.assertEqual(
+            [t for _, t in e2e_h3.extract_reply("chat", sse(ok, named=False), stream=True).texts], [RESTORED]
+        )
+        for api, event in (
+            ("messages", {"type": "error", "error": {"type": "overloaded_error", "message": "x"}}),
+            ("responses", {"type": "response.failed", "response": {"error": {"code": "server_error"}}}),
+            ("chat", {"error": {"message": "x", "type": "server_error"}}),
+        ):
+            with self.assertRaises(e2e_h3.StepError, msg=api):
+                e2e_h3.extract_reply(api, sse([event]), stream=True)
+
     def test_invalid_json_body_raises_step_error(self) -> None:
         with self.assertRaises(e2e_h3.StepError):
             e2e_h3.extract_reply("chat", b"<html>", stream=False)
