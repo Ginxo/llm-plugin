@@ -28,12 +28,29 @@ PROXY_HOST="$(python3 -c 'import sys,urllib.parse as u;print(u.urlsplit(sys.argv
 WORK="$(mktemp -d -t baas-s13-XXXXXX)"
 PY="$(command -v python3)"
 BRIDGE_PID=
+CASE_PGID= # grupo de procesos del caso en curso (unshare, sh, puente interno, timeout y Codex)
+
+kill_case() {
+  [[ -n "$CASE_PGID" ]] || return 0
+  kill -TERM -- "-$CASE_PGID" 2>/dev/null || true
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 -- "-$CASE_PGID" 2>/dev/null || break
+    sleep 0.2
+  done
+  kill -KILL -- "-$CASE_PGID" 2>/dev/null || true
+  CASE_PGID=
+}
 
 cleanup() {
+  kill_case
   [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null || true
   if [[ "${KEEP:-0}" == 1 ]]; then echo "Directorio de trabajo: $WORK"; else rm -rf "$WORK"; fi
 }
+# Ctrl-C o SIGTERM: se sale por la trampa de EXIT, que mata el caso en curso antes de borrar $WORK.
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 KEY="$("$PY" -c 'import base64,hashlib,sys;print("baas_"+base64.urlsafe_b64encode(hashlib.sha256(("baas-dev-key:"+sys.argv[1]).encode()).digest()).rstrip(b"=").decode())' "$EMAIL")"
 FAKE_PROVIDER_KEY="sk-fake-s13-provider-key"
@@ -88,22 +105,25 @@ run_case() {
   mkdir -p "$out"
   before="$(fake_lines)"
   set +e
-  env -i HOME="$WORK/home" CODEX_HOME="$WORK/codex-$name" PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
+  # setsid: el caso corre en su propio grupo de procesos (su PID es el PGID), que se mata entero al
+  # terminar o al interrumpir el script. timeout --foreground deja a Codex en ese mismo grupo.
+  setsid env -i HOME="$WORK/home" CODEX_HOME="$WORK/codex-$name" PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
     BAAS_API_KEY="$KEY" BAAS_FAKE_PROVIDER_KEY="$FAKE_PROVIDER_KEY" \
     unshare -rnm sh -c '
       mount --bind "$4" /etc/hosts
       ip link set lo up
       "$0" "$1" tcp-to-unix "127.0.0.1:$2,[::1]:$2" "$3" 2>/dev/null &
       bridge=$!
+      trap "kill \"\$bridge\" 2>/dev/null" EXIT
       sleep 0.4
       shift 4
-      timeout 120 "$@"
-      rc=$?
-      kill "$bridge" 2>/dev/null
-      exit "$rc"' "$PY" "$REPO/dev/netns_bridge.py" "$PORT" "$WORK/bridge.sock" "$WORK/hosts" \
-    "$CODEX_BIN" exec --skip-git-repo-check --ephemeral --color never -s read-only -C "$proj" \
-    -o "$out/last.txt" "$@" "Responde solo: hola" >"$out/stdout" 2>"$out/stderr" </dev/null
+      timeout --foreground --kill-after=5 120 "$@"' "$PY" "$REPO/dev/netns_bridge.py" "$PORT" "$WORK/bridge.sock" \
+    "$WORK/hosts" "$CODEX_BIN" exec --skip-git-repo-check --ephemeral --color never -s read-only -C "$proj" \
+    -o "$out/last.txt" "$@" "Responde solo: hola" >"$out/stdout" 2>"$out/stderr" </dev/null &
+  CASE_PGID=$!
+  wait "$CASE_PGID"
   local rc=$?
+  kill_case # restos del grupo (p. ej. el binario nativo si timeout solo mató al lanzador de node)
   set -e
   after="$(fake_lines)"
   echo
