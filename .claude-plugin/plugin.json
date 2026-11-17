@@ -1,0 +1,13 @@
+{
+  "name": "baas",
+  "displayName": "BaaS-AI-IP",
+  "version": "0.1.0",
+  "description": "Conecta Claude Code con BaaS-AI-IP: vincula el proyecto a una organización (/baas-init), muestra su estado (/baas-status), enseña al agente a usar el MCP `baas` y ejecuta scripts verificados por hash.",
+  "author": {
+    "name": "BaaS-AI-IP",
+    "url": "https://github.com/baas-ai-ip"
+  },
+  "homepage": "https://github.com/baas-ai-ip/llm-plugin",
+  "repository": "https://github.com/baas-ai-ip/llm-plugin",
+  "keywords": ["baas-ai-ip", "mcp", "knowledge", "proxy"]
+}

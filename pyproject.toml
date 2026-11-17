@@ -1,0 +1,48 @@
+# Solo para desarrollo (tests y lint). El plugin no se instala con pip: Claude Code
+# lo carga desde el marketplace y sus scripts usan únicamente la biblioteca estándar.
+[project]
+name = "baas-llm-plugin"
+version = "0.1.0"
+description = "Plugin de Claude Code para BaaS-AI-IP (skills + scripts Python, solo biblioteca estándar)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pyyaml>=6.0.2",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["scripts", "tests", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PT", "N"]
+ignore = [
+    "S101",   # assert en tests
+    "RUF001", # comillas tipográficas («») en cadenas en español
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# El plugin lanza procesos a propósito (CLI de Claude Code, intérprete del script verificado)
+"scripts/**" = ["S603", "S607"]
+"tests/**" = ["S105", "S106", "S108", "S603", "S607", "S310"]
+"dev/**" = ["S603", "S607", "T201"]
+"tools/**" = ["T201"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts", "dev", "tools"]
+addopts = "-ra --strict-markers"
+markers = [
+    "claude_cli: pruebas con el CLI real de Claude Code en un HOME temporal y sin red (opt-in con BAAS_TEST_CLAUDE_CLI=1)",
+]
