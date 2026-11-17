@@ -1,0 +1,132 @@
+"""Configuración del proyecto (contrato §10): solo ficheros locales, no versionables y en `.gitignore`.
+
+- `.claude/settings.local.json`: bloque `env` con `ANTHROPIC_BASE_URL` y `ANTHROPIC_CUSTOM_HEADERS`
+  (la cabecera `X-Baas-Api-Key` es el único sitio del proyecto donde va la clave; ver docs/spike-s1.md).
+- `.claude/baas.local.json`: organización y URLs devueltas por el handshake (sin secretos).
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from .envfile import atomic_write
+from .errors import ProjectSafetyError
+
+SETTINGS_LOCAL = ".claude/settings.local.json"
+BINDING = ".claude/baas.local.json"
+GITIGNORE_ENTRIES = (SETTINGS_LOCAL, BINDING)
+HEADER_NAME = "X-Baas-Api-Key"
+GITIGNORE_COMMENT = "# BaaS-AI-IP (plugin baas): configuración local con credenciales; no versionar"
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def resolve_project_dir(explicit: str | None, *, cwd: Path) -> Path:
+    """`CLAUDE_PROJECT_DIR` si llega; si no, la raíz del repositorio git; si no, el directorio actual."""
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    res = _git(cwd, "rev-parse", "--show-toplevel")
+    if res is not None and res.returncode == 0 and res.stdout.strip():
+        return Path(res.stdout.strip()).resolve()
+    return cwd.resolve()
+
+
+def check_not_tracked(project: Path) -> None:
+    """Un `.gitignore` no protege un fichero ya versionado: en ese caso no escribimos la clave."""
+    if not project.is_dir():
+        return
+    for rel in GITIGNORE_ENTRIES:
+        res = _git(project, "ls-files", "--error-unmatch", "--", rel)
+        if res is not None and res.returncode == 0:
+            raise ProjectSafetyError(
+                f"`{rel}` está versionado en git; escribir en él podría publicar tu API key.",
+                hint=f"Sácalo del índice con `git rm --cached {rel}` (y haz commit) antes de lanzar /baas-init.",
+            )
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except ValueError as exc:
+        raise ProjectSafetyError(f"{path} no es JSON válido; corrígelo y vuelve a lanzar /baas-init.") from exc
+    if not isinstance(data, dict):
+        raise ProjectSafetyError(f"{path} no contiene un objeto JSON.")
+    return data
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> bool:
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, content)
+    return True
+
+
+def merge_custom_headers(existing: str | None, api_key: str) -> str:
+    """Sustituye la línea `X-Baas-Api-Key` y conserva las demás cabeceras del usuario."""
+    keep = [
+        line
+        for line in (existing or "").split("\n")
+        if line.strip() and line.split(":", 1)[0].strip().lower() != HEADER_NAME.lower()
+    ]
+    return "\n".join([*keep, f"{HEADER_NAME}: {api_key}"])
+
+
+def write_settings_local(project: Path, proxy_anthropic_url: str, api_key: str) -> bool:
+    path = project / SETTINGS_LOCAL
+    data = _load_json(path)
+    env = data.get("env")
+    if env is None:
+        env = {}
+    if not isinstance(env, dict):
+        raise ProjectSafetyError(f"El bloque `env` de {path} no es un objeto JSON.")
+    env["ANTHROPIC_BASE_URL"] = proxy_anthropic_url
+    env["ANTHROPIC_CUSTOM_HEADERS"] = merge_custom_headers(env.get("ANTHROPIC_CUSTOM_HEADERS"), api_key)
+    data["env"] = env
+    return _write_json(path, data)
+
+
+def _present(lines: list[str], entry: str) -> bool:
+    variants = {entry, "/" + entry, "**/" + entry}
+    return any(line.strip() in variants for line in lines)
+
+
+def ensure_gitignore(project: Path) -> list[str]:
+    path = project / ".gitignore"
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = text.splitlines()
+    missing = [e for e in GITIGNORE_ENTRIES if not _present(lines, e)]
+    if not missing:
+        return []
+    if text and not text.endswith("\n"):
+        text += "\n"
+    block = ([GITIGNORE_COMMENT] if GITIGNORE_COMMENT not in lines else []) + missing
+    path.write_text(text + "\n".join(block) + "\n", encoding="utf-8")
+    return missing
+
+
+def write_binding(project: Path, binding: dict[str, Any]) -> bool:
+    return _write_json(project / BINDING, binding)
+
+
+def read_binding(project: Path) -> dict[str, Any] | None:
+    path = project / BINDING
+    if not path.exists():
+        return None
+    return _load_json(path)
+
+
+def read_settings_env(project: Path) -> dict[str, Any]:
+    env = _load_json(project / SETTINGS_LOCAL).get("env")
+    return env if isinstance(env, dict) else {}

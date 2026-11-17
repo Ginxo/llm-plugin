@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: La etiqueta coincide con la versión de plugin.json
+        run: uv run --locked --python 3.13 python tools/lint_skills.py --expect-version "${GITHUB_REF_NAME#v}"
+      - name: Tests
+        run: |
+          uv run --locked --python 3.10 pytest
+          uv run --locked --python 3.13 pytest
+      - name: Paquete del plugin
+        run: git archive --format=zip --prefix=baas/ -o "baas-plugin-${GITHUB_REF_NAME}.zip" "$GITHUB_REF_NAME" .claude-plugin skills scripts README.md
+      - name: Publicar la release (sin despliegue: llega a los usuarios por el marketplace)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "baas-plugin-${GITHUB_REF_NAME}.zip" --verify-tag --generate-notes --title "baas $GITHUB_REF_NAME"

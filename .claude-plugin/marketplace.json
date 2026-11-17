@@ -1,0 +1,15 @@
+{
+  "name": "baas-ai-ip",
+  "description": "Marketplace de BaaS-AI-IP para Claude Code",
+  "owner": {
+    "name": "BaaS-AI-IP",
+    "url": "https://github.com/baas-ai-ip"
+  },
+  "plugins": [
+    {
+      "name": "baas",
+      "source": "./",
+      "description": "Plugin de BaaS-AI-IP: /baas-init, /baas-status, skill baas-brain y ejecutor de scripts del MCP"
+    }
+  ]
+}
