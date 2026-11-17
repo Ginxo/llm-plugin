@@ -318,7 +318,7 @@ queda una organización `e2e-<ejecución>` que se puede bloquear y eliminar a ma
 | :--- | :--- |
 | Utilidades puras (SSE, comprobaciones de contenido, cliente WebSocket, inspector) | **Ejecutado**: `tests/test_e2e_h4.py` (la CI) |
 | Recorrido completo contra `dev/fake_h4_stack.py` (webapp, proxy, MCP y proveedor simulados) | **Ejecutado**: todos los pasos en verde con el cuerpo del proveedor guardado como objeto y como texto, y dos ejecuciones seguidas |
-| Cada fallo inyectable de la pila simulada (30) detectado por el paso que le corresponde | **Ejecutado** (tabla de abajo) |
+| Cada fallo inyectable de la pila simulada (31) detectado por el paso que le corresponde | **Ejecutado** (tabla de abajo) |
 | Contra la pila real de H4 (`h4-int`): proxy real con el modo observación y el estado por conversación, webapp real con el interruptor, la eliminación, la vista del PLATFORM_ADMIN y el WebSocket, MCP real con la cuarentena, vault y Redis reales | **No ejecutado.** Lo hace el coordinador en C2. Los pasos 5, 6, 7, 8 y 9 dependen de los cuatro componentes |
 | La interfaz web (W3, W7, W8, W11 en el navegador, en `es` y `en`) y «el PLATFORM_ADMIN no ve el contenido **por la UI**» | **Fuera de esta prueba.** La UI pinta lo que devuelve la API que se comprueba aquí (`content_available`); el recorrido en el navegador es de C2 |
 | Claude Code real y Codex real | Fuera de esta prueba (prueba manual del usuario, C2; `docs/codex.md`) |
