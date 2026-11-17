@@ -802,6 +802,8 @@ class E2EH4:
         if item is None:
             return [*problems, f"{case.label}: el PLATFORM_ADMIN no ve la conversación en la lista"]
         cid = str(item["id"])
+        if item.get("content_available") not in (None, False):
+            problems.append(f"{case.label}: la lista dice content_available = {item.get('content_available')!r}")
         if item.get("originals") not in (None, "LOCKED"):
             problems.append(f"{case.label}: originals = {item.get('originals')!r} (se esperaba LOCKED)")
         detail = self.webapp("GET", f"/api/v1/conversations/{cid}", who)

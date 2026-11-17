@@ -501,6 +501,7 @@ class StackState:
             "status": "ACTIVE", "turn_count": len(conv.turns), "verification_status": conv.verification_status,
             "originals": "OWN" if self.content_mode(viewer, conv) == "OWN" else "LOCKED",
         }  # fmt: skip
+        data["content_available"] = self.content_mode(viewer, conv) == "OWN" or self.admin_content(conv)
         if "no-cause" not in self.faults:
             data["anonymizer_enabled"] = conv.anonymizer
         return data
