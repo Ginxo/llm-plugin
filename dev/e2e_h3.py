@@ -29,12 +29,14 @@ plugin. `dev/fake_h3_stack.py` simula la pila para probar este script sin ella.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import secrets
 import string
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Sequence
@@ -500,6 +502,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=f"APIs que se prueban, separadas por comas: {', '.join(APIS)} (todas)")  # fmt: skip
     p.add_argument("--trace-timeout", type=float, default=30, help="Segundos de espera de cada traza en la webapp")
     p.add_argument("--settle", type=float, default=2, help="Segundos de espera antes de comprobar que nada reaparece")
+    p.add_argument("--purge-wait", type=float, default=1,
+                   help="Segundos entre el borrado y el turno siguiente (purga por Pub/Sub)")  # fmt: skip
     p.add_argument("--timeout", type=float, default=60, help="Tiempo máximo de cada petición HTTP")
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
@@ -541,3 +545,482 @@ def http(
             return Http(resp.status, list(resp.headers.items()), resp.read())
     except urllib.error.HTTPError as exc:
         return Http(exc.code, list(exc.headers.items()) if exc.headers else [], exc.read() or b"")
+
+
+def first_difference(expected: Any, received: Any, path: str = "$") -> str | None:
+    """Primera diferencia entre dos valores JSON (`None` si son idénticos, sin confundir tipos)."""
+    if type(expected) is not type(received):
+        return f"{path}: {canonical(expected)[:80]} ≠ {canonical(received)[:80]}"
+    if isinstance(expected, dict):
+        for key in sorted(expected.keys() | received.keys()):
+            if key not in received:
+                return f"{path}.{key}: falta en lo recibido"
+            if key not in expected:
+                return f"{path}.{key}: sobra en lo recibido ({canonical(received[key])[:80]})"
+            diff = first_difference(expected[key], received[key], f"{path}.{key}")
+            if diff:
+                return diff
+        return None
+    if isinstance(expected, list):
+        if len(expected) != len(received):
+            return f"{path}: {len(expected)} elementos ≠ {len(received)}"
+        for i, (a, b) in enumerate(zip(expected, received, strict=True)):
+            diff = first_difference(a, b, f"{path}[{i}]")
+            if diff:
+                return diff
+        return None
+    return None if expected == received else f"{path}: {canonical(expected)[:80]} ≠ {canonical(received)[:80]}"
+
+
+def verification_problems(verification: Any) -> list[str]:
+    """Lo que impide dar por buena la verificación de un turno con los tres valores (contrato §5.2)."""
+    if not isinstance(verification, dict):
+        return [f"el turno no tiene verificación ({verification!r})"]
+    problems = []
+    if verification.get("status") != "CLEAN":
+        problems.append(f"verification.status = {verification.get('status')} (se esperaba CLEAN)")
+    for name in ("request_replacements_by_type", "response_replacements_by_type"):
+        counts = verification.get(name) or {}
+        missing = [kind for kind in VALUES if not (isinstance(counts, dict) and counts.get(kind))]
+        if missing:
+            problems.append(f"{name} sin {', '.join(missing)}: {counts}")
+    for name in ("unresolved_response_tokens", "orphan_request_tokens"):
+        if verification.get(name):
+            problems.append(f"{name} = {verification.get(name)}")
+    if verification.get("residual_matches"):
+        problems.append(f"residual_matches = {verification.get('residual_matches')}")
+    return problems
+
+
+def snippet(body: bytes, limit: int = 300) -> str:
+    return repr(body[:limit].decode(errors="replace"))
+
+
+# --- la prueba ------------------------------------------------------------------------------------
+
+
+@dataclass
+class Case:
+    group: str  # texto · herramienta · bypass · borrado
+    api: str
+    stream: bool
+    tag: str
+    model: str
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def label(self) -> str:
+        return f"{API_NAMES[self.api]} · {mode_name(self.stream)} · {self.group}"
+
+
+def mode_name(stream: bool) -> str:
+    return "streaming" if stream else "sin streaming"
+
+
+def webapp_login(app_url: str, email: str, password: str, totp_secret: str, timeout: float) -> str:
+    """Cookie `baas_session`: contraseña y, si la webapp lo pide, TOTP (como en `dev/e2e_h2.py`)."""
+    hdrs = {"X-Requested-With": "baas-webapp"}
+    res = http("POST", f"{app_url}/api/v1/auth/login", headers=hdrs,
+               payload={"email": email, "password": password}, timeout=timeout)  # fmt: skip
+    check(res.status == 200, f"login de {email} → HTTP {res.status}: {snippet(res.body, 200)}")
+    cookies = cookies_from(res.headers)
+    if "baas_session" in cookies:  # BAAS_DEV_SKIP_TOTP=1
+        return cookies["baas_session"]
+    check("baas_mfa" in cookies, f"login sin cookie de MFA ni de sesión: {snippet(res.body, 200)}")
+    for attempt in range(2):
+        r = http("POST", f"{app_url}/api/v1/auth/totp", headers={**hdrs, "Cookie": f"baas_mfa={cookies['baas_mfa']}"},
+                 payload={"code": totp(totp_secret)}, timeout=timeout)  # fmt: skip
+        session = cookies_from(r.headers).get("baas_session")
+        if r.status == 200 and session:
+            return session
+        if attempt == 0:  # el código ya se usó en esta ventana: se espera a la siguiente
+            time.sleep(31 - time.time() % 30)
+    raise StepError(f"TOTP rechazado: HTTP {r.status} {snippet(r.body, 200)}")
+
+
+class E2E:
+    def __init__(self, args: argparse.Namespace, nonce: str | None = None) -> None:
+        self.args = args
+        self.nonce = nonce or new_nonce()
+        self.key = dev_api_key(args.email)
+        self.bypass_key = dev_api_key(args.bypass_email)
+        self.binding: dict[str, Any] = {}
+        self.bypass_binding: dict[str, Any] = {}
+        self.session: str | None = None
+        self.sent: list[Case] = []  # casos de AI-IP que el proxy respondió con 200
+        self.deleted: dict[str, Case] = {}  # conversación borrada → su primer turno
+        self.delete_cases: dict[str, tuple[Case, str]] = {}  # API → (primer turno, conversación borrada)
+
+    # utilidades
+    def case(self, group: str, api: str, stream: bool) -> Case:
+        mode = "stream" if stream else "json"
+        return Case(
+            group, api, stream, case_tag(self.nonce, group, api, mode), case_model(self.nonce, group, api, mode)
+        )
+
+    def send(self, binding: dict[str, Any], key: str, api: str, payload: dict[str, Any]) -> tuple[bytes, Http]:
+        headers = {"X-Baas-Api-Key": key}
+        if api == "messages":
+            headers |= {"x-api-key": FAKE_ANTHROPIC_KEY, "anthropic-version": "2023-06-01"}
+        else:
+            headers["Authorization"] = f"Bearer {FAKE_OPENAI_KEY}"
+        if payload.get("stream"):
+            headers["Accept"] = "text/event-stream"
+        raw = encode(payload)
+        return raw, http("POST", api_url(binding, api), headers=headers, data=raw, timeout=self.args.timeout)
+
+    def debug_entries(self) -> list[dict[str, Any]]:
+        res = http("GET", f"{self.args.fake_url}/_debug/requests", timeout=self.args.timeout)
+        check(res.status == 200, f"GET {self.args.fake_url}/_debug/requests → HTTP {res.status}")
+        data = res.json()
+        check(
+            isinstance(data, dict) and isinstance(data.get("requests"), list), f"forma inesperada: {snippet(res.body)}"
+        )
+        return [e for e in data["requests"] if isinstance(e, dict)]
+
+    def webapp(self, path: str) -> Http:
+        return http("GET", f"{self.args.app_url}{path}", headers={"Cookie": f"baas_session={self.session}"},
+                    timeout=self.args.timeout)  # fmt: skip
+
+    def conversations(self) -> list[dict[str, Any]]:
+        res = self.webapp(f"/api/v1/conversations?org={self.args.org}&q={self.nonce}&limit=200")
+        check(res.status == 200, f"GET /api/v1/conversations → HTTP {res.status}: {snippet(res.body, 200)}")
+        return [i for i in (res.json() or {}).get("items") or [] if isinstance(i, dict)]
+
+    def wait_conversation(self, model: str, *, exclude: Iterable[str] = ()) -> dict[str, Any]:
+        """La conversación de `model` con al menos un turno (y que no esté en `exclude`)."""
+        skip = set(exclude)
+        deadline = time.monotonic() + self.args.trace_timeout
+        while True:
+            for item in self.conversations():
+                if item.get("model") == model and (item.get("turn_count") or 0) >= 1 and item.get("id") not in skip:
+                    return item
+            if time.monotonic() > deadline:
+                raise StepError(f"la conversación ({model}) no aparece en GET /api/v1/conversations"
+                                f" tras {self.args.trace_timeout:g} s")  # fmt: skip
+            time.sleep(0.25)
+
+    def provider_problems(self, case: Case) -> list[str]:
+        """Lo que recibió el proveedor para `case`: solo tokens, ningún valor."""
+        entries = tagged(self.debug_entries(), case.tag)
+        if not entries:
+            return [f"el proveedor no recibió la petición (ninguna en /_debug/requests con «{case.tag}»)"]
+        problems = []
+        for entry in entries:
+            text, path = debug_text(entry), str(entry.get("path"))
+            if not path.split("?")[0].endswith(UPSTREAM_PATHS[case.api]):
+                problems.append(f"el proveedor la recibió en {path} (se esperaba {UPSTREAM_PATHS[case.api]})")
+            leaked = [f"{kind} «{value}»" for kind, value in VALUES.items() if value in text]
+            if leaked:
+                problems.append(f"el proveedor recibió en claro: {', '.join(leaked)}")
+            missing = [token for token in TOKENS if token not in text]
+            if missing:
+                problems.append(f"el proveedor no recibió {', '.join(missing)}")
+        return problems
+
+    # 0
+    def webapp_up(self) -> str:
+        res = http("GET", f"{self.args.app_url}/healthz", timeout=self.args.timeout)
+        check(res.status == 200, f"GET {self.args.app_url}/healthz → HTTP {res.status}")
+        return f"{self.args.app_url} responde"
+
+    # 1
+    def fake_debug(self) -> str:
+        before = self.debug_entries()
+        res = http("DELETE", f"{self.args.fake_url}/_debug/requests", timeout=self.args.timeout)
+        check(200 <= res.status < 300, f"DELETE {self.args.fake_url}/_debug/requests → HTTP {res.status}")
+        after = self.debug_entries()
+        check(not after, f"tras vaciarlo, /_debug/requests aún tiene {len(after)} petición(es)")
+        return f"{self.args.fake_url}/_debug/requests responde; vaciado ({len(before)} petición(es) previas)"
+
+    # 2a y 2b
+    def handshake(self, email: str, key: str, org: str, *, ai_ip: bool) -> dict[str, Any]:
+        res = http("POST", f"{self.args.app_url}/api/v1/plugin/handshake", headers={"Authorization": f"Bearer {key}"},
+                   timeout=self.args.timeout)  # fmt: skip
+        check(res.status == 200, f"handshake de {email} → HTTP {res.status}: {snippet(res.body, 200)}")
+        orgs = {o.get("slug"): o for o in (res.json() or {}).get("organizations") or [] if isinstance(o, dict)}
+        check(org in orgs, f"{email} no tiene la organización «{org}» (¿seed-dev de H3?): {sorted(map(str, orgs))}")
+        binding = orgs[org]
+        check(binding.get("ai_ip_enabled") is ai_ip,
+              f"ai_ip_enabled = {binding.get('ai_ip_enabled')!r} en «{org}» (se esperaba {ai_ip})")  # fmt: skip
+        check(binding.get("proxy_anthropic_url") and binding.get("proxy_openai_url"), f"sin URLs del proxy: {binding}")
+        return override_proxy(binding, self.args.proxy_url) if self.args.proxy_url else binding
+
+    def handshake_privacy(self) -> str:
+        a = self.args
+        self.binding = self.handshake(a.email, self.key, a.org, ai_ip=True)
+        return (
+            f"«{a.org}» con AI-IP activo · {self.binding['proxy_anthropic_url']} · {self.binding['proxy_openai_url']}"
+        )
+
+    def handshake_bypass(self) -> str:
+        a = self.args
+        self.bypass_binding = self.handshake(a.bypass_email, self.bypass_key, a.bypass_org, ai_ip=False)
+        b = self.bypass_binding
+        return f"«{a.bypass_org}» con AI-IP apagado · {b['proxy_anthropic_url']} · {b['proxy_openai_url']}"
+
+    # 3
+    def login(self) -> str:
+        a = self.args
+        self.session = webapp_login(a.app_url, a.admin_email, a.password, a.totp_secret, a.timeout)
+        return f"sesión de {a.admin_email} iniciada"
+
+    # 4 y 5
+    def aiip_case(self, api: str, stream: bool, tool: bool) -> str:
+        case = self.case("herramienta" if tool else "texto", api, stream)
+        text = f"{case.tag}. {SENSITIVE_TEXT}." + (f" Por favor, {TOOL_TRIGGER} {TOOL_NAME}." if tool else "")
+        case.payload = request_body(api, case.model, text, stream=stream, tool=tool)
+        _, res = self.send(self.binding, self.key, api, case.payload)
+        check(res.status == 200, f"{API_NAMES[api]} → HTTP {res.status}: {snippet(res.body)}")
+        self.sent.append(case)
+        problems: list[str] = []
+        ctype = next((v for k, v in res.headers if k.lower() == "content-type"), "")
+        if stream and "text/event-stream" not in ctype:
+            problems.append(f"Content-Type {ctype!r} en una respuesta en streaming")
+        body = res.body.decode(errors="replace")
+        if "[[" in body:
+            at = body.index("[[")
+            problems.append(f"el cuerpo de la respuesta contiene «[[»: {body[max(0, at - 20) : at + 30]!r}")
+        reply = extract_reply(api, res.body, stream=stream)
+        if tool:
+            calls = [c for c in reply.tool_calls if c.name == TOOL_NAME]
+            if not calls:
+                problems.append(f"no hay llamada a la herramienta {TOOL_NAME}: {[c.name for c in reply.tool_calls]}")
+            problems += [f"{c.where}: {p}" for c in calls for p in tool_problems(c.arguments)]
+            problems += [f"{where}: queda «[[» en el texto" for where, t in reply.texts if "[[" in t]
+            copies = [c.where for c in calls]
+        else:
+            if not reply.texts:
+                problems.append("la respuesta no trae texto")
+            problems += [f"{where}: {p}" for where, t in reply.texts for p in restoration_problems(t)]
+            copies = [where for where, _ in reply.texts]
+        problems += self.provider_problems(case)
+        check(not problems, "\n".join(problems))
+        what = "argumentos de la herramienta restaurados y JSON válido" if tool else "texto restaurado"
+        return (
+            f"{what} en {len(copies)} copia(s): {', '.join(copies)}\n"
+            f"el proveedor recibió {', '.join(TOKENS)} y ninguno de los valores"
+        )
+
+    # 6
+    def verification(self) -> str:
+        check(self.sent, "ningún caso de AI-IP llegó a responder 200")
+        ready = lambda item: item and (item.get("turn_count") or 0) >= 1 and item.get("verification_status")  # noqa: E731
+        deadline = time.monotonic() + self.args.trace_timeout
+        while True:
+            items = {i.get("model"): i for i in self.conversations()}
+            if all(ready(items.get(c.model)) for c in self.sent) or time.monotonic() > deadline:
+                break
+            time.sleep(0.25)
+        problems: list[str] = []
+        for case in self.sent:
+            item = items.get(case.model)
+            if item is None:
+                problems.append(f"{case.label}: la conversación no aparece en GET /api/v1/conversations")
+                continue
+            if item.get("ai_ip_enabled") is not True:
+                problems.append(f"{case.label}: ai_ip_enabled = {item.get('ai_ip_enabled')!r}")
+            if item.get("verification_status") != "CLEAN":
+                problems.append(f"{case.label}: verificación {item.get('verification_status')} (se esperaba CLEAN)")
+            problems += [f"{case.label}: {p}" for p in verification_problems(self.last_turn(str(item.get("id"))))]
+        check(not problems, "\n".join(problems))
+        return f"{len(self.sent)} turno(s) CLEAN con reemplazos de DNI, EMAIL e IBAN en la ida y en la vuelta"
+
+    def last_turn(self, conversation_id: str) -> Any:
+        res = self.webapp(f"/api/v1/conversations/{conversation_id}")
+        check(res.status == 200, f"GET /api/v1/conversations/{conversation_id} → HTTP {res.status}")
+        turns = [t for t in (res.json() or {}).get("turns") or [] if isinstance(t, dict)]
+        check(turns, f"la conversación {conversation_id} no tiene turnos")
+        index = max(int(t.get("turn_index") or 0) for t in turns)
+        res = self.webapp(f"/api/v1/conversations/{conversation_id}/turns/{index}")
+        check(res.status == 200, f"GET …/{conversation_id}/turns/{index} → HTTP {res.status}")
+        return (res.json() or {}).get("verification")
+
+    # 7
+    def bypass_case(self, api: str, stream: bool) -> str:
+        case = self.case("bypass", api, stream)
+        case.payload = request_body(api, case.model, f"{case.tag}. {SENSITIVE_TEXT}.", stream=stream)
+        raw, res = self.send(self.bypass_binding, self.bypass_key, api, case.payload)
+        check(res.status == 200, f"{API_NAMES[api]} → HTTP {res.status}: {snippet(res.body)}")
+        entries = tagged(self.debug_entries(), case.tag)
+        check(entries, f"el proveedor no recibió la petición (ninguna en /_debug/requests con «{case.tag}»)")
+        problems, exact = [], True
+        for entry in entries:
+            same, byte_same = same_payload(raw, entry.get("body"))
+            exact = exact and byte_same
+            if not same:
+                received = entry.get("body")
+                with contextlib.suppress(ValueError):
+                    received = json.loads(received) if isinstance(received, str) else received
+                diff = first_difference(json.loads(raw), received)
+                problems.append(f"lo que recibió el proveedor no es idéntico a lo enviado: {diff}")
+        reply = extract_reply(api, res.body, stream=stream)
+        if not any(all(v in t for v in VALUES.values()) for _, t in reply.texts):
+            problems.append("la respuesta no trae el eco con los valores")
+        check(not problems, "\n".join(problems))
+        how = "byte a byte" if exact else "como JSON (el proveedor no guarda los bytes exactos)"
+        return f"el proveedor recibió exactamente lo que envió el cliente ({how})"
+
+    # 8
+    def deletion(self, api: str) -> str:
+        case = self.case("borrado", api, False)
+        first = f"{case.tag}. {SENSITIVE_TEXT}."
+        case.payload = request_body(api, case.model, first)
+        _, res = self.send(self.binding, self.key, api, case.payload)
+        check(res.status == 200, f"primer turno → HTTP {res.status}: {snippet(res.body)}")
+        reply = extract_reply(api, res.body, stream=False)
+        answer = reply.texts[0][1] if reply.texts else ""
+        check(answer, f"el primer turno no trae texto: {snippet(res.body)}")
+        conversation_id = str(self.wait_conversation(case.model)["id"])
+
+        deleted = http("POST", f"{self.args.app_url}/api/v1/conversations/{conversation_id}/delete",
+                       headers={"Cookie": f"baas_session={self.session}", "X-Requested-With": "baas-webapp"},
+                       payload={"reason": "Prueba de punta a punta de AI-IP (H3): borrado"},
+                       timeout=self.args.timeout)  # fmt: skip
+        check(
+            deleted.status == 200, f"POST …/{conversation_id}/delete → HTTP {deleted.status}: {snippet(deleted.body)}"
+        )
+        propagated = (deleted.json() or {}).get("propagated")
+        check(isinstance(propagated, bool), f"la respuesta del borrado no trae «propagated»: {snippet(deleted.body)}")
+        gone = self.webapp(f"/api/v1/conversations/{conversation_id}")
+        check(gone.status == 404, f"tras borrarla, GET /api/v1/conversations/{conversation_id} → HTTP {gone.status}"
+                                  " (se esperaba 404)")  # fmt: skip
+        self.deleted[conversation_id] = case
+        self.delete_cases[api] = (case, conversation_id)
+        time.sleep(self.args.purge_wait)  # conversation.purge llega al proxy por Pub/Sub, sin esperar respuesta
+
+        tag2 = case_tag(self.nonce, "continua", api, "json")
+        follow = f"{tag2}. Sigue con la conversación."
+        if api == "responses":
+            check(reply.response_id, f"la respuesta de Responses no trae «id»: {snippet(res.body)}")
+            payload = request_body(api, case.model, follow, previous_response_id=reply.response_id)
+            history = f"previous_response_id {reply.response_id}"
+        else:
+            past = [{"role": "user", "content": first}, {"role": "assistant", "content": answer}]
+            payload = request_body(api, case.model, follow, history=past)
+            history = "historial con la respuesta anterior"
+        _, blocked = self.send(self.binding, self.key, api, payload)
+        etype, code, message = provider_error(blocked.body)
+        problems = []
+        if blocked.status != 403:
+            hint = f" (si el proxy aún no había aplicado la purga, sube --purge-wait de {self.args.purge_wait:g} s)"
+            problems.append(
+                f"el turno con historial → HTTP {blocked.status} (se esperaba 403): {snippet(blocked.body, 200)}"
+                + (hint if blocked.status == 200 else "")
+            )
+        if etype != "permission_error":
+            problems.append(f"error.type = {etype!r} (se esperaba permission_error)")
+        if api == "messages" and "eliminada" not in message:
+            problems.append(f"el mensaje de error no dice que la conversación fue eliminada: {message!r}")
+        if api != "messages" and code != "baas_conversation_deleted":
+            problems.append(f"error.code = {code!r} (se esperaba baas_conversation_deleted)")
+        if tagged(self.debug_entries(), tag2):
+            problems.append("el proveedor recibió el turno de la conversación borrada")
+        check(not problems, "\n".join(problems))
+        shown = f"{etype} · {code}" if code else f"{etype} «{message}»"
+        return (
+            f"conversación {conversation_id} borrada (propagated: {str(propagated).lower()}) y 404 en la webapp\n"
+            f"turno siguiente ({history}) → 403 {shown}; no llegó al proveedor"
+        )
+
+    def nothing_reappears(self) -> str:
+        time.sleep(self.args.settle)
+        listed = {str(i.get("id")) for i in self.conversations()}
+        problems = []
+        for conversation_id in self.deleted:
+            res = self.webapp(f"/api/v1/conversations/{conversation_id}")
+            if res.status != 404 or conversation_id in listed:
+                problems.append(f"la conversación borrada {conversation_id} reaparece en la webapp (HTTP {res.status})")
+        check(not problems, "\n".join(problems))
+        return f"{len(self.deleted)} conversación(es) borrada(s) siguen sin aparecer {self.args.settle:g} s después"
+
+    # 9
+    def fresh_after_delete(self, api: str) -> str:
+        case, deleted_id = self.delete_cases[api]
+        _, res = self.send(self.binding, self.key, api, case.payload)
+        check(res.status == 200, f"el primer mensaje sin historial → HTTP {res.status}"
+                                 f" (una conversación nueva no se bloquea): {snippet(res.body, 200)}")  # fmt: skip
+        reply = extract_reply(api, res.body, stream=False)
+        problems = [f"{where}: {p}" for where, t in reply.texts for p in restoration_problems(t)]
+        check(reply.texts and not problems, "\n".join(problems) or "la respuesta no trae texto")
+        item = self.wait_conversation(case.model, exclude=[deleted_id])
+        return f"200 con los valores restaurados; conversación nueva {item['id']} (la borrada era {deleted_id})"
+
+    # 10
+    def no_values_in_clear(self) -> str:
+        entries = self.debug_entries()
+        marker = f"caso-{self.nonce}-bypass-"
+        checked = [e for e in entries if marker not in debug_text(e)]
+        leaks = []
+        for entry in checked:
+            found = [f"{kind} «{value}»" for kind, value in VALUES.items() if value in debug_text(entry)]
+            if found:
+                leaks.append(f"{entry.get('path')}: {', '.join(found)} en claro")
+        check(not leaks, "\n".join(leaks))
+        apart = len(entries) - len(checked)
+        return f"{len(checked)} petición(es) revisada(s) sin valores en claro ({apart} de bypass aparte)"
+
+    def run(self, runner: Runner) -> None:
+        a = self.args
+        groups = set(a.only)
+        privacy = bool(groups & {"aiip", "borrado"})
+        s0, s1 = "0. webapp accesible", "1. proveedor falso: /_debug/requests"
+        s2a = f"2a. handshake de {a.email} ({a.org}, AI-IP activo)"
+        s2b = f"2b. handshake de {a.bypass_email} ({a.bypass_org}, AI-IP apagado)"
+        s3 = f"3. sesión en la webapp como {a.admin_email}"
+        runner.step(s0, self.webapp_up)
+        runner.step(s1, self.fake_debug)
+        if privacy:
+            runner.step(s2a, self.handshake_privacy, needs=[s0])
+        if "bypass" in groups:
+            runner.step(s2b, self.handshake_bypass, needs=[s0])
+        if privacy:
+            runner.step(s3, self.login, needs=[s0])
+        cases = [(api, stream) for api in APIS for stream in (False, True)]
+        if "aiip" in groups:
+            for number, tool in ((4, False), (5, True)):
+                kind = "AI-IP con herramienta" if tool else "AI-IP texto"
+                for i, (api, stream) in enumerate(cases, 1):
+                    if api in a.apis:
+                        name = f"{number}.{i} {kind} · {API_NAMES[api]} · {mode_name(stream)}"
+                        run = lambda api=api, stream=stream, tool=tool: self.aiip_case(api, stream, tool)  # noqa: E731
+                        runner.step(name, run, needs=[s1, s2a])
+            runner.step("6. verificación CLEAN en la webapp", self.verification, needs=[s2a, s3])
+        if "bypass" in groups:
+            for i, (api, stream) in enumerate(cases, 1):
+                if api in a.apis:
+                    run = lambda api=api, stream=stream: self.bypass_case(api, stream)  # noqa: E731
+                    runner.step(f"7.{i} bypass · {API_NAMES[api]} · {mode_name(stream)}", run, needs=[s1, s2b])
+        if "borrado" in groups:
+            names = {api: f"8.{i} borrado · {API_NAMES[api]}" for i, api in enumerate(APIS, 1) if api in a.apis}
+            for api, name in names.items():
+                runner.step(name, lambda api=api: self.deletion(api), needs=[s1, s2a, s3])
+            needs = [s3] if self.deleted else list(names.values())
+            runner.step("8.4 nada reaparece en la webapp tras el borrado", self.nothing_reappears, needs=needs)
+            api = next(iter(self.delete_cases), a.apis[0])
+            runner.step(f"9. conversación nueva tras el borrado ({API_NAMES[api]})",
+                        lambda: self.fresh_after_delete(api), needs=[names[api]])  # fmt: skip
+        if privacy:
+            runner.step("10. ningún valor en claro en /_debug/requests", self.no_values_in_clear, needs=[s1, s2a])
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    runner = Runner()
+    e2e = E2E(args)
+    print(f"Prueba de punta a punta H3 (AI-IP) · webapp {args.app_url} · proveedor falso {args.fake_url}"
+          f" · organización {args.org} · ejecución {e2e.nonce}")  # fmt: skip
+    e2e.run(runner)
+    report = {**runner.report(), "app_url": args.app_url, "fake_url": args.fake_url, "nonce": e2e.nonce,
+              "only": args.only, "apis": args.apis}  # fmt: skip
+    if args.json:
+        args.json.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    failed = [r.name for r in runner.results if r.status != "OK"]
+    print("RESULTADO:", "todo OK" if not failed else f"{len(failed)} paso(s) sin éxito: {', '.join(failed)}")
+    return runner.exit_code()
+
+
+if __name__ == "__main__":
+    with contextlib.suppress(KeyboardInterrupt):
+        sys.exit(main())
+    sys.exit(130)

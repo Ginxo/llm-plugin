@@ -7,9 +7,12 @@ ejecutan con `pytest` en la CI y con `python -m unittest discover tests`).
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev"))
 
 import e2e_h3
+import fake_h3_stack
 
 DNI, EMAIL, IBAN = "12345678Z", "ana.perez@privada.test", "ES91 2100 0418 4502 0005 1332"
 RESTORED = f"Eco: DNI {DNI}, email {EMAIL}, IBAN {IBAN}"
@@ -255,6 +259,32 @@ class ChecksTest(unittest.TestCase):
         )
         self.assertEqual(e2e_h3.provider_error(b"nada"), (None, None, ""))
 
+    def test_first_difference(self) -> None:
+        self.assertIsNone(e2e_h3.first_difference({"a": [1, {"b": "x"}]}, {"a": [1, {"b": "x"}]}))
+        self.assertEqual(e2e_h3.first_difference({"a": [1, {"b": "x"}]}, {"a": [1, {"b": "y"}]}), '$.a[1].b: "x" ≠ "y"')
+        self.assertEqual(e2e_h3.first_difference({"s": True}, {"s": 1}), "$.s: true ≠ 1")
+        self.assertIn("sobra", e2e_h3.first_difference({}, {"extra": 1}))
+        self.assertIn("falta", e2e_h3.first_difference({"model": "m"}, {}))
+        self.assertIn("elementos", e2e_h3.first_difference([1], [1, 2]))
+
+    def test_verification_problems(self) -> None:
+        clean = {
+            "status": "CLEAN",
+            "request_replacements_by_type": {"DNI": 1, "EMAIL": 1, "IBAN": 1},
+            "response_replacements_by_type": {"DNI": 2, "EMAIL": 1, "IBAN": 1},
+            "unresolved_response_tokens": 0,
+            "orphan_request_tokens": 0,
+            "residual_matches": [],
+        }
+        self.assertEqual(e2e_h3.verification_problems(clean), [])
+        self.assertTrue(e2e_h3.verification_problems(None))
+        warning = {**clean, "status": "WARNING", "unresolved_response_tokens": 1}
+        joined = " ".join(e2e_h3.verification_problems(warning))
+        self.assertIn("WARNING", joined)
+        self.assertIn("unresolved_response_tokens", joined)
+        missing = {**clean, "request_replacements_by_type": {"DNI": 1}}
+        self.assertIn("EMAIL, IBAN", " ".join(e2e_h3.verification_problems(missing)))
+
 
 class RequestsTest(unittest.TestCase):
     def test_tag_has_no_digits(self) -> None:
@@ -309,6 +339,7 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(ns.only, ["aiip", "bypass", "borrado"])
         self.assertEqual(ns.apis, ["messages", "chat", "responses"])
         self.assertIsNone(ns.proxy_url)
+        self.assertEqual((ns.trace_timeout, ns.settle, ns.purge_wait), (30.0, 2.0, 1.0))
 
     def test_explicit_values(self) -> None:
         ns = e2e_h3.parse_args(
@@ -327,16 +358,81 @@ class ParseArgsTest(unittest.TestCase):
                 "5",
                 "--settle",
                 "0",
+                "--purge-wait",
+                "0.5",
             ]
         )
         self.assertEqual((ns.app_url, ns.fake_url, ns.proxy_url), ("http://a:1", "http://f:2", "http://p:3"))
         self.assertEqual((ns.only, ns.apis), (["bypass", "borrado"], ["chat"]))
-        self.assertEqual((ns.trace_timeout, ns.settle), (5.0, 0.0))
+        self.assertEqual((ns.trace_timeout, ns.settle, ns.purge_wait), (5.0, 0.0, 0.5))
 
     def test_invalid_choice_exits_two(self) -> None:
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as ctx:
             e2e_h3.parse_args(["--apis", "gemini"])
         self.assertEqual(ctx.exception.code, 2)
+
+
+# --- recorrido completo contra la pila simulada ------------------------------------------------------
+
+
+def run_e2e(stack: fake_h3_stack.FakeH3Stack, *extra: str) -> tuple[int, dict[str, dict], str]:
+    """Ejecuta `e2e_h3.main` contra la pila simulada; devuelve el código, los pasos por nombre y la salida."""
+    with tempfile.TemporaryDirectory() as tmp:
+        report_path = Path(tmp) / "informe.json"
+        argv = ["--app-url", stack.app_url, "--fake-url", stack.fake_url, "--trace-timeout", "3",
+                "--settle", "0.05", "--purge-wait", "0", "--timeout", "10", "--json", str(report_path),
+                *extra]  # fmt: skip
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = e2e_h3.main(argv)
+        report = json.loads(report_path.read_text())
+    return code, {s["name"]: s for s in report["steps"]}, out.getvalue()
+
+
+def statuses(steps: dict[str, dict], prefix: str) -> set[str]:
+    return {s["status"] for name, s in steps.items() if name.startswith(prefix)}
+
+
+class FullRunTest(unittest.TestCase):
+    def assert_all_ok(self, code: int, steps: dict[str, dict], out: str) -> None:
+        self.assertEqual(code, 0, out)
+        self.assertEqual({s["status"] for s in steps.values()}, {"OK"}, out)
+
+    def test_everything_passes_with_body_as_object(self) -> None:
+        with fake_h3_stack.FakeH3Stack() as stack:
+            code, steps, out = run_e2e(stack)
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(len([n for n in steps if n.startswith("4.")]), 6)
+        self.assertEqual(len([n for n in steps if n.startswith("5.")]), 6)
+        self.assertEqual(len([n for n in steps if n.startswith("7.")]), 6)
+        self.assertEqual(len([n for n in steps if n.startswith("8.")]), 4)
+        for prefix in ("0.", "1.", "2a.", "2b.", "3.", "6.", "9.", "10."):
+            self.assertEqual(len([n for n in steps if n.startswith(prefix)]), 1, prefix)
+        self.assertIn("RESULTADO: todo OK", out)
+
+    def test_everything_passes_with_body_as_text(self) -> None:
+        with fake_h3_stack.FakeH3Stack(debug_body="text") as stack:
+            code, steps, out = run_e2e(stack)
+        self.assert_all_ok(code, steps, out)
+        self.assertIn("byte a byte", " ".join(s["detail"] for n, s in steps.items() if n.startswith("7.")))
+
+    def test_only_bypass_and_one_api(self) -> None:
+        with fake_h3_stack.FakeH3Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "bypass", "--apis", "chat")
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(
+            sorted(steps),
+            sorted(["0. webapp accesible", "1. proveedor falso: /_debug/requests",
+                    "2b. handshake de analista@demo.test (demo, AI-IP apagado)",
+                    "7.3 bypass · Chat Completions · sin streaming", "7.4 bypass · Chat Completions · streaming"]),
+        )  # fmt: skip
+
+    def test_stack_unreachable_fails(self) -> None:
+        with fake_h3_stack.FakeH3Stack() as stack:
+            app, fake = stack.app_url, stack.fake_url
+        argv = ["--app-url", app, "--fake-url", fake, "--timeout", "2"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(e2e_h3.main(argv), 1)
 
 
 if __name__ == "__main__":
