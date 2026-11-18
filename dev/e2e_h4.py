@@ -483,6 +483,7 @@ class Conv:
     answer: str = ""
     response_id: str | None = None
     follow: list[h3.Case] = field(default_factory=list)
+    past: list[tuple[str, str]] = field(default_factory=list)  # (usuario, asistente) de cada turno ya respondido
 
 
 class E2EH4:
@@ -967,35 +968,44 @@ class E2EH4:
         problems += self.tokenized_problems(case.tag, api) if kind == "B" else self.clear_problems(case.tag, api, raw)
         reply = h3.extract_reply(api, res.body, stream=False)
         conv = Conv(case, first, reply.texts[0][1] if reply.texts else "", reply.response_id)
+        conv.past.append((first, conv.answer))
         if api == "responses" and not conv.response_id:
             problems.append("la respuesta de Responses no trae «id»")
         self.conversations[kind][api] = conv
         return "\n".join(f"{API_NAMES[api]}: {p}" for p in problems)
 
-    def follow_turn(self, kind: str, api: str) -> str:
-        """Segundo turno de la conversación `kind` con historial: sigue como empezó."""
+    def follow_turn(self, kind: str, api: str, *, tokenized: bool) -> str:
+        """Siguiente turno de la conversación `kind`, con el historial completo: en claro o tokenizado."""
         conv = self.conversations[kind][api]
-        case = self.case(f"i{kind.lower()}-sigue", api)
+        n = len(conv.follow) + 1
+        case = self.case(f"i{kind.lower()}-sigue" + ("" if n == 1 else str(n)), api)
         follow = f"{case.tag}. Sigue. {SENSITIVE_TEXT}."
         if api == "responses":
             case.payload = h3.request_body(api, conv.case.model, follow, previous_response_id=conv.response_id)
         else:
-            past = [{"role": "user", "content": conv.first_text}, {"role": "assistant", "content": conv.answer}]
+            past = [m for user, answer in conv.past for m in ({"role": "user", "content": user},
+                                                              {"role": "assistant", "content": answer})]  # fmt: skip
             case.payload = h3.request_body(api, conv.case.model, follow, history=past)
         raw, res = self.send(self.binding, self.args.email, api, case.payload)
         check(
-            res.status == 200, f"{API_NAMES[api]}: segundo turno de {kind} → HTTP {res.status}: {h3.snippet(res.body)}"
+            res.status == 200,
+            f"{API_NAMES[api]}: turno {n + 1} de {kind} → HTTP {res.status}: {h3.snippet(res.body)}",
         )
         problems = self.reply_texts(api, res, False, follow)
-        problems += self.tokenized_problems(case.tag, api) if kind == "B" else self.clear_problems(case.tag, api, raw)
+        problems += self.tokenized_problems(case.tag, api) if tokenized else self.clear_problems(case.tag, api, raw)
+        reply = h3.extract_reply(api, res.body, stream=False)
+        conv.past.append((follow, reply.texts[0][1] if reply.texts else ""))
+        conv.response_id = reply.response_id or conv.response_id
         conv.follow.append(case)
         return "\n".join(f"{API_NAMES[api]}: {p}" for p in problems)
 
-    def phase(self, steps: Iterable[tuple[str, str]], what: str) -> str:
+    def phase(self, steps: Iterable[tuple[str, str]], what: str, *, tokenized: bool = False) -> str:
         problems = []
         for kind, api in steps:
-            run = self.first_turn if what == "first" else self.follow_turn
-            problems.append(run(kind, api))
+            if what == "first":
+                problems.append(self.first_turn(kind, api))
+            else:
+                problems.append(self.follow_turn(kind, api, tokenized=tokenized))
         check(not any(problems), "\n".join(p for p in problems if p))
         return ""
 
@@ -1014,16 +1024,23 @@ class E2EH4:
         }[kind]
         return f"conversación {kind} ({self.api_names()}) {what}"
 
-    def continues(self, kind: str) -> str:
-        self.phase([(kind, api) for api in self.apis()], "follow")
-        what = "sigue en claro" if kind != "B" else "sigue tokenizada y restaurada"
-        return f"la conversación {kind} {what} aunque el interruptor haya cambiado ({self.api_names()})"
+    def continues(self, kind: str, *, then: str = "same") -> str:
+        """Otro turno de `kind`. `then`: `same` (conserva su estado), `raise` (A, que empezó en claro, sube a
+        anonimizada con el anonimizador encendido: trinquete, H4-08) o `stay` (A ya subió y no baja al apagarlo)."""
+        tokenized = kind == "B" or then in ("raise", "stay")
+        self.phase([(kind, api) for api in self.apis()], "follow", tokenized=tokenized)
+        what = {
+            "raise": "sube: su turno sale tokenizado y restaurado",
+            "stay": "sigue anonimizada aunque se haya apagado el anonimizador",
+        }.get(then, "sigue tokenizada y restaurada" if kind == "B" else "sigue en claro")
+        return f"la conversación {kind} {what} ({self.api_names()})"
 
     def switch_state(self) -> str:
-        """La webapp: A y C empezaron con el anonimizador apagado (`WARNING`), B con él encendido (`CLEAN`)."""
+        """La webapp: A y C empezaron con el anonimizador apagado (`WARNING`), B con él encendido (`CLEAN`); A subió
+        a anonimizada en su turno 2 (`protected_from_turn`), los otros no tienen `protected_from_turn`."""
         who, problems = self.args.email, []
-        expected = {"A": (False, "WARNING"), "B": (True, "CLEAN"), "C": (False, "WARNING")}
-        for kind, (flag, status) in expected.items():
+        expected = {"A": (False, "WARNING", 2), "B": (True, "CLEAN", None), "C": (False, "WARNING", None)}
+        for kind, (flag, status, raised_at) in expected.items():
             for api, conv in self.conversations[kind].items():
                 item = self.wait_conversation(who, conv.case.model, turns=1 + len(conv.follow))
                 label = f"{kind} · {API_NAMES[api]}"
@@ -1031,8 +1048,65 @@ class E2EH4:
                     problems.append(f"{label}: anonymizer_enabled = {anonymizer_flag(item)!r} (se esperaba {flag})")
                 if item.get("verification_status") != status:
                     problems.append(f"{label}: verificación {item.get('verification_status')} (se esperaba {status})")
+                if item.get("protected_from_turn") != raised_at:
+                    problems.append(
+                        f"{label}: protected_from_turn = {item.get('protected_from_turn')!r} (se esperaba {raised_at})"
+                    )
         check(not problems, "\n".join(problems))
-        return "A y C: anonimizador ✘ y WARNING; B: anonimizador ✔ y CLEAN"
+        return (
+            "A: anonimizador ✘ al empezar, WARNING y protegida desde el turno 2; B: ✔ y CLEAN; "
+            "C: ✘ y WARNING, sin subir"
+        )
+
+    def raised_turn_problems(self, who: str, cid: str, index: int, *, visible: bool) -> list[str]:
+        """Un turno de A visto por el PLATFORM_ADMIN: sin contenido (salió en claro) o solo con tokens."""
+        turn = self.turn(who, cid, index)
+        if turn.status != 200:
+            return [f"GET …/turns/{index} → HTTP {turn.status}"]
+        data = turn.json() or {}
+        if not visible:
+            return [f"turno {index}: {p}" for p in admin_turn_problems(data)] + [
+                f"el turno {index} (salió en claro) contiene {leak}"
+                for leak in content_leaks(turn.body, needles_for(self.nonce))
+            ]
+        problems = []
+        if data.get("content_available") is not True:
+            problems.append(f"turno {index}: content_available = {data.get('content_available')!r} (salió anonimizado)")
+        sent = segments_text(data.get("request_sent"))
+        problems += [f"turno {index}: lo enviado no trae {token}" for token in TOKENS if token not in sent]
+        raw = turn.body.decode(errors="replace") if isinstance(turn.body, bytes) else str(turn.body)
+        problems += [f"turno {index}: contiene el valor original de {kind} «{value}»"
+                     for kind, value in VALUES.items() if value in raw]  # fmt: skip
+        for key in ("request_original", "response_returned"):
+            if data.get(key):
+                problems.append(f"turno {index}: el PLATFORM_ADMIN recibe «{key}»")
+        reveal = self.webapp("POST", f"/api/v1/conversations/{cid}/turns/{index}/reveal", who, {"reason": REASON})
+        if reveal.status == 200:
+            problems.append(f"turno {index}: el PLATFORM_ADMIN puede revelar los originales (HTTP 200)")
+        return problems
+
+    def admin_raised(self) -> str:
+        """El PLATFORM_ADMIN ve por turno (H4-08): el 1 de A salió en claro (sin contenido), los siguientes salieron
+        anonimizados (los ve con tokens, sin valores)."""
+        who = self.args.admin_email
+        problems: list[str] = []
+        for api, conv in self.conversations["A"].items():
+            label = f"A · {API_NAMES[api]}"
+            item = next((i for i in self.list_conversations(who) if i.get("model") == conv.case.model), None)
+            if item is None:
+                problems.append(f"{label}: el PLATFORM_ADMIN no ve la conversación en la lista")
+                continue
+            cid, last = str(item["id"]), 1 + len(conv.follow)
+            if item.get("protected_from_turn") != 2:
+                problems.append(f"{label}: protected_from_turn = {item.get('protected_from_turn')!r} (se esperaba 2)")
+            problems += [f"{label}: {p}" for p in self.raised_turn_problems(who, cid, 1, visible=False)]
+            for index in range(2, last + 1):
+                problems += [f"{label}: {p}" for p in self.raised_turn_problems(who, cid, index, visible=True)]
+        check(not problems, "\n".join(problems))
+        return (
+            "turno 1 de A sin contenido (salió en claro) y los siguientes visibles solo con tokens, "
+            "sin valores ni revelado"
+        )
 
     def back_to_off(self) -> str:
         state = self.org_state().get("anonymizer_enabled")
@@ -1325,19 +1399,24 @@ class E2EH4:
             a1 = "8.2 conversaciones A: primer turno con el anonimizador apagado"
             on = "8.3 encender el anonimizador"
             b1 = "8.4 con él encendido: B nueva sale tokenizada"
-            a2 = "8.5 con él encendido: A sigue en claro"
+            a2 = "8.5 con él encendido: A sube a anonimizada en su siguiente turno"
             off = "8.6 apagar el anonimizador"
             b2 = "8.7 con él apagado: B sigue tokenizada y restaurada"
             c1 = "8.8 con él apagado: C nueva sale en claro"
+            a3 = "8.9 con él apagado: A sigue anonimizada (no baja)"
             step(a1, lambda: self.initial("A"), needs=base)
             step(on, lambda: self.switch(True), needs=[a1])
             step(b1, lambda: self.initial("B"), needs=[on])
-            step(a2, lambda: self.continues("A"), needs=[a1, on])
+            step(a2, lambda: self.continues("A", then="raise"), needs=[a1, on])
             step(off, lambda: self.switch(False), needs=[on])
             step(b2, lambda: self.continues("B"), needs=[b1, off])
             step(c1, lambda: self.initial("C"), needs=[off])
-            step("8.9 la webapp: A y C ✘/WARNING, B ✔/CLEAN", self.switch_state, needs=[a2, b2, c1])
-            step("8.10 el interruptor vuelve a su valor inicial (apagado)", self.back_to_off, needs=[s3])
+            step(a3, lambda: self.continues("A", then="stay"), needs=[a2, off])
+            sync = "8.10 la webapp: A ✘/WARNING y protegida desde el turno 2, B ✔/CLEAN, C ✘/WARNING"
+            step(sync, self.switch_state, needs=[a3, b2, c1])
+            step("8.11 el PLATFORM_ADMIN ve por turno: el 1 de A sin contenido, los demás con tokens",
+                 self.admin_raised, needs=[sync])  # fmt: skip
+            step("8.12 el interruptor vuelve a su valor inicial (apagado)", self.back_to_off, needs=[s3])
         if "eliminar" in groups:
             created = "9.1 crear la organización con datos"
             step(created, self.create_org, needs=[s0, s1, s3])

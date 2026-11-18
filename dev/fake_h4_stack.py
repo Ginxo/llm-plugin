@@ -80,6 +80,11 @@ FAULTS = {
     "observe-clean": "los turnos en observación salen CLEAN y sin coincidencias residuales",
     "state-follows-switch": "una conversación abierta adopta el valor actual del interruptor (no conserva el suyo)",
     "toggle-no-propagation": "el proxy no se entera de los cambios del interruptor",
+    "no-ratchet": "una conversación abierta en claro no sube al encender el anonimizador (como antes de H4-08)",
+    "ratchet-lowers": "apagar el anonimizador baja una conversación que ya estaba anonimizada",
+    "no-protected-from": "la webapp no informa de protected_from_turn",
+    "admin-sees-pre-raise": "el PLATFORM_ADMIN ve el texto de los turnos que salieron sin anonimizar",
+    "admin-hides-raised": "el PLATFORM_ADMIN no ve los turnos que ya salieron anonimizados",
     # lo que expone la webapp
     "no-cause": "la webapp no dice con qué anonimizador empezó cada conversación",
     "admin-sees-content-api": "el PLATFORM_ADMIN recibe el texto enviado y recibido en los turnos",
@@ -145,6 +150,16 @@ class Conv:
     vault: Vault = field(default_factory=Vault)
     turns: list[dict[str, Any]] = field(default_factory=list)
     verification_status: str | None = None
+    # H4-08: `ai_ip` y `anonymizer` son los del INICIO; los `now_*` son los del proxy ahora (solo suben).
+    protected_from_turn: int | None = None
+    now_ai_ip: bool | None = None
+    now_anonymizer: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.now_ai_ip is None:
+            self.now_ai_ip = self.ai_ip
+        if self.now_anonymizer is None:
+            self.now_anonymizer = self.anonymizer
 
 
 @dataclass
@@ -231,12 +246,25 @@ class StackState:
         return "VERIFY" if viewer.platform_admin and conv.org not in viewer.memberships else "LOCKED"
 
     def admin_content(self, conv: Conv) -> bool:
-        """¿Debe ver contenido un PLATFORM_ADMIN ajeno? Solo con AI-IP y anonimizador encendidos al empezar."""
+        """De la conversación: ¿hay algún turno que un PLATFORM_ADMIN ajeno pueda ver? Empezó anonimizada o ya subió."""
         if "admin-sees-content-api" in self.faults:
             return True
         if not conv.ai_ip and "admin-sees-bypass" in self.faults:
             return True
-        return conv.ai_ip and conv.anonymizer
+        return (conv.ai_ip and conv.anonymizer) or conv.protected_from_turn is not None
+
+    def admin_content_turn(self, conv: Conv, turn: dict[str, Any]) -> bool:
+        """De un turno (H4-08): solo si salió con AI-IP y anonimizador encendidos."""
+        if "admin-sees-content-api" in self.faults:
+            return True
+        if not turn["ai_ip"] and "admin-sees-bypass" in self.faults:
+            return True
+        protected = bool(turn["ai_ip"] and turn["anonymizer"])
+        if protected and "admin-hides-raised" in self.faults and conv.protected_from_turn is not None:
+            return False
+        if not protected and "admin-sees-pre-raise" in self.faults and conv.protected_from_turn is not None:
+            return True
+        return protected
 
     # --- organizaciones ------------------------------------------------------------------------------
     def org_json(self, org: Org) -> dict[str, Any]:
@@ -407,6 +435,15 @@ class StackState:
             self.convs[conv.id] = conv
         elif "state-follows-switch" in self.faults:
             conv.ai_ip, conv.anonymizer = org.ai_ip, self.proxy_anonymizer.get(org.slug, org.anonymizer)
+            conv.now_ai_ip, conv.now_anonymizer = conv.ai_ip, conv.anonymizer
+        else:
+            policy_anonymizes = org.ai_ip and self.proxy_anonymizer.get(org.slug, org.anonymizer)
+            anonymized = bool(conv.now_ai_ip and conv.now_anonymizer)
+            if policy_anonymizes and not anonymized and "no-ratchet" not in self.faults:
+                conv.now_ai_ip = conv.now_anonymizer = True  # H4-08: sube en su siguiente turno
+            elif not policy_anonymizes and anonymized and "ratchet-lowers" in self.faults:
+                conv.now_ai_ip = org.ai_ip
+                conv.now_anonymizer = self.proxy_anonymizer.get(org.slug, org.anonymizer)
         self.fingerprints.setdefault(fp, conv.id)
         return conv
 
@@ -432,7 +469,7 @@ class StackState:
                 )
             payload = json.loads(raw)
             conv = self._resolve(api, org, user, payload)
-            mode = "bypass" if not conv.ai_ip else "anonymize" if conv.anonymizer else "observe"
+            mode = "bypass" if not conv.now_ai_ip else "anonymize" if conv.now_anonymizer else "observe"
             if mode == "observe" and "observe-anonymizes" in self.faults:
                 mode = "anonymize"
         request_counts: dict[str, int] = {}
@@ -486,10 +523,14 @@ class StackState:
         with self.lock:
             turn = {
                 "turn_index": len(conv.turns) + 1, "status": "COMPLETED", "verification": verification,
+                "ai_ip": bool(conv.now_ai_ip), "anonymizer": bool(conv.now_anonymizer),
                 "verification_status": verification["status"] if verification else None,
                 "original": original, "request_sent": sent_text, "response_received": f"Eco: {sent_text}",
             }  # fmt: skip
             conv.turns.append(turn)
+            started_protected = conv.ai_ip and conv.anonymizer
+            if not started_protected and conv.protected_from_turn is None and turn["ai_ip"] and turn["anonymizer"]:
+                conv.protected_from_turn = turn["turn_index"]
             if _SEVERITY[turn["verification_status"]] > _SEVERITY[conv.verification_status]:
                 conv.verification_status = turn["verification_status"]
             for sub in list(self.subscribers):
@@ -515,14 +556,18 @@ class StackState:
         data["content_available"] = self.content_mode(viewer, conv) == "OWN" or self.admin_content(conv)
         if "no-cause" not in self.faults:
             data["anonymizer_enabled"] = conv.anonymizer
+        if "no-protected-from" not in self.faults:
+            data["protected_from_turn"] = conv.protected_from_turn
         return data
 
     def turn_json(self, conv: Conv, turn: dict[str, Any], viewer: User, *, live: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {"turn_index": turn["turn_index"], "status": turn["status"],
                                 "verification_status": turn["verification_status"],
+                                "ai_ip_enabled": turn["ai_ip"], "anonymizer_enabled": turn["anonymizer"],
                                 "verification": turn["verification"], "replacements": []}  # fmt: skip
         mode = self.content_mode(viewer, conv)
-        if mode == "OWN" or (mode == "VERIFY" and (self.admin_content(conv) or (live and "ws-leak" in self.faults))):
+        visible = self.admin_content_turn(conv, turn)
+        if mode == "OWN" or (mode == "VERIFY" and (visible or (live and "ws-leak" in self.faults))):
             data["request_sent"] = segments(turn["request_sent"])
             data["response_received"] = segments(turn["response_received"])
             if mode == "VERIFY":
