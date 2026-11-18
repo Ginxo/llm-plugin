@@ -8,9 +8,13 @@ que el hito H4 añade (contrato §4, §5.2, §6 y §8; plan, tareas W2 a W5, P2,
   cuerpo sale tal como entró, sin tokens, con `WARNING` y `residual_matches`; cada conversación conserva el valor con
   el que empezó en los dos sentidos. Una organización bloqueada responde `403 baas_access_blocked` y una eliminada,
   `403 baas_access_denied`.
-- **Webapp**: `PUT /orgs/{slug}/anonymizer`, crear, bloquear, activar AI-IP, invitar miembros,
+- **Webapp**: `PUT /orgs/{slug}/anonymizer`, crear, bloquear, activar AI-IP, invitar miembros (usuarios nuevos con
+  enlace de activación, `POST /auth/activation/{token}/password`, claves personales `/api-keys`, `GET /me`),
   `POST /orgs/{slug}/delete` (con sus errores), la auditoría, la vista de verificación del PLATFORM_ADMIN sin contenido
   (`content_available`) y el WebSocket `/api/v1/ws/traces` con el mismo filtrado.
+- **Usuarios que se quedan sin organización** (contrato §6): `GET /orgs/{slug}/delete-preview`, `disable_orphans` al
+  eliminar (desactiva, revoca claves personales, cierra sesiones, invalida enlaces y audita `user.disabled` sin email),
+  `409 USER_DISABLED` para un ORG_ADMIN y la reactivación por el PLATFORM_ADMIN (`user.reactivated`).
 - **MCP** (`/org/<slug>/mcp`): `initialize` y `baas_write_document`; una organización eliminada pasa a
   `.quarantine/<slug>-<fecha>`.
 - `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, claves de Redis y MCP).
@@ -110,6 +114,24 @@ FAULTS = {
     "no-quarantine": "el directorio del MCP no pasa a cuarentena",
     "audit-missing": "la eliminación no deja rastro en la auditoría",
     "delete-removes-users": "al eliminar una organización se elimina también a sus usuarios",
+    # usuarios que se quedan sin organización
+    "preview-lists-all": "la vista previa lista a todos los miembros, no solo a quien se quedaría sin organización",
+    "preview-open": "la vista previa de la eliminación la puede pedir un ORG_ADMIN o un USER de la organización",
+    "preview-needs-block": "la vista previa exige que la organización esté bloqueada (409 ORG_NOT_BLOCKED)",
+    "orphans-kept": "al eliminar con disable_orphans: true no se desactiva a nadie",
+    "orphans-ignore-flag": "con disable_orphans: false se desactiva igualmente",
+    "orphans-default-off": "sin el campo disable_orphans no se desactiva a nadie (el valor por omisión es false)",
+    "orphans-other-org": "también se desactiva a quien conserva otra organización",
+    "orphans-invited-skipped": "los invitados que no activaron la cuenta no se desactivan",
+    "orphans-keys-kept": "se desactiva al usuario pero sus claves personales siguen vigentes",
+    "orphans-sessions-kept": "se desactiva al usuario pero sus sesiones siguen abiertas",
+    "orphans-links-kept": "los enlaces de activación sin usar del usuario desactivado no se invalidan",
+    "orphans-audit-missing": "desactivar a un usuario no deja ninguna fila user.disabled",
+    "orphans-audit-email": "la fila user.disabled lleva el email y el nombre del usuario",
+    "disabled-can-login": "un usuario desactivado puede iniciar sesión",
+    "reactivate-orgadmin": "un ORG_ADMIN puede reactivar a un usuario desactivado (sin 409 USER_DISABLED)",
+    "reactivate-no-audit": "reactivar a un usuario no deja ninguna fila user.reactivated",
+    "reactivate-restores-keys": "al reactivar a un usuario vuelven a valer sus claves revocadas",
 }
 
 
@@ -126,11 +148,38 @@ class Org:
 
 
 @dataclass
+class Key:
+    """Una clave personal (`POST /api-keys`)."""
+
+    id: str
+    label: str
+    secret: str
+    revoked: bool = False
+
+
+@dataclass
+class Link:
+    """Un enlace de activación: `USED` si ya se usó, `REVOKED` si se invalidó o su usuario está desactivado."""
+
+    token: str
+    used: bool = False
+    revoked: bool = False
+
+
+@dataclass
 class User:
     email: str
     memberships: dict[str, str]  # slug → ORG_ADMIN · USER
     platform_admin: bool = False
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    status: str = "ACTIVE"  # ACTIVE · INVITED · DISABLED
+    password: str | None = DEV_PASSWORD
+    keys: list[Key] = field(default_factory=list)
+    links: list[Link] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.name = self.name or self.email.split("@")[0]
 
 
 @dataclass
@@ -199,8 +248,10 @@ class StackState:
             User("observador@observacion.test", {"observacion": "USER"}),
         ]
         self.users = {u.email: u for u in users}
+        self.users_by_id = {u.id: u for u in users}
         self.by_key = {dev_api_key(u.email): u for u in users}
         self.sessions: dict[str, User] = {}
+        self.links: dict[str, tuple[User, Link]] = {}  # token → (usuario, enlace de activación)
         self.deleted_slugs: set[str] = set()
         self.ghosts: dict[str, Org] = {}  # lo que el proxy o el MCP siguen viendo con un fallo inyectado
         self.proxy_anonymizer: dict[str, bool] = {s: o.anonymizer for s, o in self.orgs.items()}
@@ -216,6 +267,21 @@ class StackState:
         self.redis_keys |= {f"baas:policy:org:{slug}" for slug in self.orgs}
         self.mcp_dirs: dict[str, dict[str, str]] = {}
         self.quarantine: list[str] = []
+
+    # --- auditoría ---------------------------------------------------------------------------------
+    def record(self, action: str, actor: User | None, *, org: str | None = None, target_type: str | None = None,
+               target_id: str | None = None, reason: str | None = None,
+               metadata: dict[str, Any] | None = None) -> None:  # fmt: skip
+        """Una fila de auditoría con la forma de `GET /api/v1/audit` de la webapp: `target_label` de un usuario es su
+        email (la webapp lo resuelve al leer, no se guarda en la fila)."""
+        target = self.users_by_id.get(target_id or "") if target_type == "user" else None
+        self.audit.append({
+            "id": str(uuid.uuid4()), "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "actor": {"id": actor.id, "email": actor.email, "name": actor.name} if actor else None,
+            "org_slug": org, "action": action, "source": "WEBAPP", "target_type": target_type,
+            "target_id": target_id, "target_label": target.email if target else target_id, "reason": reason,
+            "count": 1, "sensitive": False, "metadata": metadata or {},
+        })  # fmt: skip
 
     # --- permisos ----------------------------------------------------------------------------------
     def can_see_org(self, user: User, slug: str) -> bool:
@@ -275,18 +341,180 @@ class StackState:
             self.orgs[slug] = org
             self.proxy_anonymizer[slug] = org.anonymizer
             self.redis_keys.add(f"baas:policy:org:{slug}")
-            self.audit.append({"action": "org.created", "org_id": str(uuid.uuid4()), "actor": actor.email,
-                               "target_type": "organization", "target_id": slug, "metadata": {}})  # fmt: skip
+            self.record("org.created", actor, org=slug, target_type="organization", target_id=slug)
         return 201, {"organization": self.org_json(org), "member": None, "activation_url": None, "propagated": True}
 
-    def invite(self, slug: str, email: str, role: str) -> tuple[int, dict[str, Any]]:
+    def member_json(self, user: User, slug: str) -> dict[str, Any]:
+        others = bool(set(user.memberships) - {slug})
+        return {"user_id": user.id, "email": user.email, "name": user.name, "status": user.status,
+                "governance_role": user.memberships.get(slug), "functional_roles": [],
+                "is_platform_admin": user.platform_admin, "other_orgs": others}  # fmt: skip
+
+    def new_link(self, user: User) -> str:
+        token = secrets.token_urlsafe(24)
+        link = Link(token)
+        user.links.append(link)
+        self.links[token] = (user, link)
+        return token
+
+    def invite(self, viewer: User, slug: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """`POST /orgs/{slug}/members`: un usuario nuevo nace `INVITED` con enlace; uno `DISABLED` solo lo reactiva un
+        PLATFORM_ADMIN (`ACTIVE` si ya tenía contraseña, `INVITED` con otro enlace si no)."""
+        email = str(body.get("email") or "").strip().lower()
+        role = str(body.get("governance_role") or "USER")
         with self.lock:
-            user = self.users.get(email)
+            if slug not in self.orgs or not self.can_see_org(viewer, slug):
+                return 404, {"error": "NOT_FOUND", "message": "Organization not found"}
+            if not (viewer.platform_admin or viewer.memberships.get(slug) == "ORG_ADMIN"):
+                return 403, {"error": "FORBIDDEN", "message": "Forbidden"}
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                return 422, {"error": "VALIDATION_ERROR", "message": "Invalid email", "field": "email"}
+            user, previous = self.users.get(email), None
             if user is None:
-                return 404, {"error": "NOT_FOUND", "message": "User not found"}
+                name = str(body.get("name") or "").strip() or email.split("@")[0]
+                user = User(email, {}, name=name, status="INVITED", password=None)
+                self.users[email] = user
+                self.users_by_id[user.id] = user
+            else:
+                if slug in user.memberships:
+                    return 409, {"error": "ALREADY_MEMBER", "message": "This user is already a member"}
+                if user.status == "DISABLED":
+                    if not viewer.platform_admin and "reactivate-orgadmin" not in self.faults:
+                        return 409, {"error": "USER_DISABLED", "message": "This user is disabled"}
+                    previous, user.status = "DISABLED", "ACTIVE" if user.password else "INVITED"
+                    if "reactivate-restores-keys" in self.faults:
+                        for key in user.keys:
+                            key.revoked = False
+                            self.by_key[key.secret] = user
+                elif user.status == "INVITED" and user.memberships:
+                    return 409, {"error": "USER_NOT_ACTIVE", "message": "The user has not activated the account"}
             user.memberships[slug] = role
             self.redis_keys.add(f"baas:member:{user.id}:{slug}")
-        return 201, {"member": {"email": email, "governance_role": role}, "activation_url": None, "propagated": True}
+            token = self.new_link(user) if user.status == "INVITED" else None
+            self.record("member.invited", viewer, org=slug, target_type="user", target_id=user.id,
+                        metadata={"email": email, "governance_role": role, "functional_roles": [],
+                                  "new_user": previous is None and token is not None,
+                                  "activation_link_issued": token is not None})  # fmt: skip
+            if previous and "reactivate-no-audit" not in self.faults:
+                self.record("user.reactivated", viewer, target_type="user", target_id=user.id,
+                            reason=str(body.get("reason") or "") or None,
+                            metadata={"previous_status": previous, "org_slug": slug})  # fmt: skip
+            url = f"{self.app_url}/activate/{token}" if token else None
+            return 201, {"member": self.member_json(user, slug), "activation_url": url, "propagated": True}
+
+    # --- usuarios que se quedan sin organización ---------------------------------------------------------
+    def orphan_candidates(self, slug: str, *, preview: bool = False) -> list[User]:
+        """Miembros que no son PLATFORM_ADMIN, no tienen otra membresía y no están `DISABLED` (en orden de `id`)."""
+        out = []
+        for user in sorted(self.users.values(), key=lambda u: u.id):
+            if slug not in user.memberships:
+                continue
+            if preview and "preview-lists-all" in self.faults:
+                out.append(user)
+                continue
+            if user.platform_admin or user.status == "DISABLED":
+                continue
+            if set(user.memberships) - {slug} and (preview or "orphans-other-org" not in self.faults):
+                continue
+            if user.status == "INVITED" and "orphans-invited-skipped" in self.faults:
+                continue
+            out.append(user)
+        return out
+
+    def delete_preview(self, viewer: User, slug: str) -> tuple[int, dict[str, Any]]:
+        with self.lock:
+            org = self.orgs.get(slug)
+            if org is None or not self.can_see_org(viewer, slug):
+                return 404, {"error": "NOT_FOUND", "message": "Organization not found"}
+            if not viewer.platform_admin and "preview-open" not in self.faults:
+                return 403, {"error": "FORBIDDEN", "message": "Only the platform administrator can see this"}
+            if "preview-needs-block" in self.faults and not org.blocked:
+                return 409, {"error": "ORG_NOT_BLOCKED", "message": "Block the organization first"}
+            orphans = [{"id": u.id, "email": u.email, "name": u.name, "status": u.status,
+                        "personal_keys": len([k for k in u.keys if not k.revoked])}
+                       for u in self.orphan_candidates(slug, preview=True)]  # fmt: skip
+            return 200, {"members": len([u for u in self.users.values() if slug in u.memberships]),
+                         "conversations": len([c for c in self.convs.values() if c.org == slug]),
+                         "orphans": orphans}  # fmt: skip
+
+    def disable_user(self, user: User, actor: User, reason: str, slug: str) -> None:
+        """Lo que la eliminación hace con cada usuario que se queda sin organización."""
+        previous, revoked = user.status, 0
+        user.status = "DISABLED"
+        if "orphans-keys-kept" not in self.faults:
+            for key in user.keys:
+                if not key.revoked:
+                    key.revoked, revoked = True, revoked + 1
+                    self.by_key.pop(key.secret, None)
+        if "orphans-sessions-kept" not in self.faults:
+            self.sessions = {t: u for t, u in self.sessions.items() if u is not user}
+        if "orphans-links-kept" not in self.faults:
+            for link in user.links:
+                link.revoked = True
+        if "orphans-audit-missing" in self.faults:
+            return
+        meta: dict[str, Any] = {"cause": "org.deleted", "org_slug": slug, "previous_status": previous,
+                                "keys_revoked": revoked}  # fmt: skip
+        if "orphans-audit-email" in self.faults:
+            meta |= {"email": user.email, "name": user.name}
+        self.record("user.disabled", actor, target_type="user", target_id=user.id, reason=reason, metadata=meta)
+
+    # --- sesiones, claves y enlaces ---------------------------------------------------------------------
+    def me_json(self, user: User) -> dict[str, Any]:
+        memberships = [{"org_slug": slug, "governance_role": role} for slug, role in sorted(user.memberships.items())]
+        return {"id": user.id, "email": user.email, "name": user.name, "status": user.status,
+                "is_platform_admin": user.platform_admin, "memberships": memberships}  # fmt: skip
+
+    def login(self, email: str, password: Any) -> User | None:
+        user = self.users.get(email.strip().lower())
+        if user is None or not user.password or password != user.password:
+            return None
+        if user.status != "ACTIVE" and not (user.status == "DISABLED" and "disabled-can-login" in self.faults):
+            return None
+        return user
+
+    def create_key(self, user: User, label: str) -> tuple[int, dict[str, Any]]:
+        if not 1 <= len(label.strip()) <= 100:
+            return 422, {"error": "VALIDATION_ERROR", "message": "Label must have 1-100 characters", "field": "label"}
+        with self.lock:
+            key = Key(str(uuid.uuid4()), label.strip(), "baas_" + secrets.token_urlsafe(32))
+            user.keys.append(key)
+            self.by_key[key.secret] = user
+        return 201, {"key": self.key_json(key, user), "secret": key.secret}
+
+    @staticmethod
+    def key_json(key: Key, user: User) -> dict[str, Any]:
+        return {"id": key.id, "label": key.label, "kind": "PERSONAL", "org_slug": None,
+                "revoked_at": "2026-11-18T00:00:00Z" if key.revoked else None,
+                "user": {"id": user.id, "email": user.email, "name": user.name}}  # fmt: skip
+
+    def link_state(self, token: str) -> tuple[str, User | None, Link | None]:
+        found = self.links.get(token)
+        if found is None:
+            return "NOT_FOUND", None, None
+        user, link = found
+        if link.used:
+            return "USED", user, link
+        if link.revoked or user.status == "DISABLED":
+            return "REVOKED", user, link
+        return "VALID", user, link
+
+    def activate(self, token: str, password: str) -> tuple[int, dict[str, Any], str | None]:
+        """`POST /auth/activation/{token}/password` con `BAAS_DEV_SKIP_TOTP=1`: `200 {"next": "DONE"}` y sesión."""
+        with self.lock:
+            status, user, link = self.link_state(token)
+            if status != "VALID" or user is None or link is None:
+                reason = "REVOKED" if status == "NOT_FOUND" else status
+                return 410, {"error": "LINK_INVALID", "message": "This link is no longer valid", "reason": reason}, None
+            user.password, user.status, link.used = password, "ACTIVE", True
+            session = secrets.token_urlsafe(16)
+            self.sessions[session] = user
+        return 200, {"next": "DONE"}, session
+
+    def audit_items(self, action: str | None, limit: int) -> dict[str, Any]:
+        with self.lock:
+            rows = [r for r in reversed(self.audit) if not action or str(r["action"]).startswith(action)]
+        return {"items": rows[:limit], "total": len(rows), "limit": limit, "offset": 0}
 
     def set_anonymizer(self, viewer: User, slug: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         with self.lock:
@@ -308,9 +536,8 @@ class StackState:
                 org.anonymizer = enabled
             if "toggle-no-propagation" not in self.faults:
                 self.proxy_anonymizer[slug] = org.anonymizer
-            self.audit.append({"action": "org.anonymizer.changed", "org_id": slug, "actor": viewer.email,
-                               "target_type": "organization", "target_id": slug,
-                               "metadata": {"after": enabled, "reason": reason}})  # fmt: skip
+            self.record("org.anonymizer.changed", viewer, org=slug, target_type="organization", target_id=slug,
+                        reason=reason, metadata={"after": enabled, "reason": reason})  # fmt: skip
         return 200, {"organization": self.org_json(org), "propagated": True}
 
     def set_flag(self, viewer: User, slug: str, field_name: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -359,6 +586,14 @@ class StackState:
                 return 422, {"error": "SLUG_MISMATCH", "message": "The confirmation does not match the slug"}
             members = [u for u in self.users.values() if slug in u.memberships]
             conversations = [c for c in self.convs.values() if c.org == slug]
+            disable = body.get("disable_orphans", "orphans-default-off" not in self.faults)
+            if "orphans-ignore-flag" in self.faults:
+                disable = True
+            if "orphans-kept" in self.faults:
+                disable = False
+            disabled = self.orphan_candidates(slug) if disable else []
+            for user in disabled:  # antes de borrar las membresías: es lo que decide quién se queda sin organización
+                self.disable_user(user, viewer, reason, slug)
             self.deleted_slugs.add(slug)
             del self.orgs[slug]
             if {"proxy-still-serves", "mcp-still-serves"} & self.faults:
@@ -381,11 +616,10 @@ class StackState:
                 self.quarantine.append(f"{slug}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
                 del self.mcp_dirs[slug]
             if "audit-missing" not in self.faults:
-                self.audit.append({"action": "org.deleted", "org_id": None, "actor": viewer.email,
-                                   "target_type": "organization", "target_id": slug,
-                                   "metadata": {"slug": slug, "reason": reason, "conversations": len(conversations),
-                                                "members": len(members)}})  # fmt: skip
-        return 200, {"propagated": True}
+                self.record("org.deleted", viewer, target_type="organization", target_id=slug, reason=reason,
+                            metadata={"slug": slug, "reason": reason, "conversations": len(conversations),
+                                      "members": len(members)})  # fmt: skip
+        return 200, {"propagated": True, "disabled_users": len(disabled)}
 
     # --- lo que miraría el inspector ---------------------------------------------------------------------
     def vault_rows(self, slug: str) -> int:
@@ -622,6 +856,8 @@ def proxy_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
 
 _ORG = re.compile(r"/api/v1/orgs/([a-z0-9-]+)")
 _ORG_SUB = re.compile(r"/api/v1/orgs/([a-z0-9-]+)/(anonymizer|block|ai-ip|members|delete)")
+_ORG_GET = re.compile(r"/api/v1/orgs/([a-z0-9-]+)/(members|delete-preview)")
+_ACTIVATION = re.compile(r"/api/v1/auth/activation/([A-Za-z0-9_-]+)(/password)?")
 _CONV = re.compile(r"/api/v1/conversations/([0-9a-f-]+)")
 _TURN = re.compile(r"/api/v1/conversations/([0-9a-f-]+)/turns/(\d+)")
 _REVEAL = re.compile(r"/api/v1/conversations/([0-9a-f-]+)/turns/(\d+)/reveal")
@@ -645,11 +881,32 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
             url = urlsplit(self.path)
             if url.path == "/healthz":
                 return self._json(200, {"status": "ok", "version": "simulada"})
+            if (m := _ACTIVATION.fullmatch(url.path)) and not m.group(2):
+                status, user, _ = state.link_state(m.group(1))
+                if status != "VALID" or user is None:
+                    return self._json(200, {"status": status})
+                return self._json(200, {"status": "VALID", "purpose": "ACTIVATION", "email": user.email,
+                                        "name": user.name, "org_names": sorted(user.memberships)})  # fmt: skip
             viewer = self._viewer()
             if viewer is None:
                 return self._json(401, {"error": "UNAUTHENTICATED", "message": "Not authenticated"})
             if url.path == "/api/v1/ws/traces":
                 return self._websocket(viewer, parse_qs(url.query))
+            if url.path == "/api/v1/me":
+                return self._json(200, state.me_json(viewer))
+            if url.path == "/api/v1/api-keys":
+                return self._json(200, {"items": [state.key_json(k, viewer) for k in viewer.keys]})
+            if m := _ORG_GET.fullmatch(url.path):
+                slug = m.group(1)
+                if m.group(2) == "delete-preview":
+                    return self._json(*state.delete_preview(viewer, slug))
+                if slug not in state.orgs or not state.can_see_org(viewer, slug):
+                    return self._json(404, {"error": "NOT_FOUND", "message": "Organization not found"})
+                if not (viewer.platform_admin or viewer.memberships.get(slug) == "ORG_ADMIN"):
+                    return self._json(403, {"error": "FORBIDDEN", "message": "Forbidden"})
+                with state.lock:
+                    members = [state.member_json(u, slug) for u in state.users.values() if slug in u.memberships]
+                return self._json(200, {"members": members})
             if m := _ORG.fullmatch(url.path):
                 org = state.orgs.get(m.group(1))
                 if org is None or not state.can_see_org(viewer, org.slug):
@@ -660,9 +917,9 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
                     return self._json(
                         403, {"error": "FORBIDDEN", "message": "Only administrators can see the audit log"}
                     )
-                action = (parse_qs(url.query).get("action") or [None])[0]
-                items = [a for a in state.audit if not action or a["action"] == action]
-                return self._json(200, {"items": items, "total": len(items)})
+                query = parse_qs(url.query)
+                action = (query.get("action") or [None])[0]
+                return self._json(200, state.audit_items(action, int((query.get("limit") or ["50"])[0])))
             if url.path == "/api/v1/conversations":
                 query = parse_qs(url.query)
                 org = (query.get("org") or [None])[0]
@@ -699,13 +956,19 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
                 return self._json(403, _CSRF)
             body = json.loads(raw or b"{}")
             if self.path == "/api/v1/auth/login":
-                user = state.users.get(str(body.get("email")))
-                if user is None or body.get("password") != DEV_PASSWORD:
+                user = state.login(str(body.get("email")), body.get("password"))
+                if user is None:
                     return self._json(401, {"error": "INVALID_CREDENTIALS", "message": "Invalid credentials"})
                 token = secrets.token_urlsafe(16)
                 state.sessions[token] = user
                 cookie = f"baas_session={token}; HttpOnly; Path=/; SameSite=lax"
-                return self._json(200, {"user": {"email": user.email}}, {"Set-Cookie": cookie})
+                return self._json(200, {"next": "DONE"}, {"Set-Cookie": cookie})
+            if (m := _ACTIVATION.fullmatch(self.path)) and m.group(2):
+                status, data, session = state.activate(m.group(1), str(body.get("password") or ""))
+                set_cookie = (
+                    {"Set-Cookie": f"baas_session={session}; HttpOnly; Path=/; SameSite=lax"} if session else None
+                )
+                return self._json(status, data, set_cookie)
             viewer = self._viewer()
             if viewer is None:
                 return self._json(401, {"error": "UNAUTHENTICATED", "message": "Not authenticated"})
@@ -713,6 +976,8 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
                 if not viewer.platform_admin:
                     return self._json(403, {"error": "FORBIDDEN", "message": "Forbidden"})
                 return self._json(*state.create_org(viewer, str(body.get("slug")), str(body.get("name"))))
+            if self.path == "/api/v1/api-keys":
+                return self._json(*state.create_key(viewer, str(body.get("label") or "")))
             if m := _REVEAL.fullmatch(self.path):
                 conv = next((c for c in self._visible(viewer) if c.id == m.group(1)), None)
                 if conv is None:
@@ -725,11 +990,7 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
                 slug = m.group(1)
                 if m.group(2) == "delete":
                     return self._json(*state.delete_org(viewer, slug, body))
-                if slug not in state.orgs or not state.can_see_org(viewer, slug):
-                    return self._json(404, {"error": "NOT_FOUND", "message": "Organization not found"})
-                return self._json(
-                    *state.invite(slug, str(body.get("email")), str(body.get("governance_role") or "USER"))
-                )
+                return self._json(*state.invite(viewer, slug, body))
             return self._json(404, {"error": "NOT_FOUND", "message": "Not found"})
 
         def do_PUT(self) -> None:

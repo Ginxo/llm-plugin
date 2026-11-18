@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import socket
 import stat
 import sys
@@ -102,6 +103,176 @@ class PureUtilitiesTest(unittest.TestCase):
         self.assertEqual(e2e_h4.org_data(None), {})
 
 
+class OrphanUtilitiesTest(unittest.TestCase):
+    """Las utilidades puras del grupo «huérfanos» (10) y el cliente de inicio de sesión."""
+
+    ADMIN = "admin@baas.test"
+    A = e2e_h4.Person("a", "huerf-abc-a@huerf.test", "Huerfano A abc", user_id="u-a")
+    B = e2e_h4.Person("b", "huerf-abc-b@huerf.test", "Huerfano B abc", user_id="u-b")
+
+    @staticmethod
+    def row(**changes: object) -> dict[str, object]:
+        row: dict[str, object] = {
+            "action": "user.disabled", "target_type": "user", "target_id": "u-a", "reason": e2e_h4.REASON,
+            "org_slug": None, "actor": {"id": "x", "email": "admin@baas.test", "name": "Administrador"},
+            "target_label": "huerf-abc-a@huerf.test",  # la webapp lo resuelve al leer: no cuenta
+            "metadata": {"cause": "org.deleted", "org_slug": "o1", "previous_status": "ACTIVE", "keys_revoked": 1},
+        }  # fmt: skip
+        return {**row, **changes}
+
+    def audit_problems(self, row: object, **changes: object) -> list[str]:
+        kwargs: dict[str, object] = {
+            "org_slug": "o1", "previous_status": "ACTIVE", "actor_email": self.ADMIN, "reason": e2e_h4.REASON,
+            "forbidden": [self.A.email, self.A.name], "min_keys": 1,
+        }  # fmt: skip
+        return e2e_h4.disabled_audit_problems(row, **{**kwargs, **changes})  # type: ignore[arg-type]
+
+    def test_new_names_are_unique_and_valid(self) -> None:
+        e2e = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), nonce="abcdefghij")
+        self.assertEqual(sorted(e2e.orph_slugs), ["o1", "o2", "o3", "o4"])
+        for slug in e2e.orph_slugs.values():
+            self.assertRegex(slug, r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$")
+            self.assertTrue(slug.startswith("huerf-abcdefghij-"))
+        emails = [p.email for p in e2e.orph.values()]
+        self.assertEqual(len(set(emails)), 7)
+        self.assertTrue(all(re.fullmatch(r"huerf-abcdefghij-[a-z]@huerf\.test", e) for e in emails))
+        names = [p.name for p in e2e.orph.values()]
+        self.assertEqual(len(set(names)), 7)
+        self.assertFalse([n for n in names if n.lower() in " ".join(emails)], "el nombre no es parte de ningún email")
+        other = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), nonce="zzzzzzzzzz")
+        self.assertFalse(set(emails) & {p.email for p in other.orph.values()})
+
+    def test_activation_token_and_counts(self) -> None:
+        self.assertEqual(e2e_h4.activation_token("http://app.localhost:8080/activate/AbC-_9/"), "AbC-_9")
+        self.assertEqual(e2e_h4.activation_token(None), "")
+        self.assertEqual(e2e_h4.activation_token(""), "")
+        self.assertTrue(e2e_h4.is_count(0) and e2e_h4.is_count(3))
+        self.assertFalse(e2e_h4.is_count(True) or e2e_h4.is_count(None) or e2e_h4.is_count("1") or e2e_h4.is_count(1.0))
+
+    def test_api_error_never_prints_the_body(self) -> None:
+        res = e2e_h4.Http(409, [], b'{"error": "USER_DISABLED", "activation_url": "http://x/activate/secreto"}')
+        self.assertEqual(e2e_h4.api_error(res), "HTTP 409 USER_DISABLED")
+        self.assertEqual(e2e_h4.api_error(e2e_h4.Http(502, [], b"<html>")), "HTTP 502")
+        self.assertEqual(e2e_h4.api_error(e2e_h4.Http(200, [], b"[1]")), "HTTP 200")
+
+    def test_audit_rows_filter_by_action_and_target(self) -> None:
+        body = {"items": [self.row(), self.row(target_id="u-b"), self.row(action="member.invited"), "no", None]}
+        self.assertEqual(len(e2e_h4.audit_rows(body, "user.disabled", "u-a")), 1)
+        self.assertEqual(len(e2e_h4.audit_rows(body, "user.disabled", "u-b")), 1)
+        self.assertEqual(e2e_h4.audit_rows(body, "user.reactivated", "u-a"), [])
+        self.assertEqual(e2e_h4.audit_rows(None, "user.disabled", "u-a"), [])
+        self.assertEqual(e2e_h4.audit_rows({"items": None}, "user.disabled", "u-a"), [])
+
+    def preview(self, *orphans: dict[str, object], members: int = 3) -> dict[str, object]:
+        return {"members": members, "conversations": 0, "orphans": list(orphans)}
+
+    def entry(self, person: e2e_h4.Person, status: str = "ACTIVE", keys: int = 1) -> dict[str, object]:
+        return {"id": person.user_id, "email": person.email, "name": person.name, "status": status,
+                "personal_keys": keys}  # fmt: skip
+
+    def test_preview_problems(self) -> None:
+        want = [(self.A, "ACTIVE", 1)]
+        self.assertEqual(e2e_h4.preview_problems(self.preview(self.entry(self.A)), want, members=3), [])
+        # lista a quien tiene otra organización (o al PLATFORM_ADMIN)
+        extra = self.preview(self.entry(self.A), self.entry(self.B))
+        self.assertIn(
+            "lista a quien no se quedaría sin organización", " ".join(e2e_h4.preview_problems(extra, want, members=3))
+        )
+        self.assertIn("no lista a", " ".join(e2e_h4.preview_problems(self.preview(), want, members=3)))
+        # campos
+        bad = self.preview({**self.entry(self.A), "personal_keys": 0, "status": "INVITED", "id": "otro"})
+        text = " ".join(e2e_h4.preview_problems(bad, want, members=3))
+        for field in ("personal_keys", "status", "id"):
+            self.assertIn(f"a: {field} =", text)
+        self.assertIn(
+            "members = 2",
+            " ".join(e2e_h4.preview_problems(self.preview(self.entry(self.A), members=2), want, members=3)),
+        )
+        self.assertTrue(
+            e2e_h4.preview_problems({**self.preview(self.entry(self.A)), "conversations": None}, want, members=3)
+        )
+        self.assertTrue(e2e_h4.preview_problems({**self.preview(self.entry(self.A)), "members": True}, want, members=1))
+        self.assertTrue(e2e_h4.preview_problems({"members": 3, "conversations": 0, "orphans": None}, want, members=3))
+        self.assertTrue(e2e_h4.preview_problems("no es un objeto", want, members=3))
+        dup = self.preview(self.entry(self.A), self.entry(self.A))
+        self.assertIn("repetidas", " ".join(e2e_h4.preview_problems(dup, want, members=3)))
+
+    def test_disabled_audit_problems(self) -> None:
+        self.assertEqual(self.audit_problems(self.row()), [])
+        meta = {"cause": "org.deleted", "org_slug": "o1", "previous_status": "ACTIVE", "keys_revoked": 1}
+        cases = {
+            "target_type": self.row(target_type="organization"),
+            "reason": self.row(reason="otro"),
+            "org_slug = 'o1'": self.row(org_slug="o1"),
+            "actor": self.row(actor={"email": "otro@baas.test"}),
+            "metadata.cause": self.row(metadata={**meta, "cause": "member.removed"}),
+            "metadata.org_slug": self.row(metadata={**meta, "org_slug": "o9"}),
+            "metadata.previous_status": self.row(metadata={**meta, "previous_status": "INVITED"}),
+            "metadata.keys_revoked": self.row(metadata={**meta, "keys_revoked": 0}),
+        }
+        for fragment, row in cases.items():
+            self.assertIn(fragment, " ".join(self.audit_problems(row)), fragment)
+        self.assertIn("keys_revoked", " ".join(self.audit_problems(self.row(metadata={**meta, "keys_revoked": True}))))
+        self.assertEqual(self.audit_problems(self.row(metadata={**meta, "keys_revoked": 0}), min_keys=0), [])
+        self.assertTrue(self.audit_problems("no es un objeto"))
+        self.assertTrue(self.audit_problems(self.row(metadata=None)))
+
+    def test_disabled_audit_rejects_email_or_name_anywhere_but_target_label(self) -> None:
+        meta = {"cause": "org.deleted", "org_slug": "o1", "previous_status": "ACTIVE", "keys_revoked": 1}
+        for where, row in (
+            ("metadata", self.row(metadata={**meta, "email": self.A.email})),
+            ("name", self.row(metadata={**meta, "note": self.A.name.upper()})),  # sin distinguir mayúsculas
+            ("reason", self.row(reason=f"{e2e_h4.REASON} {self.A.email}")),
+            ("key", self.row(**{self.A.email: 1})),
+            ("actor", self.row(actor={"email": self.ADMIN, "name": self.A.name})),
+        ):
+            problems = self.audit_problems(row, reason=row["reason"])  # type: ignore[arg-type]
+            self.assertTrue(any("no debe llevar el email ni el nombre" in p for p in problems), where)
+        # target_label (derivado al leer) no cuenta
+        self.assertEqual(self.audit_problems(self.row(target_label=self.A.name)), [])
+
+    def test_reactivated_audit_problems(self) -> None:
+        row = {"actor": {"email": self.ADMIN}, "metadata": {"previous_status": "DISABLED", "org_slug": "o2"}}
+        self.assertEqual(e2e_h4.reactivated_audit_problems(row, org_slug="o2", actor_email=self.ADMIN), [])
+        wrong = {"actor": {"email": "x@baas.test"}, "metadata": {"previous_status": "ACTIVE", "org_slug": "o9"}}
+        text = " ".join(e2e_h4.reactivated_audit_problems(wrong, org_slug="o2", actor_email=self.ADMIN))
+        for fragment in ("actor", "previous_status", "org_slug"):
+            self.assertIn(fragment, text)
+        self.assertTrue(e2e_h4.reactivated_audit_problems(None, org_slug="o2", actor_email=self.ADMIN))
+
+    def test_login_waits_when_rate_limited(self) -> None:
+        e2e = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), nonce="abcdefghij")
+        cookie = [("Set-Cookie", "baas_session=abc; Path=/")]
+        answers = [e2e_h4.Http(429, [], b'{"error": "RATE_LIMITED", "retry_after_seconds": 7}'),
+                   e2e_h4.Http(200, cookie, b'{"next": "DONE"}')]  # fmt: skip
+        with (
+            mock.patch.object(e2e_h4.h3, "http", side_effect=answers) as http,
+            mock.patch("time.sleep") as sleep,
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(e2e.new_session("a@huerf.test"), "abc")
+        sleep.assert_called_once_with(8)
+        self.assertEqual(http.call_count, 2)
+        self.assertIn("RATE_LIMITED", out.getvalue())
+        # tres 429 seguidos: se devuelve el último, sin esperar para siempre
+        with (
+            mock.patch.object(e2e_h4.h3, "http", return_value=e2e_h4.Http(429, [], b"{}")),
+            mock.patch("time.sleep") as sleep,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(e2e.raw_login("a@huerf.test").status, 429)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_login_without_dev_skip_totp_says_so(self) -> None:
+        e2e = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), nonce="abcdefghij")
+        with (
+            mock.patch.object(e2e_h4.h3, "http", return_value=e2e_h4.Http(200, [], b'{"next": "TOTP"}')),
+            self.assertRaises(e2e_h4.StepError) as ctx,
+        ):
+            e2e.new_session("a@huerf.test")
+        self.assertIn("BAAS_DEV_SKIP_TOTP=1", str(ctx.exception))
+
+
 class ParseArgsTest(unittest.TestCase):
     def test_defaults_follow_dev_stack(self) -> None:
         env = {"BAAS_DEV_HTTP_PORT": "48080", "BAAS_DEV_FAKE_UPSTREAM_PORT": "48090",
@@ -114,7 +285,7 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(ns.fake_url, "http://127.0.0.1:48090")
         self.assertEqual((ns.org, ns.email), ("observacion", "observador@observacion.test"))
         self.assertEqual((ns.admin_email, ns.orgadmin_email), ("admin@baas.test", "orgadmin@demo.test"))
-        self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar"])
+        self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar", "huerfanos"])
         self.assertEqual(ns.apis, ["messages", "chat", "responses"])
         self.assertEqual((ns.inspect, ns.compose_project, ns.mcp_data_dir), ("auto", "h4-plugin", "/data"))
         self.assertIsNone(ns.proxy_url)
@@ -394,6 +565,8 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 6)
         once = ["0.", "1.", "2.", "2b.", "3.", "4.", "6.", "7.1", "7.2", "7.3", "8.1 ", "8.2", "8.3", "8.4", "8.5"]
         once += ["8.6", "8.7", "8.8", "8.9", "8.10", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5", "9.6", "9.7", "9.8"]
+        once += ["10.1 ", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7", "10.8", "10.9", "10.10", "10.11", "10.12"]
+        once += ["10.13", "10.14"]
         for prefix in once:
             self.assertEqual(len([n for n in steps if n.startswith(prefix)]), 1, prefix)
         self.assertFalse(initial, "el interruptor debe quedar apagado, como al empezar")
@@ -425,15 +598,32 @@ class FullRunTest(unittest.TestCase):
             code, steps, out = run_e2e(stack, "--only", "observacion", "--apis", "chat")
         self.assert_all_ok(code, steps, out)
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 2)
-        self.assertFalse([n for n in steps if n.startswith(("8.", "9."))])
+        self.assertFalse([n for n in steps if n.startswith(("8.", "9.", "10."))])
         with fake_h4_stack.FakeH4Stack() as stack:
             code, steps, out = run_e2e(stack, "--only", "interruptor", "--apis", "messages")
         self.assert_all_ok(code, steps, out)
-        self.assertFalse([n for n in steps if n.startswith(("5.", "9."))])
+        self.assertFalse([n for n in steps if n.startswith(("5.", "9.", "10."))])
         with fake_h4_stack.FakeH4Stack() as stack:
             code, steps, out = run_e2e(stack, "--only", "eliminar", "--inspect", "none", inspector=None)
         self.assert_all_ok(code, steps, out)
         self.assertEqual(len([n for n in steps if n.startswith("9.")]), 7, "sin inspector no hay pasos 9.1b ni 9.8")
+        self.assertFalse([n for n in steps if n.startswith("10.")])
+
+    def test_only_the_orphans_group(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "huerfanos", inspector=None)
+            leftovers = sorted(stack.state.orgs)
+            users = sorted(u.email for u in stack.state.users.values() if u.email.startswith("huerf-"))
+            statuses = {u.status for u in stack.state.users.values() if u.email.startswith("huerf-")}
+            keys = [k for u in stack.state.users.values() if u.email.startswith("huerf-") for k in u.keys]
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(len([n for n in steps if n.startswith("10.")]), 14)
+        self.assertFalse([n for n in steps if n.startswith(("5.", "8.", "9."))])
+        self.assertEqual(leftovers, ["baas-ai-ip", "demo", "observacion"], "las cuatro organizaciones se eliminaron")
+        self.assertEqual(len(users), 7)
+        # B, X, A y G (las de O2) y F quedan desactivados; C (O3, false) sigue ACTIVE y E sigue INVITED
+        self.assertEqual(statuses, {"DISABLED", "ACTIVE", "INVITED"})
+        self.assertEqual(sum(not k.revoked for k in keys), 1, "solo la clave de C sigue vigente")
 
     def test_inspect_none_skips_container_steps(self) -> None:
         with fake_h4_stack.FakeH4Stack() as stack:
@@ -509,11 +699,31 @@ class FaultsTest(unittest.TestCase):
         "audit-missing": {"9.7": ("org.deleted",)},
         "delete-removes-users": {"9.5": ("handshake",)},
         "delete-no-reauth": {"9.2": ("sin contraseña", "contraseña incorrecta")},
+        "preview-lists-all": {"10.3": ("lista a quien no se quedaría sin organización",)},
+        "preview-open": {"10.4": ("USER de la organización", "403")},
+        "preview-needs-block": {"10.3": ("409 ORG_NOT_BLOCKED",)},
+        "orphans-kept": {"10.5": ("disabled_users = 0",)},
+        "orphans-ignore-flag": {"10.9": ("disabled_users = 2",)},
+        "orphans-default-off": {"10.10": ("disabled_users = 0",)},
+        "orphans-other-org": {"10.5": ("disabled_users = 2",)},
+        "orphans-invited-skipped": {"10.10": ("no lista a",)},
+        "orphans-keys-kept": {"10.6": ("baas_invalid_api_key", "handshake"), "10.8": ("keys_revoked",)},
+        "orphans-sessions-kept": {"10.6": ("su sesión de antes sigue abierta",)},
+        "orphans-links-kept": {"10.13": ("vuelve a valer",)},
+        "orphans-audit-missing": {"10.8": ("0 fila(s)",)},
+        "orphans-audit-email": {"10.8": ("no debe llevar el email ni el nombre",)},
+        "disabled-can-login": {"10.6": ("inicia sesión con la contraseña correcta",)},
+        "reactivate-orgadmin": {"10.11": ("USER_DISABLED",)},
+        "reactivate-no-audit": {"10.12": ("user.reactivated",)},
+        "reactivate-restores-keys": {"10.12": ("clave de antes", "revocada")},
     }
 
+    ORPHAN_PREFIXES = ("preview-", "orphans-", "reactivate-", "disabled-")  # solo los pasos 10 los comprueban
+
     def run_fault(self, fault: str) -> dict[str, dict]:
+        only = ("--only", "huerfanos") if fault.startswith(self.ORPHAN_PREFIXES) else ()
         with fake_h4_stack.FakeH4Stack(faults={fault}) as stack:
-            code, steps, out = run_e2e(stack, "--trace-timeout", "0.5")
+            code, steps, out = run_e2e(stack, "--trace-timeout", "0.5", *only, inspector=None if only else "stack")
         self.assertEqual(code, 1, f"{fault}: {out}")
         return steps
 
