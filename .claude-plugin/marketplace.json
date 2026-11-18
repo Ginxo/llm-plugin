@@ -9,7 +9,7 @@
     {
       "name": "baas",
       "source": "./",
-      "description": "Plugin de BaaS-AI-IP: /baas-init, /baas-status, skill baas-brain y ejecutor de scripts del MCP"
+      "description": "Plugin de BaaS-AI-IP: /baas-init, /baas-status, /baas-sync (skills de la organización como /<org>:<skill>), skill baas-brain y ejecutor de scripts del MCP"
     }
   ]
 }
