@@ -283,6 +283,7 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--compose-project` | `$COMPOSE_PROJECT_NAME` o `baas-dev` | Proyecto de compose de la pila |
 | `--mcp-data-dir` | `/data` | `BAAS_DATA_DIR` del contenedor del MCP |
 | `--trace-timeout` | `30` | Segundos de espera de cada traza o de lo que se propaga (bloqueo, eliminación, cuarentena) |
+| `--flush-wait` | `2` | Segundos que se espera antes de mirar el AOF vivo en 10.4 (con `appendfsync everysec` Redis puede retrasar hasta 2 s escribir lo que ya recibió) |
 | `--propagation-wait` | `1.5` | Segundos entre cambiar el anonimizador y el turno siguiente (`ai_ip.changed` llega al proxy por Pub/Sub) |
 | `--timeout` | `60` | Tiempo máximo de cada petición HTTP |
 | `--json <fichero>` | — | Informe en JSON (pasos, estado, duración, detalle, identificador de la ejecución) |

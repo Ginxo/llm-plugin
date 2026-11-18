@@ -804,6 +804,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--trace-timeout", type=float, default=30, help="Segundos de espera de cada traza o propagación")
     p.add_argument("--propagation-wait", type=float, default=1.5,
                    help="Segundos entre cambiar el anonimizador y el turno siguiente (Pub/Sub)")  # fmt: skip
+    p.add_argument("--flush-wait", type=float, default=2.0,
+                   help="Segundos de espera antes de mirar el AOF vivo (Redis lo escribe con retraso)")  # fmt: skip
     p.add_argument("--timeout", type=float, default=60, help="Tiempo máximo de cada petición HTTP")
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
@@ -1812,6 +1814,7 @@ class E2EH4:
         """Antes de reescribir nada: la traza de cada turno se escribió (y se borró) en alguna instancia; si fue en la
         persistente, su texto sigue en el AOF vivo aunque ya no esté en memoria (el problema de H4-02)."""
         insp = self.redis_inspector()
+        time.sleep(self.args.flush_wait)  # con appendfsync everysec, Redis puede retrasar hasta 2 s escribir el AOF
         problems = self.data_dir_problems(PERSISTENT)
         found = insp.disk_contains(PERSISTENT, run_needles(self.nonce))
         if found:

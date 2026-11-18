@@ -306,6 +306,7 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual((ns.admin_email, ns.orgadmin_email), ("admin@baas.test", "orgadmin@demo.test"))
         self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar", "originales", "huerfanos"])
         self.assertEqual((ns.anon_org, ns.anon_email), ("privada", "analista@privada.test"))
+        self.assertEqual(ns.flush_wait, 2.0, "Redis con appendfsync everysec puede retrasar la escritura hasta 2 s")
         self.assertEqual(ns.apis, ["messages", "chat", "responses"])
         self.assertEqual((ns.inspect, ns.compose_project, ns.mcp_data_dir), ("auto", "h4-plugin", "/data"))
         self.assertIsNone(ns.proxy_url)
@@ -925,6 +926,25 @@ class ScannerControlTest(unittest.TestCase):
         self.assertEqual([k for k in state.redis[fake_h4_stack.PERSISTENT].live if k.startswith("baas:e2e:")], [])
 
 
+class LiveAofWaitTest(unittest.TestCase):
+    def test_the_live_aof_is_read_after_the_flush_wait(self) -> None:
+        """Redis puede retrasar hasta 2 s escribir su AOF (`appendfsync everysec`): se espera antes de mirarlo, o una
+        fuga reciente pasaría por «limpia»."""
+        with fake_h4_stack.FakeH4Stack() as stack:
+            args = e2e_h4.parse_args(["--flush-wait", "1.5"])
+            e2e = e2e_h4.E2EH4(args, stack.inspector, nonce="abcdefghij")
+            order: list[str] = []
+            real_scan = stack.inspector.disk_contains
+            with (
+                mock.patch.object(e2e_h4.time, "sleep", side_effect=lambda s: order.append(f"sleep {s}")),
+                mock.patch.object(
+                    stack.inspector, "disk_contains", side_effect=lambda *a: (order.append("scan"), real_scan(*a))[1]
+                ),
+            ):
+                e2e.aof_live_clean()
+        self.assertEqual(order, ["sleep 1.5", "scan"])
+
+
 class MissingInspectorTest(unittest.TestCase):
     def test_every_query_fails_saying_how_to_continue(self) -> None:
         missing = e2e_h4.MissingInspector("no hay motor")
@@ -953,7 +973,8 @@ def run_e2e(
     with tempfile.TemporaryDirectory() as tmp:
         report_path = Path(tmp) / "informe.json"
         argv = ["--app-url", stack.app_url, "--fake-url", stack.fake_url, "--trace-timeout", "3",
-                "--propagation-wait", "0", "--timeout", "10", "--json", str(report_path), *extra]  # fmt: skip
+                "--propagation-wait", "0", "--flush-wait", "0", "--timeout", "10",
+                "--json", str(report_path), *extra]  # fmt: skip
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = e2e_h4.main(argv, inspector=stack.inspector if inspector == "stack" else inspector)  # type: ignore[arg-type]
