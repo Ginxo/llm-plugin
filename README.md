@@ -145,7 +145,7 @@ Una skill es un paquete (`SKILL.md`, scripts, plantillas y contexto). Los **ORG_
   python3 "<ruta del plugin>/scripts/baas.py" export <skill> <directorio>
   ```
 
-Sin límites de extensión y con un único tope de tamaño de 500 MiB por fichero (se rechaza antes de subir; lo demás solo avisa), nunca se sube nada de fuera del árbol indicado y el original no se modifica. Detalle, opciones y límites en [docs/publicar-skills.md](docs/publicar-skills.md).
+Sin límites de extensión y con un único tope de tamaño de 500 MiB por fichero (se rechaza antes de subir; lo demás solo avisa; lo que pasa de 4 MiB se sube y se baja por trozos, sin cargarlo en memoria), nunca se sube nada de fuera del árbol indicado y el original no se modifica. Detalle, opciones y límites en [docs/publicar-skills.md](docs/publicar-skills.md).
 
 ## Solución de problemas
 

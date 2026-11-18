@@ -9,6 +9,15 @@ Solo pueden publicar los **ORG_ADMIN** y los **PLATFORM_ADMIN**. Quien tenga el 
 `/baas-sync`. Sin límites de extensión y con un único tope de tamaño de **500 MiB por fichero** (el plugin lo rechaza antes de
 subir; el servidor también); lo demás solo **avisa** (`LARGE_FILE` desde 25 MiB, `LARGE_PACKAGE` desde 100 MiB).
 
+**Ficheros grandes.** Lo que pasa de **4 MiB** no viaja en el mensaje del lote: `publish` lo sube **por trozos** (`baas_begin_upload`
+y `baas_put_chunk`, trozos de 8 MiB con su `sha256`, y el lote atómico lo referencia con `upload_id`), y `sync`, `export` y
+`run-script` lo bajan por trozos (`baas_read_chunk`) y lo escriben a disco según llega. Así la memoria del servidor y la del
+plugin **no crecen con el tamaño del fichero** (con 500 MiB: ≈ 139 MiB en el servidor y ≈ 120 MiB en el cliente, en lugar de
+3,3 GB en el servidor) y el `sha256` se verifica de extremo a extremo. Lo pequeño sigue yendo inline, en el mismo lote
+(hasta 8 MiB por mensaje; si no cabe, el resto también va por trozos). Un `--dry-run` no sube los ficheros grandes: los
+nombra en el informe («se subirán por trozos al publicar») y los ensaya al publicar de verdad. Si el lote se rechaza o
+falla, las cargas se descartan (`baas_abort_upload`). Si el proceso muere sin poder avisar, la carga que quedó a medias se descarta sola a las 24 horas.
+
 ## El camino corto: `/baas-publish`
 
 ```text

@@ -246,6 +246,7 @@ class FakeBaas:
         self.scripts = default_scripts()
         self.skills = default_skills(self.scripts)  # paquetes (hito H5): org → nombre → SkillPackage
         self.package_paths = "store"  # rutas del manifiesto: "store" (skills/<skill>/<ruta>) o "relative"
+        self.chunk_size = 8 * 1024 * 1024  # bytes que devuelve `baas_read_chunk` por omisión (contrato §7.4)
         self.mcp_delay = 0.0  # segundos que tarda el MCP en responder (simula un servidor lento)
         self.list_filter: set[str] | None = None  # si se fija, baas_list_skills solo lista estas skills
         self.global_kill_switch = False
@@ -512,6 +513,8 @@ def make_handler(state: FakeBaas) -> type[BaseHTTPRequestHandler]:
                 return self._list_skills(user, target, args)
             if name in ("baas_get_skill_package", "baas_get_skill_files"):
                 return self._package_tool(user, target, name, args)
+            if name == "baas_read_chunk":
+                return self._read_chunk(user, target, args)
             return _tool_error("INVALID_ARGUMENT", "Tool desconocida", field="name")
 
         # --- skills como paquetes (contrato §7.4) -----------------------------------------
@@ -570,6 +573,43 @@ def make_handler(state: FakeBaas) -> type[BaseHTTPRequestHandler]:
             if ok:
                 info["package_sha256"] = dep.package_sha256
             return info
+
+        def _read_chunk(self, user: UserState, slug: str, args: dict[str, Any]) -> dict[str, Any]:
+            """`baas_read_chunk` (contrato §7.4): un trozo de un fichero de una skill, en base64."""
+            path = args.get("path")
+            parts = path.split("/", 2) if isinstance(path, str) else []
+            if len(parts) != 3 or parts[0] != "skills":
+                return _tool_error("NOT_FOUND", "No existe el fichero", resource=str(path))
+            pkg = state.skills.get(slug, {}).get(parts[1])
+            if pkg is None or (pkg.status != "active" and not self._is_admin(user, slug)):
+                return _tool_error("NOT_FOUND", "La skill no existe", resource=f"skills/{parts[1]}")
+            if not self._can_read(user, slug, pkg):
+                return _tool_error(
+                    "AUTHORIZATION_DENIED", f"No tienes acceso a «{path}».", resource=path, required_roles=pkg.roles
+                )
+            f = pkg.all_files().get(parts[2])
+            if f is None:
+                return _tool_error("NOT_FOUND", "No existe el fichero", resource=path)
+            expected = args.get("expected_sha256")
+            if expected and expected != f.sha256:
+                return _tool_error("CONFLICT", "El fichero cambió", resource=path, current_sha256=f.sha256)
+            offset = int(args.get("offset") or 0)
+            length = int(args.get("length") or state.chunk_size)
+            if offset > len(f.content):
+                return _tool_error("INVALID_ARGUMENT", "Desplazamiento fuera del fichero", field="offset")
+            piece = f.content[offset : offset + length]
+            return _tool_ok(
+                {
+                    "path": path,
+                    "size": len(f.content),
+                    "sha256": f.sha256,
+                    "offset": offset,
+                    "length": len(piece),
+                    "eof": offset + len(piece) >= len(f.content),
+                    "encoding": "base64",
+                    "content": base64.b64encode(piece).decode(),
+                }
+            )
 
         def _package_tool(self, user: UserState, slug: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
             allowed = {"skill", "org"} | ({"paths"} if tool == "baas_get_skill_files" else set())
@@ -647,6 +687,7 @@ TOOLS = [
     "baas_get_script",
     "baas_get_skill_package",
     "baas_get_skill_files",
+    "baas_read_chunk",
     "baas_search_knowledge",
     "baas_read_document",
     "baas_write_document",

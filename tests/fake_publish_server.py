@@ -17,6 +17,7 @@ import base64
 import hashlib
 import json
 import re
+import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -107,6 +108,15 @@ class FakeStore:
         self.kill_scope: str | None = None
         self.corrupt_reads: dict[str, bytes] = {}  # ruta del almacén -> bytes que devolverá `get_skill_files`
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # carga y descarga por trozos (contrato §7.4)
+        self.max_file_bytes = 500 * MiB
+        self.max_chunk = 16 * MiB
+        self.chunk_size = 8 * MiB
+        self.uploads: dict[str, dict[str, Any]] = {}
+        self.lose_put_responses = 0  # cuántos `baas_put_chunk` se aplican pero responden con un corte de red
+        self.corrupt_chunk_once = 0  # cuántos `baas_put_chunk` llegan corruptos (el sha256 del trozo no coincide)
+        self.inline_read_limit: int | None = None  # un `baas_get_skill_files` con un fichero mayor falla (memoria)
+        self.inline_write_limit: int | None = None  # un `baas_write_files` con un `content` mayor falla (memoria)
         self.lock = threading.Lock()
 
     # --- utilidades ----------------------------------------------------------------------------------
@@ -247,6 +257,11 @@ class FakeStore:
 
     def _tool_baas_get_skill_files(self, args: dict[str, Any]) -> dict[str, Any]:
         pkg = self._tool_baas_get_skill_package(args)
+        if self.inline_read_limit is not None:
+            for entry in pkg["files"]:
+                wanted = args.get("paths")
+                if (wanted is None or entry["path"] in wanted) and entry["size"] > self.inline_read_limit:
+                    raise McpToolError("UNAVAILABLE", "Un fichero grande no cabe inline.", {})
         skill = args["skill"]
         wanted = args.get("paths")
         prefix = f"skills/{skill}/" if self.path_style == "store" else ""
@@ -301,6 +316,111 @@ class FakeStore:
         nxt = str(start + limit) if start + limit < len(visible) else None
         return {"files": page, "next_cursor": nxt}
 
+    def _tool_baas_begin_upload(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin()
+        path, size, declared = args.get("path"), args.get("size"), args.get("sha256")
+        bad = path_error(path) if isinstance(path, str) else "path.invalid"
+        if bad:
+            raise McpToolError("INVALID_ARGUMENT", "Ruta no válida", {"field": "path"})
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise McpToolError("INVALID_ARGUMENT", "Tamaño no válido", {"field": "size"})
+        if size > self.max_file_bytes:
+            raise McpToolError("INVALID_ARGUMENT", "El fichero pasa del tope por fichero (MiB)", {"field": "size"})
+        upload_id = secrets.token_urlsafe(18)
+        self.uploads[upload_id] = {"path": path, "size": size, "sha256": declared, "data": bytearray()}
+        return {
+            "upload_id": upload_id,
+            "path": path,
+            "size": size,
+            "chunk_size": self.chunk_size,
+            "max_chunk_size": self.max_chunk,
+            "expires_at": "2099-01-01T00:00:00.000000Z",
+        }
+
+    def _tool_baas_put_chunk(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin()
+        up = self.uploads.get(args.get("upload_id", ""))
+        if up is None:
+            raise McpToolError("NOT_FOUND", "No existe la carga.", {"resource": str(args.get("upload_id"))})
+        data = base64.b64decode(args["content"], validate=True)
+        if len(data) > self.max_chunk:
+            raise McpToolError(
+                "INVALID_ARGUMENT", "Trozo demasiado grande", {"field": "content", "code": "chunk.too_large"}
+            )
+        if self.corrupt_chunk_once > 0:
+            self.corrupt_chunk_once -= 1
+            data = b"\x00" + data[1:]
+        if args.get("sha256") and sha(data) != args["sha256"]:
+            raise McpToolError(
+                "INVALID_ARGUMENT",
+                "El sha256 del trozo no coincide",
+                {"field": "sha256", "code": "chunk.sha256_mismatch"},
+            )
+        received = len(up["data"])
+        if args["offset"] != received:
+            raise McpToolError(
+                "INVALID_ARGUMENT",
+                "El trozo no empieza donde toca",
+                {"field": "offset", "code": "upload.offset", "received": received, "size": up["size"]},
+            )
+        if received + len(data) > up["size"]:
+            raise McpToolError(
+                "INVALID_ARGUMENT", "Se sale del tamaño", {"field": "content", "code": "upload.overflow"}
+            )
+        up["data"] += data
+        if self.lose_put_responses > 0:
+            self.lose_put_responses -= 1
+            from baas_plugin.errors import NetworkError
+
+            raise NetworkError("Se cortó la conexión antes de recibir la respuesta.")
+        return {
+            "upload_id": args["upload_id"],
+            "received": len(up["data"]),
+            "size": up["size"],
+            "complete": len(up["data"]) == up["size"],
+        }
+
+    def _tool_baas_abort_upload(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin()
+        return {"ok": True, "aborted": self.uploads.pop(args.get("upload_id", ""), None) is not None}
+
+    def _tool_baas_read_chunk(self, args: dict[str, Any]) -> dict[str, Any]:
+        path = args.get("path", "")
+        if path not in self.files:
+            raise McpToolError("NOT_FOUND", "No existe el fichero.", {"resource": path})
+        roles = self.knowledge_roles(path) if path.startswith("knowledge/") else self.skill_roles(path.split("/")[1])
+        if not self.can_read(roles):
+            raise McpToolError(
+                "AUTHORIZATION_DENIED", f"No tienes acceso a «{path}».", {"resource": path, "required_roles": roles}
+            )
+        data = self.corrupt_reads.get(path, self.files[path])
+        digest = sha(self.files[path])
+        if args.get("expected_sha256") and args["expected_sha256"] != digest:
+            raise McpToolError("CONFLICT", "El fichero cambió.", {"resource": path, "current_sha256": digest})
+        offset = int(args.get("offset") or 0)
+        length = int(args.get("length") or self.chunk_size)
+        if offset > len(data):
+            raise McpToolError("INVALID_ARGUMENT", "Desplazamiento fuera del fichero", {"field": "offset"})
+        piece = data[offset : offset + min(length, self.max_chunk)]
+        return {
+            "path": path,
+            "size": len(data),
+            "sha256": digest,
+            "offset": offset,
+            "length": len(piece),
+            "eof": offset + len(piece) >= len(data),
+            "encoding": "base64",
+            "content": base64.b64encode(piece).decode(),
+        }
+
+    def _require_admin(self) -> None:
+        if not self.admin:
+            raise McpToolError(
+                "AUTHORIZATION_DENIED",
+                "Solo un administrador puede escribir.",
+                {"resource": "org:" + self.org, "required_roles": ["ORG_ADMIN", "PLATFORM_ADMIN"]},
+            )
+
     def _role_failures(self, path: str, roles: Any) -> list[dict[str, Any]]:
         """`*` (solo) o roles existentes; vale igual en `baas.yaml`, `_acl.yaml` y cabeceras (contrato §7.4)."""
         if roles is None or roles == ["*"]:
@@ -324,23 +444,58 @@ class FakeStore:
         failures: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
         incoming: dict[str, bytes] = {}
+        uploads_used: list[str] = []
         for f in args.get("files") or []:
             path = f.get("path", "")
             bad = path_error(path)
             if bad:
                 failures.append({"path": path, "field": "path", "code": bad, "message": "Ruta no válida"})
                 continue
-            try:
-                data = (
-                    base64.b64decode(f["content"], validate=True)
-                    if f.get("encoding", "utf8") == "base64"
-                    else f["content"].encode("utf-8")
-                )
-            except (ValueError, KeyError):
-                failures.append(
-                    {"path": path, "field": "content", "code": "content.invalid", "message": "Contenido no válido"}
-                )
-                continue
+            consumed: str | None = None
+            if f.get("upload_id") is not None:
+                up = self.uploads.get(f["upload_id"])
+                if "content" in f:
+                    failures.append(
+                        {
+                            "path": path,
+                            "field": "upload_id",
+                            "code": "content.invalid",
+                            "message": "content y upload_id",
+                        }
+                    )
+                    continue
+                if up is None:
+                    failures.append({"path": path, "field": "upload_id", "code": "upload.unknown", "message": "?"})
+                    continue
+                if up["path"] != path:
+                    failures.append({"path": path, "field": "upload_id", "code": "upload.path", "message": "?"})
+                    continue
+                if len(up["data"]) != up["size"]:
+                    failures.append({"path": path, "field": "upload_id", "code": "upload.incomplete", "message": "?"})
+                    continue
+                if up["sha256"] and sha(bytes(up["data"])) != up["sha256"]:
+                    failures.append(
+                        {"path": path, "field": "upload_id", "code": "upload.sha256_mismatch", "message": "?"}
+                    )
+                    continue
+                data = bytes(up["data"])
+                consumed = f["upload_id"]
+            else:
+                try:
+                    data = (
+                        base64.b64decode(f["content"], validate=True)
+                        if f.get("encoding", "utf8") == "base64"
+                        else f["content"].encode("utf-8")
+                    )
+                except (ValueError, KeyError):
+                    failures.append(
+                        {"path": path, "field": "content", "code": "content.invalid", "message": "Contenido no válido"}
+                    )
+                    continue
+                if self.inline_write_limit is not None and len(data) > self.inline_write_limit:
+                    raise McpToolError("UNAVAILABLE", "Un fichero grande no cabe inline.", {})
+            if consumed is not None:
+                uploads_used.append(consumed)
             expected = f.get("expected_sha256")
             current = sha(self.files[path]) if path in self.files else None
             if (expected == "none" and current is not None) or (expected not in (None, "none") and expected != current):
@@ -497,6 +652,8 @@ class FakeStore:
             "estimated_sync_bytes": sum(p["size"] for p in packages),
         }
         if not dry:
+            for upload_id in uploads_used:
+                self.uploads.pop(upload_id, None)
             for path, data in incoming.items():
                 self.versions.append((path, self.files.get(path), "write"))
                 self.files[path] = data
