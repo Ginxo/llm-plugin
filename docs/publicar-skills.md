@@ -46,7 +46,7 @@ exportar) · `10` error del MCP, con su código en `[BAAS_MCP_<código>]`.
 
 ### `inspect`: qué hay en esa skill (solo lectura)
 
-Informe mecánico (texto, o JSON con `--json`) de una carpeta de skill y de los scripts (`--scripts`) y el
+Informe mecánico (texto, o JSON con `--json`; `--list-files` añade la lista completa de ficheros) de una carpeta de skill y de los scripts (`--scripts`) y el
 conocimiento (`--knowledge`) que se le asocien:
 
 | Sección | Qué detecta |

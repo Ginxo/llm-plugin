@@ -408,6 +408,8 @@ def test_cli_json_output(brain: Brain, capsys: pytest.CaptureFixture[str]) -> No
     data = json.loads(out)
     assert data["skill"]["name"] == "facturacion"
     assert data["scripts"]["suggested"]
+    assert "files" not in data  # la lista completa es opcional (--list-files)
+    assert data["summary"]["files"] > 10
 
 
 def test_cli_text_report_in_spanish(brain: Brain, capsys: pytest.CaptureFixture[str]) -> None:
@@ -499,5 +501,11 @@ def test_a_file_name_that_is_not_utf8_does_not_break_the_report(
     brain: Brain, capsys: pytest.CaptureFixture[str]
 ) -> None:
     (brain.skill / "references").joinpath(os.fsdecode(b"raro-\xff.md")).write_text("x\n")
-    assert cli.main(["inspect", str(brain.skill), "--json"]) == 0
+    assert cli.main(["inspect", str(brain.skill), "--json", "--list-files"]) == 0
     assert "raro-" in capsys.readouterr().out
+
+
+def test_cli_json_can_list_every_file(brain: Brain, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["inspect", str(brain.skill), "--json", "--list-files"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert len(data["files"]) == data["summary"]["files"]

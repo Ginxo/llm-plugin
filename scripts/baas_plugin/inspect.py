@@ -1020,6 +1020,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         excludes=args.exclude,
         default_excludes=not args.no_default_excludes,
     )
+    if args.json and not args.list_files:
+        rep = {k: v for k, v in rep.items() if k != "files"}  # con miles de ficheros, la lista llenaría el contexto
     text = json.dumps(rep, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(rep)
     sys.stdout.write(text.encode("utf-8", "backslashreplace").decode("utf-8"))  # un nombre no UTF-8 no rompe la salida
     return 0
@@ -1050,5 +1052,6 @@ def add_inspect_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore
         help="Excluye lo que coincida (glob; `dir/` = solo carpetas)",
     )
     p.add_argument("--no-default-excludes", action="store_true", help="No ignorar .git, __pycache__, node_modules…")
-    p.add_argument("--json", action="store_true", help="Salida en JSON")
+    p.add_argument("--json", action="store_true", help="Salida en JSON (sin la lista de ficheros: usa --list-files)")
+    p.add_argument("--list-files", action="store_true", help="Con --json, incluye la lista completa de ficheros")
     p.set_defaults(func=cmd_inspect)
