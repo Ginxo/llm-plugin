@@ -7,6 +7,7 @@ distribuyen con el plugin.
 - [Hito H3 (AI-IP)](#hito-h3-ai-ip): `dev/e2e_h3.py`, anonimización y rehidratación por el proxy.
 - [Hito H4 (observación y eliminación de organizaciones)](#hito-h4-observación-y-eliminación-de-organizaciones):
   `dev/e2e_h4.py`, el anonimizador apagado, el interruptor y eliminar una organización.
+- [E9 (roles funcionales)](#e9-roles-funcionales): `dev/e9_roles.py`, que los roles aíslan el contenido aunque una skill lo cite.
 
 ## Hito H2 (épica E4)
 
@@ -388,3 +389,54 @@ confirmarlos al integrar:
 ### 6. Resultado
 
 Pendiente de la integración (C2). Contra la pila simulada, la ejecución completa pasa en un par de segundos.
+
+## E9 (roles funcionales)
+
+`dev/e9_roles.py` comprueba contra la pila real que los **roles funcionales aíslan el contenido** de una organización,
+aunque una skill del rol A cite la ruta de un documento del rol B (criterio 6 de la Fase 1). Crea lo que falte, así que
+se puede lanzar las veces que haga falta.
+
+### 1. Cómo lanzarla
+
+La pila de `deploy` en modo desarrollo (`BAAS_DEV_SKIP_TOTP=1`, como `compose.dev.yml`):
+
+```bash
+uv run python dev/e9_roles.py --app-url http://app.localhost:8080 --evidence e9-evidencia.json
+```
+
+Sale con `0` si todo pasa, `1` si algún paso falla y `2` si los argumentos no valen. `--evidence` guarda cada llamada MCP
+con su respuesta (sin API keys ni enlaces de activación; los textos largos se recortan). Los inicios de sesión están
+limitados (20 por minuto y IP): con `RATE_LIMITED` la prueba espera y repite.
+
+### 2. Qué crea y qué comprueba
+
+Como PLATFORM_ADMIN (`admin@baas.test`), por la API de la webapp:
+
+- La organización `e9-prueba` («E9 Prueba») con los roles funcionales `recepcion` y `facturacion`.
+- Cuatro usuarios nuevos (`…@e9.test`, contraseña de desarrollo, activados por la API): un ORG_ADMIN, un USER solo con
+  `recepcion`, un USER solo con `facturacion` y un USER sin rol funcional. Cada ejecución les crea una API key
+  `e9-roles-<fecha>` y revoca las anteriores. Las URL del MCP salen del *handshake*.
+
+Como ORG_ADMIN, **por MCP** y con el procedimiento de las skills `componer-conocimiento` y `componer-skill` de la
+organización meta (buscar antes de crear, cabecera válida, `expected_sha256`, verificar con la búsqueda): un documento
+por rol (`knowledge/recepcion/…`, `knowledge/facturacion/…`), un documento sin roles, y una skill con script por rol
+(`gestion-de-citas`, `emision-de-facturas`) que **cita la ruta del documento del otro rol**.
+
+Después, con la clave de cada usuario (9 búsquedas, filtros por `type` y `area` incluidos):
+
+| Quién | Qué se comprueba |
+| :--- | :--- |
+| ORG_ADMIN y PLATFORM_ADMIN | Leen los siete ficheros y encuentran ambos documentos (control positivo) |
+| USER con `recepcion` | Busca, lee y obtiene su documento, su skill y su script (con su `sha256`); la búsqueda y `baas_list_skills` no devuelven ni dejan ver trozos de lo de `facturacion`; leerlo por su ruta, su skill, su script o **siguiendo la cita de su skill** da `AUTHORIZATION_DENIED` con `required_roles: ["facturacion"]`; escribir da `AUTHORIZATION_DENIED` (`ORG_ADMIN`, `PLATFORM_ADMIN`) y no cambia nada |
+| USER con `facturacion` | Lo simétrico |
+| USER sin rol funcional | `baas_list_skills` vacío, búsquedas vacías y todas las lecturas denegadas |
+| USER de otra organización (`user@otra.test`) | La ruta `/org/e9-prueba/mcp` responde `404 NOT_FOUND`; con `org=e9-prueba` desde su organización, `NOT_FOUND` en cinco tools |
+
+`tests/test_e9_roles.py` prueba sin pila las utilidades puras, que el contenido es válido para el MCP, que lo visible para un
+rol no contiene lo del otro (para que no haya falsos positivos) y que las funciones que buscan fugas detectan una.
+
+### 3. Resultado (2026-11-18, pila `h4-int`)
+
+La primera ejecución crea todo lo que falta (organización, roles, usuarios y los siete ficheros); las siguientes no crean
+nada y repiten las comprobaciones. Con una mutación (el documento de facturación visible también para `recepcion`) el paso del rol `recepcion` falla y nombra la
+ruta, el título y el extracto que se ven.
