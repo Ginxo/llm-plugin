@@ -159,8 +159,6 @@ valen. No se distribuye con el plugin y solo usa la biblioteca estándar.
 | `--purge-wait` | `1` | Segundos entre el borrado y el turno siguiente: `conversation.purge` llega al proxy por Pub/Sub |
 | `--settle` | `2` | Segundos antes de comprobar que las conversaciones borradas no reaparecen |
 | `--timeout` | `60` | Tiempo máximo de cada petición HTTP |
-| `--usage-timeout` | `90` | Grupo `uso`: espera del uso del MCP (ventana de 5 s), de la foto de disco (cada 30 s) y de un servicio que se vuelve a arrancar |
-| `--overhead-n` | `200` | Grupo `uso` (12.10): pares de peticiones (directo y por el proxy) que se miden |
 | `--json <fichero>` | — | Informe en JSON (pasos, estado, duración, detalle, identificador de la ejecución) |
 
 ### 2. Qué comprueba
@@ -185,28 +183,6 @@ conversación en la webapp (`GET /api/v1/conversations?org=privada&q=<ejecución
 | 8.4 | Tras `--settle` segundos, ninguna conversación borrada reaparece (el turno rechazado no emite eventos) |
 | 9 | El mismo primer mensaje, sin historial, recibe `200` con los valores restaurados y abre una conversación **nueva** (id distinto del borrado) |
 | 10 | Ninguna petición de `/_debug/requests` contiene los valores en claro, salvo las de bypass |
-
-**Observabilidad de uso** (grupo `uso`, Fase 4; `dev/e2e_uso.py`, contrato `contrato-fase-4-uso.md` §11). Cada paso crea
-su organización `uso-<ejecución>-<paso>` con usuarios de la semilla como miembros (`orgadmin@demo.test` ORG_ADMIN,
-`analista@demo.test` USER; en 12.6 también `orgadmin@privada.test` y `analista@privada.test`) y la elimina al terminar
-(sin desactivar a nadie). Las esperas sondean cada segundo, como mucho `--trace-timeout` (trazas) o `--usage-timeout`.
-
-| Paso | Qué comprueba |
-| :--- | :--- |
-| 12.1 | N peticiones (Messages, Messages en *stream*, Chat y Responses) → `usage/traffic`: `requests` N, `tokens_in/out` = los que declara el proveedor, `bytes_in` = la longitud exacta de los cuerpos enviados y `bytes_out` = la de los recibidos; la franja local (`hours`, zona de la organización) da N y la complementaria 0; `group_by` `hour`, `weekday_hour` (168 celdas), `user` y `model` (con su proveedor) |
-| 12.2 | `<command-name>/<org>:facturacion</command-name>` (como lo envía Claude Code) y «usa la herramienta skill `<org>:informes`» (el proveedor falso responde con `tool_use` de `Skill`) → `INVOKED` 1 cada una; otro plugin (`otro:cosa`), otra organización (`demo:cosa`), un slug que empieza igual, el listado de skills y `/<org>:x` sin envoltorio → 0 |
-| 12.3 | Una sincronización como la del plugin (`baas_list_skills`, `baas_get_skill_package`, `baas_get_skill_files`) → `SYNCED` 1 y todo lo demás 0 |
-| 12.4 | Lecturas de `knowledge/<área>/<subcarpeta-centinela>/<secreto-centinela>.md` y de `knowledge/<raíz-centinela>.md` y una búsqueda centinela → el evento `content.usage` (leído en `baas:usage` con la webapp en pausa) y `group_by=area` cuentan el área y la raíz; ningún centinela en el evento, en las tablas de uso, en las respuestas de la API (JSON y CSV de todas las agrupaciones, disco y plataforma) ni en los logs de `webapp-api` y `mcp-server`; `EXISTS baas:usage` = 0 en `redis-ephemeral` y 1 en `redis` (con el grupo `webapp`) |
-| 12.5 | Tras escribir una skill con un script y un esquema y un documento, la siguiente foto (`usage/storage`) coincide con `find` sobre `/data/orgs/<slug>` del MCP clasificado como el contrato §4: mismos ficheros y cada categoría y el total con margen del 1 % (si una foto no cuadra, se espera a la siguiente) |
-| 12.6 | Sin sesión `401`, USER `403`, ORG_ADMIN de otra organización `404` (tráfico, contenido y disco) y `403` en `/platform/usage`; cada ORG_ADMIN ve solo lo suyo (y `users` de otra organización da 0); el PLATFORM_ADMIN ve las dos y `/platform/usage`; `usage.viewed` solo con el detalle por persona del PLATFORM_ADMIN, visible en W10 para el ORG_ADMIN |
-| 12.7 | `podman stop` de `webapp-api` y `mcp-server`: 30 peticiones por el proxy responden `200` con la misma respuesta y una latencia sin degradarse frente a las de antes (×1,5 y +5 ms en la mediana, +10 ms en el p95); «datos hasta» (`usage_source_status`) no avanza; al volver (`podman start`), `data_until` se pone al día y las peticiones y la búsqueda pendientes cuentan una sola vez |
-| 12.8 | Filas de tráfico, contenido y foto de hace 3 y de hace 1 mes (`psql`); retención a 2 meses por la API y purga (se ejecuta al arrancar `webapp-api`): las de 3 meses se borran y las de 1 mes no; una conversación borrada sigue contando; eliminar la organización deja 0 filas suyas en el acto; la retención vuelve a su valor |
-| 12.9 | Con la webapp en pausa se leen un `content.usage` y un `turn.completed` reales; tras consumirlos, se reinyectan con `XADD` (mismo `event_id`) y no cambian nada; lo mismo con un `storage.snapshot` propio inyectado dos veces |
-| 12.10 | 200 pares intercalados de ~2 KB (Messages, bypass) directos al proveedor falso y por el proxy con conexión persistente: el p95 del sobrecoste debe quedar por debajo de 10 ms (objetivo de `fase-1-h4-mediciones.md`) |
-
-Con podman, `podman start` de `webapp-api` vuelve a ejecutar sus dependencias ya terminadas (`webapp-migrate` y
-`webapp-seed`, idempotentes); `podman restart` no sirve con `podman-compose` (las da por «no arrancadas»). La pila
-simulada (`dev/fake_h4_stack.py`) no simula este grupo: sus utilidades e inspector se prueban en `tests/test_e2e_uso.py`.
 
 Los pasos que dependen de uno fallido quedan `SALTADO` (y cuentan como fallo). `/_debug/requests` guarda las 50
 últimas peticiones; una ejecución completa envía 22 al proveedor.
@@ -322,6 +298,9 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--flush-wait` | `2` | Segundos que se espera antes de mirar el AOF vivo en 10.4 (con `appendfsync everysec` Redis puede retrasar hasta 2 s escribir lo que ya recibió) |
 | `--propagation-wait` | `1.5` | Segundos entre cambiar el anonimizador y el turno siguiente (`ai_ip.changed` llega al proxy por Pub/Sub) |
 | `--timeout` | `60` | Tiempo máximo de cada petición HTTP |
+| `--usage-timeout` | `90` | Grupo `uso`: espera del uso del MCP (ventana de 5 s), de la foto de disco (cada 30 s) y de un servicio que se vuelve a arrancar |
+| `--overhead-n` | `200` | Grupo `uso` (12.10): pares de peticiones (directo y por el proxy) que se miden |
+| `--usage-window` | `5` | Grupo `uso`: `BAAS_USAGE_WINDOW_SECONDS` del MCP de la pila (5 en desarrollo); 12.3 espera una ventana más 1 s antes de dar el recuento por cerrado |
 | `--json <fichero>` | — | Informe en JSON (pasos, estado, duración, detalle, identificador de la ejecución) |
 
 ### 2. Qué comprueba
@@ -413,10 +392,32 @@ como PLATFORM_ADMIN (`POST …/members` → enlace de activación → `POST /api
 | 11.13 | El PLATFORM_ADMIN invita a G (desactivado y sin activar) a O2 → `201`, `member.status: INVITED` con un enlace **nuevo**; el de antes no vale, el nuevo sí; con él G activa la cuenta, inicia sesión y queda `ACTIVE` en O2; auditoría `user.reactivated` con `metadata` `{org_slug: <O2>, new_status: "INVITED"}` |
 | 11.14 | **Limpieza**: bloquear y eliminar O2 (la última) → `disabled_users: 4` (A, B, X y G ya no tienen otra organización); A, desactivado otra vez, ya no inicia sesión y su clave nueva se rechaza. Las cuentas no se eliminan: quedan `huerf-<ejecución>-*` (C `ACTIVE` y E `INVITED` sin organización; A, B, X, F y G `DISABLED`) |
 
+**Observabilidad de uso** (grupo `uso`, Fase 4; `dev/e2e_uso.py`, contrato `contrato-fase-4-uso.md` §11). Cada paso crea
+su organización `uso-<ejecución>-<paso>` con usuarios de la semilla como miembros (`orgadmin@demo.test` ORG_ADMIN,
+`analista@demo.test` USER; en 12.6 también `orgadmin@privada.test` y `analista@privada.test`) y la elimina al terminar
+(sin desactivar a nadie). Las esperas sondean cada segundo, como mucho `--trace-timeout` (trazas) o `--usage-timeout`.
+
+| Paso | Qué comprueba |
+| :--- | :--- |
+| 12.1 | N peticiones (Messages, Messages en *stream*, Chat y Responses) → `usage/traffic`: `requests` N, `tokens_in/out` = los que declara el proveedor, `bytes_in` = la longitud exacta de los cuerpos enviados y `bytes_out` = la de los recibidos; la franja local (`hours`, zona de la organización) da N y la complementaria 0; `group_by` `hour`, `weekday_hour` (168 celdas), `user` y `model` (con su proveedor) |
+| 12.2 | `<command-name>/<org>:facturacion</command-name>` (como lo envía Claude Code: el envoltorio en un bloque y la petición en otro) y «usa la herramienta skill `<org>:informes`» (el proveedor falso responde con `tool_use` de `Skill`), cada una en una conversación de **dos turnos correlacionados** (comprobado: `turn_count` 2): el segundo vuelve a llevar el comando en el historial o trae `[tool_use: Skill]` y el `tool_result` «Launching skill: …» al principio de su `request_original` → `INVOKED` 1 cada una (un extractor que mirara también ahí contaría 2); otro plugin (`otro:cosa`), otra organización (`demo:cosa-<ejecución>`, que tampoco aparece en `demo`), un slug que empieza igual, el listado de skills y `/<org>:x` sin envoltorio → 0 |
+| 12.3 | Una sincronización como la del plugin (`baas_list_skills`, `baas_get_skill_package`, `baas_get_skill_files`) → `SYNCED` 1 y todo lo demás 0 |
+| 12.4 | Lecturas de `knowledge/<área>/<subcarpeta-centinela>/<secreto-centinela>.md` y de `knowledge/<raíz-centinela>.md` y una búsqueda centinela → el evento `content.usage` (leído en `baas:usage` con la webapp en pausa) y `group_by=area` cuentan el área y la raíz; ningún centinela en el evento, en las tablas de uso, en las respuestas de la API (JSON y CSV de todas las agrupaciones, disco y plataforma) ni en los logs de `webapp-api` y `mcp-server`; `EXISTS baas:usage` = 0 en `redis-ephemeral` y 1 en `redis` (con el grupo `webapp`) |
+| 12.5 | Tras escribir una skill con un script y un esquema y un documento, la siguiente foto (`usage/storage`) coincide con `find` sobre `/data/orgs/<slug>` del MCP clasificado como el contrato §4: mismos ficheros y cada categoría y el total con margen del 1 % (si una foto no cuadra, se espera a la siguiente) |
+| 12.6 | Sin sesión `401`, USER `403`, ORG_ADMIN de otra organización `404` (tráfico, contenido y disco) y `403` en `/platform/usage`; cada ORG_ADMIN ve solo lo suyo (y `users` de otra organización da 0); el PLATFORM_ADMIN ve las dos y `/platform/usage`; `usage.viewed` solo con el detalle por persona del PLATFORM_ADMIN, visible en W10 para el ORG_ADMIN |
+| 12.7 | `podman stop` de `webapp-api` y `mcp-server` (y `podman start` de cada uno aunque el otro falle, esperando a que respondan antes de eliminar la organización): 30 peticiones por el proxy responden `200` con la misma respuesta y una latencia sin degradarse frente a las de antes (×1,5 y +5 ms en la mediana, +10 ms en el p95); «datos hasta» (`usage_source_status`) no avanza; al volver (`podman start`), `data_until` se pone al día y las peticiones y la búsqueda pendientes cuentan una sola vez. «Se queda atrás» se lee en la base con el consumidor parado; lo que importa es la puesta al día exacta. La tolerancia de latencia detecta un bloqueo o un tiempo de espera, no una degradación fina |
+| 12.8 | Filas de tráfico, contenido y foto de hace 61 y de hace 59 meses (`psql`); retención a 60 meses (el máximo) por la API y purga (se ejecuta al arrancar `webapp-api`): las de 61 meses se borran y las de 59 no; una conversación borrada sigue contando; eliminar la organización deja 0 filas suyas en el acto; la retención vuelve a su valor (también si el paso falla). **La purga es global**: con 60 meses no borra nada que la retención normal (13) conserve, pero cualquier arranque de `webapp-api` (también en 12.7) purga con la retención vigente las métricas más antiguas de toda la pila |
+| 12.9 | Con la webapp en pausa se leen un `content.usage` y un `turn.completed` reales; tras consumirlos, se reinyectan con `XADD` (mismo `event_id`) y no cambian nada; lo mismo con un `storage.snapshot` propio inyectado dos veces |
+| 12.10 | 200 pares intercalados de ~2 KB (Messages, bypass) directos al proveedor falso y por el proxy con conexión persistente: el p95 del sobrecoste debe quedar por debajo de 10 ms (objetivo de `fase-1-h4-mediciones.md`). Es un **control grueso**: el proveedor falso añade ~40 ms en muchas respuestas con conexión persistente (Nagle y ACK retardado). Que el proxy **no empeora respecto a la referencia** lo comprueban sus pruebas de sobrecoste en proceso, que no forman parte de este e2e: en `llm-interceptor-proxy`, `GO_IN_CONTAINER=1 scripts/go.sh go test -count=1 -run 'TestBypassOverheadP95\|TestAIIPOverheadP95\|TestObserveOverheadP95' -v ./internal/proxy/` |
+
+Con podman, `podman start` de `webapp-api` vuelve a ejecutar sus dependencias ya terminadas (`webapp-migrate` y
+`webapp-seed`, idempotentes); `podman restart` no sirve con `podman-compose` (las da por «no arrancadas»). La pila
+simulada (`dev/fake_h4_stack.py`) no simula este grupo: sus utilidades e inspector se prueban en `tests/test_e2e_uso.py`.
+
 Los pasos que dependen de uno fallido quedan `SALTADO` (y cuentan como fallo). El bloqueo, la eliminación y la
 cuarentena se esperan hasta `--trace-timeout` s porque llegan a proxy y MCP por Pub/Sub; igual la revocación de claves y
 la pérdida de la membresía en la parte `huerfanos`. Una ejecución completa envía unas 45 peticiones al proveedor, más
-siete de la parte `huerfanos` (`/_debug/requests` guarda las 50 últimas; el grupo `originales` no lo lee). Si una ejecución se corta entre 9.1 y 9.4,
+siete de la parte `huerfanos` y unas 530 del grupo `uso` (sobre todo 12.7 y 12.10) (`/_debug/requests` guarda las 50 últimas; el grupo `originales` no lo lee, y `uso` tampoco). Si una ejecución se corta entre 9.1 y 9.4,
 queda una organización `e2e-<ejecución>` que se puede bloquear y eliminar a mano desde W3; si se corta la parte
 `huerfanos`, quedan organizaciones `huerf-<ejecución>-o1…o4` (se eliminan igual). Los inicios de sesión están limitados a
 20 por minuto y por IP: la parte `huerfanos` inicia sesión unas 15 veces y espera lo que diga `retry_after_seconds` si
