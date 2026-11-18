@@ -312,6 +312,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    from .skillcmds import add_skill_package_parsers  # inspect, publish y export (H5)
+
+    add_skill_package_parsers(sub)
+
     p = sub.add_parser("set-key", help="Guarda la API key en ~/baas-ai-ip/.env sin mostrarla")
     p.add_argument("--stdin", action="store_true", help="Lee la clave de la entrada estándar (tubería)")
     p.add_argument("--app-url", help="URL de la webapp, p. ej. https://app.<dominio>")
