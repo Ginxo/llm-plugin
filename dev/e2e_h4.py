@@ -18,6 +18,12 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
   9.    Eliminar una organización: crear, bloquear y eliminar con confirmación del slug; la webapp, el proxy y el MCP
         dejan de servirla, el slug no se reutiliza, la auditoría lo recoge, el vault queda vacío, Redis sin sus
         claves y el directorio del MCP en cuarentena.
+  11.   Usuarios que se quedan sin organización al eliminar una (contrato §6): la vista previa los lista, la
+        eliminación los desactiva (`disable_orphans`, `true` por omisión) y revoca sus claves personales, quien
+        conserva otra organización no cambia, la auditoría `user.disabled` no lleva su email, un ORG_ADMIN no los
+        reactiva (`409 USER_DISABLED`) y el PLATFORM_ADMIN sí (`user.reactivated`, visible para el ORG_ADMIN de la
+        organización; `user.disabled`, no). Crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y exige
+        `BAAS_DEV_SKIP_TOTP=1` para activarlos.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
@@ -46,6 +52,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -55,17 +62,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_h3 as h3
 from e2e_h2 import DEV_PASSWORD, DEV_TOTP_SECRET, Http, Runner, StepError, check, dev_api_key
 
-from baas_plugin.errors import McpToolError
+from baas_plugin.errors import AuthError, McpToolError
 from baas_plugin.mcp_client import McpClient
 
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
-APIS, API_NAMES, GROUPS = h3.APIS, h3.API_NAMES, ("observacion", "interruptor", "eliminar")
+APIS, API_NAMES, GROUPS = h3.APIS, h3.API_NAMES, ("observacion", "interruptor", "eliminar", "huerfanos")
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
 REASON = "Prueba de punta a punta de H4"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# Grupo «huérfanos»: organizaciones (O1 a O4) y personas de la prueba. Persona → (organización, rol de gobierno)
+ORPHAN_ORGS = ("o1", "o2", "o3", "o4")
+ORPHAN_PEOPLE = {"a": ("o1", "USER"), "b": ("o1", "ORG_ADMIN"), "x": ("o2", "ORG_ADMIN"), "c": ("o3", "USER"),
+                 "e": ("o3", "USER"), "f": ("o4", "USER"), "g": ("o4", "USER")}  # fmt: skip
+ORPHAN_ACTIVATED = ("a", "b", "x", "c", "f")  # las demás (e, g) se quedan INVITED, sin activar la cuenta
+ORPHAN_KEYED = ("a", "b", "c", "f")  # con una clave personal
+ORPHAN_DOMAIN = "huerf.test"
+REVOKED_SUFFIX = " (clave revocada)"
 
 
 # --- utilidades puras ------------------------------------------------------------------------------
@@ -174,6 +189,132 @@ def org_data(body: Any) -> dict[str, Any]:
         nested = body.get("organization")
         return nested if isinstance(nested, dict) else body
     return {}
+
+
+@dataclass
+class Person:
+    """Un usuario que crea el grupo «huérfanos» (11): su email y su nombre son únicos de la ejecución."""
+
+    label: str
+    email: str
+    name: str
+    user_id: str = ""
+    link: str = ""  # token del enlace de activación vigente («» si ya activó la cuenta)
+    key_id: str = ""  # su clave personal vigente
+
+
+def activation_token(url: Any) -> str:
+    """El token de un enlace de activación: lo último de la ruta de `activation_url`."""
+    return str(url or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def is_count(value: Any) -> bool:
+    """Un entero (no un booleano), como `disabled_users` o `personal_keys`."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def audit_rows(body: Any, action: str, target_id: str) -> list[dict[str, Any]]:
+    """Las filas de `action` sobre `target_id` de una respuesta de `GET /api/v1/audit`."""
+    items = body.get("items") if isinstance(body, dict) else None
+    return [
+        i for i in items or [] if isinstance(i, dict) and i.get("action") == action and i.get("target_id") == target_id
+    ]
+
+
+def api_error(res: Http) -> str:
+    """`HTTP <estado> <error>` de una respuesta, sin su cuerpo (puede traer enlaces de activación o claves)."""
+    data = res.json()
+    code = data.get("error") if isinstance(data, dict) else None
+    return f"HTTP {res.status}" + (f" {code}" if isinstance(code, str) else "")
+
+
+def reactivated_audit_problems(row: Any, *, org_slug: str, actor_email: str, new_status: str) -> list[str]:
+    """Una fila `user.reactivated` (contrato §6): quien invita como actor, la organización a la que se invita como
+    `org_id` (su ORG_ADMIN la ve) y `{org_slug, new_status}`; `new_status` es `ACTIVE` si el usuario ya tenía contraseña
+    e `INVITED` si nunca activó la cuenta. Ya no hay `previous_status`."""
+    if not isinstance(row, dict):
+        return [f"la fila no es un objeto JSON: {row!r}"]
+    problems = []
+    actor = row.get("actor")
+    if not isinstance(actor, dict) or actor.get("email") != actor_email:
+        problems.append(f"user.reactivated: actor = {actor!r} (se esperaba {actor_email})")
+    if row.get("org_slug") != org_slug:
+        problems.append(
+            f"user.reactivated: org_slug = {row.get('org_slug')!r} (se esperaba la organización {org_slug})"
+        )
+    meta = row.get("metadata")
+    meta = meta if isinstance(meta, dict) else {}
+    for name, want in (("org_slug", org_slug), ("new_status", new_status)):
+        if meta.get(name) != want:
+            problems.append(f"user.reactivated: metadata.{name} = {meta.get(name)!r} (se esperaba {want!r})")
+    if "previous_status" in meta:
+        problems.append(f"user.reactivated: metadata.previous_status = {meta['previous_status']!r} (ya no existe)")
+    return problems
+
+
+def preview_problems(body: Any, orphans: Sequence[tuple[Person, str, int]], *, members: int) -> list[str]:
+    """La vista previa de eliminar una organización (contrato §6): lista **exactamente** a `orphans` (persona, estado
+    y claves personales vigentes) y a nadie más, y cuenta los `members` de la organización."""
+    if not isinstance(body, dict):
+        return [f"la vista previa no es un objeto JSON: {body!r}"]
+    problems = []
+    if not is_count(body.get("members")) or body.get("members") != members:
+        problems.append(f"members = {body.get('members')!r} (se esperaba {members})")
+    if not is_count(body.get("conversations")) or body["conversations"] < 0:
+        problems.append(f"conversations = {body.get('conversations')!r} (se esperaba un entero)")
+    listed = body.get("orphans")
+    if not isinstance(listed, list):
+        return [*problems, f"orphans no es una lista: {listed!r}"]
+    got = {str(o.get("email")): o for o in listed if isinstance(o, dict)}
+    if len(got) != len(listed):
+        problems.append(f"orphans trae entradas repetidas o sin email: {listed!r}")
+    wanted = {person.email for person, _, _ in orphans}
+    if sorted(set(got) - wanted):
+        problems.append(f"lista a quien no se quedaría sin organización: {', '.join(sorted(set(got) - wanted))}")
+    if sorted(wanted - set(got)):
+        problems.append(f"no lista a: {', '.join(sorted(wanted - set(got)))}")
+    for person, status, keys in orphans:
+        entry = got.get(person.email)
+        if entry is None:
+            continue
+        expected = {"id": person.user_id, "name": person.name, "status": status, "personal_keys": keys}
+        for name, want in expected.items():
+            if entry.get(name) != want or (name == "personal_keys" and not is_count(entry.get(name))):
+                problems.append(f"{person.label}: {name} = {entry.get(name)!r} (se esperaba {want!r})")
+    return problems
+
+
+def disabled_audit_problems(
+    row: Any, *, org_slug: str, previous_status: str, actor_email: str, reason: str, forbidden: Sequence[str],
+    min_keys: int,
+) -> list[str]:  # fmt: skip
+    """Una fila `user.disabled` de la auditoría (contrato §6): quien elimina como actor, `org_id` nulo, el motivo de la
+    eliminación, `{cause: org.deleted, org_slug, previous_status, keys_revoked}` y **ni el email ni el nombre** del
+    usuario. `target_label` no cuenta: la webapp lo deriva al leer, resolviendo la cuenta, y no se guarda en la fila."""
+    if not isinstance(row, dict):
+        return [f"la fila no es un objeto JSON: {row!r}"]
+    problems = []
+    if row.get("target_type") != "user":
+        problems.append(f"target_type = {row.get('target_type')!r} (se esperaba user)")
+    if row.get("reason") != reason:
+        problems.append(f"reason = {row.get('reason')!r} (se esperaba el motivo de la eliminación)")
+    if row.get("org_slug"):
+        problems.append(f"org_slug = {row.get('org_slug')!r} (se esperaba nulo: la organización ya no existe)")
+    actor = row.get("actor")
+    if not isinstance(actor, dict) or actor.get("email") != actor_email:
+        problems.append(f"actor = {actor!r} (se esperaba quien elimina, {actor_email})")
+    meta = row.get("metadata")
+    meta = meta if isinstance(meta, dict) else {}
+    for name, want in (("cause", "org.deleted"), ("org_slug", org_slug), ("previous_status", previous_status)):
+        if meta.get(name) != want:
+            problems.append(f"metadata.{name} = {meta.get(name)!r} (se esperaba {want!r})")
+    if not is_count(meta.get("keys_revoked")) or meta["keys_revoked"] < min_keys:
+        problems.append(f"metadata.keys_revoked = {meta.get('keys_revoked')!r} (se esperaba un entero ≥ {min_keys})")
+    visible = "\n".join(h3.strings_in({k: v for k, v in row.items() if k != "target_label"})).lower()
+    leaked = [f"«{value}»" for value in forbidden if value and value.lower() in visible]
+    if leaked:
+        problems.append(f"la fila lleva {', '.join(leaked)}: no debe llevar el email ni el nombre")
+    return problems
 
 
 # --- WebSocket mínimo (RFC 6455) con la biblioteca estándar --------------------------------------------
@@ -500,6 +641,12 @@ class E2EH4:
         self.conversations: dict[str, dict[str, Conv]] = {"A": {}, "B": {}, "C": {}}
         self.slug = new_slug(self.nonce)
         self.member_binding: dict[str, Any] = {}  # handshake de orgadmin_email en la organización que se elimina
+        prefix = f"huerf-{self.nonce}"  # grupo «huérfanos» (11)
+        self.orph_slugs = {key: f"{prefix}-{key}" for key in ORPHAN_ORGS}
+        self.orph = {label: Person(label, f"{prefix}-{label}@{ORPHAN_DOMAIN}", f"Huerfano {label.upper()} {self.nonce}")
+                     for label in ORPHAN_PEOPLE}  # fmt: skip
+        self.orph_bindings: dict[tuple[str, str], dict[str, Any]] = {}  # (persona, organización) → handshake
+        self.probes = 0
 
     # --- utilidades ------------------------------------------------------------------------------
     def case(self, group: str, api: str, stream: bool = False) -> h3.Case:
@@ -1351,6 +1498,616 @@ class E2EH4:
             problems.append(f"no hay ninguna entrada «{slug}-<fecha>» en .quarantine/ del MCP")
         return problems
 
+    # --- 11: usuarios que se quedan sin organización (huérfanos) --------------------------------------------
+    def slug_of(self, key: str) -> str:
+        return self.orph_slugs[key]
+
+    def raw_login(self, email: str) -> Http:
+        """`POST /api/v1/auth/login` con la contraseña de la prueba. Con `429` (20 inicios por minuto y por IP) espera
+        lo que diga `retry_after_seconds` y repite: esta parte inicia sesión muchas veces."""
+        for attempt in range(3):
+            res = h3.http("POST", f"{self.args.app_url}/api/v1/auth/login",
+                          headers={"X-Requested-With": "baas-webapp"},
+                          payload={"email": email, "password": self.args.password},
+                          timeout=self.args.timeout)  # fmt: skip
+            if res.status != 429 or attempt == 2:
+                break
+            wait = min(int((res.json() or {}).get("retry_after_seconds") or 30), 65)
+            print(f"          (RATE_LIMITED al iniciar sesión como {email}: espero {wait} s)")
+            time.sleep(wait + 1)
+        return res
+
+    def new_session(self, email: str) -> str:
+        res = self.raw_login(email)
+        check(res.status == 200, f"inicio de sesión de {email} → {api_error(res)}")
+        cookie = h3.cookies_from(res.headers).get("baas_session")
+        check(cookie, f"{email}: sin sesión (¿la pila tiene BAAS_DEV_SKIP_TOTP=1?)")
+        return str(cookie)
+
+    def login_refused(self, email: str) -> str | None:
+        """`None` si la webapp no deja iniciar sesión (con la contraseña correcta); si no, qué ocurrió."""
+        res = self.raw_login(email)
+        if res.status in (401, 403) and "baas_session" not in h3.cookies_from(res.headers):
+            return None
+        return f"inicia sesión con la contraseña correcta: {api_error(res)} (se esperaba 401 INVALID_CREDENTIALS)"
+
+    def status_problems(self, email: str, *, orgs: set[str] | None) -> list[str]:
+        """`GET /api/v1/me` con la sesión que `email` ya tenía: sigue `ACTIVE` y, con `orgs`, tiene esas organizaciones
+        y ninguna más."""
+        res = self.webapp("GET", "/api/v1/me", email)
+        if res.status != 200:
+            return [f"{email}: GET /api/v1/me → {api_error(res)} (se esperaba 200)"]
+        data = res.json() or {}
+        problems = []
+        if data.get("status") != "ACTIVE":
+            problems.append(f"{email}: status = {data.get('status')!r} (se esperaba ACTIVE)")
+        got = {str(m.get("org_slug")) for m in data.get("memberships") or [] if isinstance(m, dict)}
+        if orgs is not None and got != orgs:
+            problems.append(f"{email}: organizaciones {sorted(got)} (se esperaba {sorted(orgs)})")
+        return problems
+
+    def key_revoked(self, email: str, key_id: str) -> bool | None:
+        """¿Está revocada la clave `key_id` en `GET /api/v1/api-keys?scope=mine`? `None` si no aparece."""
+        res = self.webapp("GET", "/api/v1/api-keys?scope=mine", email)
+        check(res.status == 200, f"GET /api/v1/api-keys ({email}) → {api_error(res)}")
+        for item in (res.json() or {}).get("items") or []:
+            if isinstance(item, dict) and item.get("id") == key_id:
+                return bool(item.get("revoked_at"))
+        return None
+
+    def member_invite(
+        self, org_key: str, email: str, role: str, *, name: str | None = None, who: str | None = None
+    ) -> Http:
+        body: dict[str, Any] = {"email": email, "governance_role": role}
+        if name:
+            body["name"] = name
+        return self.admin_post(f"/api/v1/orgs/{self.slug_of(org_key)}/members", body, who=who)
+
+    def invite_person(self, label: str, org_key: str, role: str) -> None:
+        """Invita a un usuario nuevo: nace `INVITED` y la respuesta trae su enlace de activación."""
+        p = self.orph[label]
+        res = self.member_invite(org_key, p.email, role, name=p.name)
+        check(res.status == 201, f"invitar a {p.email} a «{self.slug_of(org_key)}» → {api_error(res)}")
+        body = res.json() or {}
+        member = body.get("member") or {}
+        p.user_id, p.link = str(member.get("user_id") or ""), activation_token(body.get("activation_url"))
+        check(
+            p.user_id and p.link and member.get("status") == "INVITED",
+            f"invitar a {p.email}: se esperaba un usuario INVITED con enlace de activación "
+            f"(status = {member.get('status')!r}, enlace: {'sí' if p.link else 'no'})",
+        )
+
+    def activate_person(self, label: str) -> None:
+        """Fija la contraseña con el enlace: con `BAAS_DEV_SKIP_TOTP=1` la webapp responde `200 {"next": "DONE"}`."""
+        p = self.orph[label]
+        res = h3.http("POST", f"{self.args.app_url}/api/v1/auth/activation/{p.link}/password",
+                      headers={"X-Requested-With": "baas-webapp"},
+                      payload={"password": self.args.password, "locale": "es"}, timeout=self.args.timeout)  # fmt: skip
+        got = (res.json() or {}).get("next")
+        check(
+            res.status == 200 and got == "DONE",
+            f"activar a {p.email} → {api_error(res)} next = {got!r} (esta parte necesita BAAS_DEV_SKIP_TOTP=1)",
+        )
+        p.link = ""
+
+    def create_key(self, label: str) -> None:
+        """La clave personal de `label` (`POST /api/v1/api-keys`); se guarda en `self.keys` y nunca se imprime."""
+        p = self.orph[label]
+        res = self.webapp("POST", "/api/v1/api-keys", p.email, {"label": f"huerf-{self.nonce}"})
+        check(res.status == 201, f"crear la clave de {p.email} → {api_error(res)}")
+        body = res.json() or {}
+        secret = str(body.get("secret") or "")
+        check(secret.startswith("baas_"), f"la clave de {p.email} no tiene la forma esperada")
+        p.key_id = str((body.get("key") or {}).get("id") or "")
+        check(p.key_id, f"la respuesta de crear la clave de {p.email} no trae el id de la clave")
+        self.keys[p.email] = secret
+
+    def handshake_orgs(self, who: str) -> tuple[Http, dict[str, dict[str, Any]]]:
+        """El handshake con la clave de `who`: la respuesta y, si fue `200`, sus organizaciones por slug."""
+        res = h3.http("POST", f"{self.args.app_url}/api/v1/plugin/handshake",
+                      headers={"Authorization": f"Bearer {self.key_of(who)}"}, payload={},
+                      timeout=self.args.timeout)  # fmt: skip
+        listed = (res.json() or {}).get("organizations") if res.status == 200 else None
+        orgs: dict[str, dict[str, Any]] = {}
+        for org in listed or []:
+            if isinstance(org, dict) and org.get("slug"):
+                orgs[str(org["slug"])] = h3.override_proxy(org, self.args.proxy_url) if self.args.proxy_url else org
+        return res, orgs
+
+    def chat_probe(self, binding: dict[str, Any], who: str) -> tuple[int, str | None]:
+        """Un turno de Chat Completions de `who` por el proxy: (estado, `error.code` del proveedor)."""
+        self.probes += 1
+        tag = h3.case_tag(self.nonce, "huerfanos", "chat", f"sonda{self.probes}")
+        payload = h3.request_body("chat", f"e2e-h4-{self.nonce}-huerfanos-chat-{self.probes}", f"{tag}. Hola.")
+        got = self.send(binding, who, "chat", payload)[1]
+        return got.status, h3.provider_error(got.body)[1]
+
+    def mcp_whoami(self, binding: dict[str, Any], who: str) -> None:
+        with McpClient(str(binding["mcp_url"]), self.key_of(who), timeout=self.args.timeout) as mcp:
+            mcp.call_tool("baas_whoami", {})
+
+    def key_serves(self, binding: dict[str, Any], who: str) -> list[str]:
+        """La clave de `who` vale en el proxy (`200`) y en el MCP (`baas_whoami`) de `binding`."""
+        problems = []
+        status, code = self.chat_probe(binding, who)
+        if status != 200:
+            problems.append(f"el proxy respondió HTTP {status} {code or ''} (se esperaba 200)")
+        try:
+            self.mcp_whoami(binding, who)
+        except Exception as exc:
+            problems.append(f"el MCP: {type(exc).__name__}: {exc}")
+        return problems
+
+    def key_rejected(self, binding: dict[str, Any], who: str) -> list[str]:
+        """La clave de `who` está revocada: el proxy responde `401 baas_invalid_api_key` y el MCP `401`."""
+        problems = []
+        status, code = self.chat_probe(binding, who)
+        if (status, code) != (401, "baas_invalid_api_key"):
+            problems.append(f"el proxy respondió HTTP {status} {code or ''} (se esperaba 401 baas_invalid_api_key)")
+        try:
+            self.mcp_whoami(binding, who)
+            problems.append("el MCP sigue aceptando la clave")
+        except AuthError:
+            pass
+        except McpToolError as exc:
+            problems.append(f"el MCP respondió {exc.code} (se esperaba 401: clave rechazada)")
+        except Exception as exc:
+            problems.append(f"el MCP: {type(exc).__name__}: {exc}")
+        return problems
+
+    def key_without_org(self, binding: dict[str, Any], who: str) -> list[str]:
+        """La clave de `who` sigue vigente pero la organización de `binding` ya no existe: el proxy responde
+        `403 baas_access_denied` y el MCP `404` (no `401`)."""
+        problems = []
+        status, code = self.chat_probe(binding, who)
+        if (status, code) != (403, "baas_access_denied"):
+            problems.append(f"el proxy respondió HTTP {status} {code or ''} (se esperaba 403 baas_access_denied)")
+        try:
+            self.mcp_whoami(binding, who)
+            problems.append("el MCP sigue sirviendo la organización eliminada")
+        except McpToolError as exc:
+            if exc.code != "NOT_FOUND":
+                problems.append(f"el MCP respondió {exc.code} (se esperaba 404 NOT_FOUND)")
+        except AuthError:
+            problems.append("el MCP rechazó la clave (401): no estaba revocada")
+        except Exception as exc:
+            problems.append(f"el MCP: {type(exc).__name__}: {exc}")
+        return problems
+
+    def disabled_problems(self, label: str, org_key: str) -> list[str]:
+        """Quien se quedó sin organización: no inicia sesión (con su contraseña, que es la correcta), su sesión de antes
+        está cerrada y su clave se rechaza en la webapp (handshake), el proxy y el MCP."""
+        p, problems = self.orph[label], []
+        refused = self.login_refused(p.email)
+        if refused:
+            problems.append(refused)
+        res = self.webapp("GET", "/api/v1/me", p.email)  # la sesión de antes de desactivarlo
+        if res.status != 401:
+            problems.append(f"su sesión de antes sigue abierta: GET /api/v1/me → {api_error(res)} (se esperaba 401)")
+        hs, _ = self.handshake_orgs(p.email)
+        if hs.status != 401:
+            problems.append(f"el handshake con su clave → {api_error(hs)} (se esperaba 401)")
+        binding = self.orph_bindings[(label, org_key)]
+        problems += self.poll(lambda: self.key_rejected(binding, p.email))
+        return [f"{label}: {m}" for m in problems]
+
+    def delete_with(self, org_key: str, **fields: Any) -> dict[str, Any]:
+        """Bloquea la organización y la elimina con `fields` (la reautenticación va aparte): devuelve la respuesta."""
+        slug = self.slug_of(org_key)
+        res = self.admin_post(f"/api/v1/orgs/{slug}/block", {"blocked": True, "reason": REASON}, method="PUT")
+        check(res.status == 200, f"PUT …/block de «{slug}» → {api_error(res)}")
+        body = self.delete_body(reason=REASON, confirm_slug=slug, **fields)
+        res = self.admin_post(f"/api/v1/orgs/{slug}/delete", body)
+        check(
+            res.status == 200,
+            f"POST …/delete de «{slug}» con {sorted(fields) or 'sin disable_orphans'} → {api_error(res)}",
+        )
+        answer = res.json() or {}
+        check(
+            isinstance(answer.get("propagated"), bool),
+            f"la respuesta no trae «propagated»: {h3.snippet(res.body, 200)}",
+        )
+        check(
+            is_count(answer.get("disabled_users")),
+            f"la respuesta no trae «disabled_users» (un entero): {h3.snippet(res.body, 200)}",
+        )
+        return answer
+
+    def audit_body(self, action: str) -> Any:
+        res = self.webapp("GET", f"/api/v1/audit?action={action}&limit=200", self.args.admin_email)
+        check(res.status == 200, f"GET /api/v1/audit?action={action} → {api_error(res)}")
+        return res.json()
+
+    def audit_targets(self, action: str) -> set[str]:
+        items = (self.audit_body(action) or {}).get("items") or []
+        return {str(i.get("target_id")) for i in items if isinstance(i, dict)}
+
+    # 11.1
+    def orph_setup(self) -> str:
+        a = self.args
+        for key, slug in self.orph_slugs.items():
+            res = self.admin_post("/api/v1/orgs", {"slug": slug, "name": f"Huérfanos {key.upper()} {self.nonce}"})
+            check(res.status == 201, f"crear «{slug}» → {api_error(res)}")
+        for label, (org, role) in ORPHAN_PEOPLE.items():
+            self.invite_person(label, org, role)
+        for label in ORPHAN_ACTIVATED:
+            self.activate_person(label)
+        b = self.orph["b"]  # B es ORG_ADMIN de O1 y USER de O2: ya activa, la segunda invitación no lleva enlace
+        res = self.member_invite("o2", b.email, "USER")
+        check(
+            res.status == 201 and not (res.json() or {}).get("activation_url"),
+            f"invitar a {b.email} a «{self.slug_of('o2')}» → {api_error(res)}",
+        )
+        res = self.member_invite("o1", a.admin_email, "USER")  # el PLATFORM_ADMIN también es miembro de O1
+        check(res.status == 201, f"invitar a {a.admin_email} a «{self.slug_of('o1')}» → {api_error(res)}")
+        for label in ORPHAN_ACTIVATED:
+            self.sessions[self.orph[label].email] = self.new_session(self.orph[label].email)
+        for label in ORPHAN_KEYED:
+            self.create_key(label)
+        return (
+            f"4 organizaciones (huerf-{self.nonce}-o1…o4), 7 usuarios (5 activados con sesión, E y G sin activar) y "
+            f"{len(ORPHAN_KEYED)} claves personales; O1: A (USER), B (ORG_ADMIN) y {a.admin_email}; "
+            "O2: X (ORG_ADMIN) y B (USER); O3: C y E; O4: F y G"
+        )
+
+    # 11.2
+    def orph_keys_serve(self) -> str:
+        expected = {"a": ["o1"], "b": ["o1", "o2"], "c": ["o3"], "f": ["o4"]}
+        for label, orgs in expected.items():
+            p = self.orph[label]
+            res, got = self.handshake_orgs(p.email)
+            check(res.status == 200, f"handshake de {p.email} → {api_error(res)}")
+            want = {self.slug_of(o) for o in orgs}
+            check(set(got) == want, f"el handshake de {p.email} lista {sorted(got)} (se esperaba {sorted(want)})")
+            for org in orgs:
+                self.orph_bindings[(label, org)] = got[self.slug_of(org)]
+        problems: list[str] = []
+        for label, orgs in expected.items():
+            for org in orgs:
+                binding, who = self.orph_bindings[(label, org)], self.orph[label].email
+                found = self.poll(partial(self.key_serves, binding, who))
+                problems += [f"{label} en {org}: {m}" for m in found]
+        check(not problems, "\n".join(problems))
+        return "A (O1), B (O1 y O2), C (O3) y F (O4): handshake, proxy (200) y MCP (baas_whoami) con su clave personal"
+
+    # 11.3
+    def orph_preview(self) -> str:
+        a, slug, person = self.args, self.slug_of("o1"), self.orph["a"]
+        org = self.webapp("GET", f"/api/v1/orgs/{slug}", a.admin_email)
+        check(
+            org.status == 200 and org_data(org.json()).get("blocked") is False,
+            f"GET /api/v1/orgs/{slug} → {api_error(org)}: se esperaba la organización sin bloquear",
+        )
+        res = self.webapp("GET", f"/api/v1/orgs/{slug}/delete-preview", a.admin_email)
+        check(res.status == 200, f"GET …/delete-preview (organización sin bloquear) → {api_error(res)}")
+        problems = preview_problems(res.json(), [(person, "ACTIVE", 1)], members=3)
+        check(not problems, "\n".join(problems))
+        return (
+            f"«{slug}» sin bloquear: 3 miembros y un solo candidato, {person.email} (ACTIVE, 1 clave personal); "
+            f"no lista a B (tiene O2) ni a {a.admin_email}"
+        )
+
+    # 11.4
+    def orph_preview_permissions(self) -> str:
+        a, slug, listed = self.args, self.slug_of("o1"), self.orph["a"].email
+        path = f"/api/v1/orgs/{slug}/delete-preview"
+        problems: list[str] = []
+        cases = (("a", "USER de la organización", (403,)), ("b", "ORG_ADMIN de la organización", (403,)),
+                 ("x", "ORG_ADMIN de otra organización", (403, 404)))  # fmt: skip
+        for label, what, allowed in cases:
+            res = self.webapp("GET", path, self.orph[label].email)
+            if res.status not in allowed:
+                problems.append(f"{what}: {api_error(res)} (se esperaba {' o '.join(map(str, allowed))})")
+            if listed.encode() in res.body:
+                problems.append(f"{what}: la respuesta lista a {listed}")
+        anonymous = h3.http("GET", f"{a.app_url}{path}", timeout=a.timeout)
+        if anonymous.status != 401:
+            problems.append(f"sin sesión: {api_error(anonymous)} (se esperaba 401)")
+        missing = self.webapp("GET", f"/api/v1/orgs/{slug}-no-existe/delete-preview", a.admin_email)
+        if missing.status != 404:
+            problems.append(f"una organización inexistente: {api_error(missing)} (se esperaba 404)")
+        problems += self.status_problems(listed, orgs={slug})  # solo lectura: nada cambió
+        still = self.webapp("GET", f"/api/v1/orgs/{slug}", a.admin_email)
+        if still.status != 200:
+            problems.append(f"tras las consultas, GET /api/v1/orgs/{slug} → {api_error(still)}")
+        check(not problems, "\n".join(problems))
+        return (
+            "USER y ORG_ADMIN de la organización → 403, ORG_ADMIN de otra → 403 o 404, sin sesión → 401, "
+            "organización inexistente → 404; la vista previa no cambió nada"
+        )
+
+    # 11.5
+    def orph_delete_explicit(self) -> str:
+        slug = self.slug_of("o1")
+        answer = self.delete_with("o1", disable_orphans=True)
+        check(answer["disabled_users"] == 1, f"disabled_users = {answer['disabled_users']} (se esperaba 1: solo A)")
+        gone = self.webapp("GET", f"/api/v1/orgs/{slug}", self.args.admin_email)
+        check(gone.status == 404, f"tras eliminar, GET /api/v1/orgs/{slug} → {api_error(gone)} (se esperaba 404)")
+        return (
+            f"«{slug}» bloqueada y eliminada con disable_orphans: true → 200, disabled_users = 1 "
+            f"(propagated: {str(answer['propagated']).lower()})"
+        )
+
+    # 11.6
+    def orph_a_disabled(self) -> str:
+        problems = self.disabled_problems("a", "o1")
+        check(not problems, "\n".join(problems))
+        return (
+            f"{self.orph['a'].email}: no inicia sesión con su contraseña, su sesión de antes está cerrada y su clave "
+            "se rechaza (handshake 401, proxy 401 baas_invalid_api_key, MCP 401)"
+        )
+
+    # 11.7
+    def orph_b_intact(self) -> str:
+        a, b, o2 = self.args, self.orph["b"], self.slug_of("o2")
+        problems = self.status_problems(b.email, orgs={o2})  # la sesión que ya tenía sigue abierta
+        try:
+            self.new_session(b.email)
+        except StepError as exc:
+            problems.append(str(exc))
+        if self.key_revoked(b.email, b.key_id) is not False:
+            problems.append(f"{b.email}: su clave personal no figura como vigente en GET /api/v1/api-keys")
+        res, orgs = self.handshake_orgs(b.email)
+        if res.status != 200 or set(orgs) != {o2}:
+            problems.append(f"handshake de {b.email}: {api_error(res)}, organizaciones {sorted(orgs)} (solo {o2})")
+        problems += self.poll(lambda: self.key_serves(self.orph_bindings[("b", "o2")], b.email))
+        for who in (a.admin_email, self.orph["x"].email, self.orph["c"].email, self.orph["f"].email):
+            problems += self.status_problems(who, orgs=None)
+        check(not problems, "\n".join(problems))
+        return (
+            f"{b.email} sigue ACTIVE, solo con «{o2}»: su sesión de antes y su contraseña valen y su clave sigue "
+            "vigente (handshake, proxy y MCP en O2); el PLATFORM_ADMIN, X, C y F siguen ACTIVE"
+        )
+
+    # 11.8
+    def orph_audit_disabled(self) -> str:
+        a, person, o1 = self.args, self.orph["a"], self.slug_of("o1")
+        body = self.audit_body("user.disabled")
+        rows = audit_rows(body, "user.disabled", person.user_id)
+        check(len(rows) == 1, f"user.disabled de A: {len(rows)} fila(s) (se esperaba 1)")
+        problems = disabled_audit_problems(
+            rows[0], org_slug=o1, previous_status="ACTIVE", actor_email=a.admin_email, reason=REASON,
+            forbidden=[person.email, person.name], min_keys=1,
+        )  # fmt: skip
+        targets = {str(i.get("target_id")) for i in (body or {}).get("items") or [] if isinstance(i, dict)}
+        problems += [f"hay una fila user.disabled de {label}, que conserva su organización"
+                     for label in ("b", "x", "c", "f") if self.orph[label].user_id in targets]  # fmt: skip
+        check(not problems, "\n".join(problems))
+        return (
+            f"user.disabled de A: actor {a.admin_email}, motivo de la eliminación, cause org.deleted, org_slug «{o1}», "
+            "previous_status ACTIVE, keys_revoked ≥ 1, sin organización y sin su email ni su nombre "
+            "(salvo target_label, que la webapp deriva al leer); ninguna fila de B, X, C ni F"
+        )
+
+    # 11.9
+    def orph_keep(self) -> str:
+        c, e, o3 = self.orph["c"], self.orph["e"], self.slug_of("o3")
+        answer = self.delete_with("o3", disable_orphans=False)
+        check(
+            answer["disabled_users"] == 0,
+            f"disabled_users = {answer['disabled_users']} (se esperaba 0 con disable_orphans: false)",
+        )
+        problems = self.status_problems(c.email, orgs=set())  # sigue ACTIVE, ahora sin ninguna organización
+        try:
+            self.new_session(c.email)
+        except StepError as exc:
+            problems.append(str(exc))
+        if self.key_revoked(c.email, c.key_id) is not False:
+            problems.append(f"{c.email}: su clave personal no figura como vigente en GET /api/v1/api-keys")
+        res, orgs = self.handshake_orgs(c.email)
+        if res.status != 200 or orgs:
+            problems.append(f"handshake de {c.email}: {api_error(res)}, organizaciones {sorted(orgs)} (200 y ninguna)")
+        problems += self.poll(lambda: self.key_without_org(self.orph_bindings[("c", "o3")], c.email))
+        link = h3.http("GET", f"{self.args.app_url}/api/v1/auth/activation/{e.link}", timeout=self.args.timeout)
+        if (link.json() or {}).get("status") != "VALID":
+            problems.append(f"el enlace de activación de {e.email} (INVITED) ya no vale")
+        disabled = self.audit_targets("user.disabled")
+        problems += [f"hay una fila user.disabled de {p.label}" for p in (c, e) if p.user_id in disabled]
+        check(not problems, "\n".join(problems))
+        return (
+            f"«{o3}» eliminada con disable_orphans: false → disabled_users = 0: C sigue ACTIVE sin organización "
+            "(contraseña y clave vigentes; el proxy responde 403 baas_access_denied y el MCP 404), el enlace de E "
+            "sigue valiendo y no hay filas user.disabled de ellos"
+        )
+
+    # 11.10
+    def orph_default(self) -> str:
+        f_, g, o4, app = self.orph["f"], self.orph["g"], self.slug_of("o4"), self.args.app_url
+        pre = self.webapp("GET", f"/api/v1/orgs/{o4}/delete-preview", self.args.admin_email)
+        check(pre.status == 200, f"GET …/delete-preview de «{o4}» → {api_error(pre)}")
+        problems = preview_problems(pre.json(), [(f_, "ACTIVE", 1), (g, "INVITED", 0)], members=2)
+        check(not problems, "vista previa de O4 (F ACTIVE con clave, G INVITED):\n" + "\n".join(problems))
+        old_link = g.link
+        answer = self.delete_with("o4")  # sin «disable_orphans»: vale true
+        check(
+            answer["disabled_users"] == 2,
+            f"disabled_users = {answer['disabled_users']} (se esperaba 2, F y G, sin el campo disable_orphans)",
+        )
+        problems = self.disabled_problems("f", "o4")
+        link = h3.http("GET", f"{app}/api/v1/auth/activation/{old_link}", timeout=self.args.timeout)
+        if (link.json() or {}).get("status") == "VALID":
+            problems.append(f"g: el enlace de activación sin usar de {g.email} sigue valiendo")
+        res = h3.http("POST", f"{app}/api/v1/auth/activation/{old_link}/password",
+                      headers={"X-Requested-With": "baas-webapp"},
+                      payload={"password": self.args.password, "locale": "es"}, timeout=self.args.timeout)  # fmt: skip
+        if res.status == 200:
+            problems.append(f"g: se pudo activar la cuenta de {g.email} con el enlace de antes")
+        body = self.audit_body("user.disabled")
+        for person, previous, min_keys in ((f_, "ACTIVE", 1), (g, "INVITED", 0)):
+            rows = audit_rows(body, "user.disabled", person.user_id)
+            if len(rows) != 1:
+                problems.append(f"{person.label}: {len(rows)} fila(s) user.disabled (se esperaba 1)")
+                continue
+            found = disabled_audit_problems(
+                rows[0], org_slug=o4, previous_status=previous, actor_email=self.args.admin_email, reason=REASON,
+                forbidden=[person.email, person.name], min_keys=min_keys,
+            )  # fmt: skip
+            problems += [f"{person.label}: {m}" for m in found]
+        check(not problems, "\n".join(problems))
+        return (
+            f"«{o4}» eliminada sin el campo disable_orphans → disabled_users = 2: F (ACTIVE) ya no inicia sesión, su "
+            "sesión está cerrada y su clave se rechaza; G (INVITED) no puede activar la cuenta con su enlace; una "
+            "fila user.disabled de cada uno (previous_status ACTIVE e INVITED), sin email ni nombre"
+        )
+
+    # 11.11
+    def orph_reactivate_denied(self) -> str:
+        a, x, o2 = self.orph["a"], self.orph["x"], self.slug_of("o2")
+        res = self.member_invite("o2", a.email, "USER", who=x.email)
+        check(
+            res.status == 409 and (res.json() or {}).get("error") == "USER_DISABLED",
+            f"X (ORG_ADMIN de «{o2}») invita a {a.email}, desactivado → {api_error(res)} "
+            "(se esperaba 409 USER_DISABLED)",
+        )
+        listing = self.webapp("GET", f"/api/v1/orgs/{o2}/members", x.email)
+        check(listing.status == 200, f"GET /api/v1/orgs/{o2}/members (X) → {api_error(listing)}")
+        emails = {str(m.get("email")) for m in (listing.json() or {}).get("members") or [] if isinstance(m, dict)}
+        problems = []
+        if a.email in emails:
+            problems.append(f"{a.email} figura como miembro de «{o2}»")
+        refused = self.login_refused(a.email)
+        if refused:
+            problems.append(refused)
+        check(not problems, "\n".join(problems))
+        return f"el ORG_ADMIN de «{o2}» que invita a {a.email} recibe 409 USER_DISABLED: no se añade ni se reactiva"
+
+    # 11.12
+    def orph_reactivate_a(self) -> str:
+        a, o2, adm = self.orph["a"], self.slug_of("o2"), self.args.admin_email
+        old_who, old_key, old_id = a.email + REVOKED_SUFFIX, self.keys[a.email], a.key_id
+        res = self.member_invite("o2", a.email, "USER")
+        check(
+            res.status == 201, f"el PLATFORM_ADMIN invita a {a.email}, desactivado → {api_error(res)} (se esperaba 201)"
+        )
+        body = res.json() or {}
+        member = body.get("member") or {}
+        check(
+            member.get("user_id") == a.user_id and member.get("status") == "ACTIVE" and not body.get("activation_url"),
+            "se esperaba reactivar a A como ACTIVE y sin enlace (tenía contraseña): "
+            f"status = {member.get('status')!r}, enlace: {'sí' if body.get('activation_url') else 'no'}",
+        )
+        self.sessions[a.email] = self.new_session(a.email)  # la contraseña se conserva
+        problems = self.status_problems(a.email, orgs={o2})
+        if self.key_revoked(a.email, old_id) is not True:
+            problems.append("su clave de antes no figura como revocada en GET /api/v1/api-keys")
+        self.keys[old_who] = old_key  # la clave revocada, para seguir comprobándola
+        self.create_key("a")
+        res, orgs = self.handshake_orgs(a.email)
+        if res.status != 200 or set(orgs) != {o2}:
+            problems.append(f"handshake con la clave nueva: {api_error(res)}, organizaciones {sorted(orgs)}")
+        else:
+            binding = self.orph_bindings[("a", "o2")] = orgs[o2]  # miembro de O2: la clave de antes solo falla revocada
+            problems += [f"clave nueva: {m}" for m in self.poll(lambda: self.key_serves(binding, a.email))]
+            problems += [f"clave de antes: {m}" for m in self.poll(lambda: self.key_rejected(binding, old_who))]
+        hs, _ = self.handshake_orgs(old_who)
+        if hs.status != 401:
+            problems.append(f"el handshake con la clave de antes → {api_error(hs)} (se esperaba 401)")
+        rows = audit_rows(self.audit_body("user.reactivated"), "user.reactivated", a.user_id)
+        if len(rows) != 1:
+            problems.append(f"{len(rows)} fila(s) user.reactivated de A (se esperaba 1)")
+        else:
+            problems += reactivated_audit_problems(rows[0], org_slug=o2, actor_email=adm, new_status="ACTIVE")
+        invited = audit_rows(self.audit_body("member.invited"), "member.invited", a.user_id)
+        if not [r for r in invited if r.get("org_slug") == o2]:
+            problems.append(f"ninguna fila member.invited de A en «{o2}» (la reactivación también da de alta)")
+        check(not problems, "\n".join(problems))
+        return (
+            f"el PLATFORM_ADMIN invita a {a.email} a «{o2}» → 201, ACTIVE y sin enlace; inicia sesión con la "
+            "contraseña de siempre; su clave de antes sigue revocada (api-keys, handshake 401, proxy 401, MCP 401) y "
+            "la nueva vale; auditoría user.reactivated (en O2, new_status ACTIVE) y member.invited"
+        )
+
+    # 11.12b
+    def orph_audit_visibility(self) -> str:
+        """W10: el ORG_ADMIN de O2 ve `user.reactivated` de A (es de su organización) y ninguna fila `user.disabled`
+        (no tienen organización: pertenecen a la plataforma); el PLATFORM_ADMIN ve las dos."""
+        a, x, o2, adm = self.orph["a"], self.orph["x"], self.slug_of("o2"), self.args.admin_email
+
+        def seen_by_x(query: str) -> Any:
+            res = self.webapp("GET", f"/api/v1/audit?{query}limit=200", x.email)
+            check(res.status == 200, f"GET /api/v1/audit?{query.rstrip('&')} (X, ORG_ADMIN de O2) → {api_error(res)}")
+            return res.json()
+
+        problems: list[str] = []
+        listing = seen_by_x("")
+        rows = audit_rows(listing, "user.reactivated", a.user_id)
+        if len(rows) != 1:
+            problems.append(f"X ve {len(rows)} fila(s) user.reactivated de A en la lista (se esperaba 1)")
+        else:
+            problems += [
+                f"X: {m}"
+                for m in reactivated_audit_problems(rows[0], org_slug=o2, actor_email=adm, new_status="ACTIVE")
+            ]
+        for where, body in (("en la lista", listing), ("filtrando por la acción", seen_by_x("action=user.disabled&"))):
+            items = [i for i in (body or {}).get("items") or [] if isinstance(i, dict)]
+            disabled = [i for i in items if i.get("action") == "user.disabled"]
+            if disabled:
+                problems.append(f"X ve {len(disabled)} fila(s) user.disabled {where}: no debe ver ninguna")
+        for action in ("user.disabled", "user.reactivated"):  # el PLATFORM_ADMIN ve las dos
+            found = len(audit_rows(self.audit_body(action), action, a.user_id))
+            if found != 1:
+                problems.append(f"el PLATFORM_ADMIN ve {found} fila(s) {action} de A (se esperaba 1)")
+        check(not problems, "\n".join(problems))
+        return (
+            f"el ORG_ADMIN X de «{o2}» ve user.reactivated de A (con org_slug «{o2}») y ninguna fila user.disabled, "
+            "ni en la lista ni filtrando por la acción; el PLATFORM_ADMIN ve las dos"
+        )
+
+    # 11.13
+    def orph_reactivate_g(self) -> str:
+        g, o2, app = self.orph["g"], self.slug_of("o2"), self.args.app_url
+        old = g.link
+        res = self.member_invite("o2", g.email, "USER")
+        check(
+            res.status == 201,
+            f"el PLATFORM_ADMIN invita a {g.email}, desactivado y sin activar → {api_error(res)} (se esperaba 201)",
+        )
+        body = res.json() or {}
+        member, new = body.get("member") or {}, activation_token(body.get("activation_url"))
+        check(
+            member.get("user_id") == g.user_id and member.get("status") == "INVITED" and new and new != old,
+            f"se esperaba reactivar a G como INVITED con un enlace nuevo: status = {member.get('status')!r}, "
+            f"enlace: {'nuevo' if new and new != old else 'ninguno o el mismo de antes'}",
+        )
+        problems = []
+        for what, token, valid in (("de antes", old, False), ("nuevo", new, True)):
+            res = h3.http("GET", f"{app}/api/v1/auth/activation/{token}", timeout=self.args.timeout)
+            if ((res.json() or {}).get("status") == "VALID") is not valid:
+                problems.append(f"el enlace {what} {'no vale' if valid else 'vuelve a valer'}")
+        check(not problems, "\n".join(problems))
+        g.link = new
+        self.activate_person("g")
+        self.sessions[g.email] = self.new_session(g.email)
+        problems = self.status_problems(g.email, orgs={o2})
+        rows = audit_rows(self.audit_body("user.reactivated"), "user.reactivated", g.user_id)
+        if len(rows) != 1:
+            problems.append(f"{len(rows)} fila(s) user.reactivated de G (se esperaba 1)")
+        else:
+            problems += reactivated_audit_problems(
+                rows[0], org_slug=o2, actor_email=self.args.admin_email, new_status="INVITED"
+            )
+        check(not problems, "\n".join(problems))
+        return (
+            f"{g.email} (nunca activó la cuenta): el PLATFORM_ADMIN lo reactiva en «{o2}» como INVITED con un enlace "
+            "nuevo; el de antes sigue invalidado; con el nuevo activa la cuenta, inicia sesión y queda ACTIVE; "
+            "auditoría user.reactivated (en O2, new_status INVITED)"
+        )
+
+    # 11.14
+    def orph_cleanup(self) -> str:
+        o2 = self.slug_of("o2")
+        answer = self.delete_with("o2", disable_orphans=True)
+        check(
+            answer["disabled_users"] == 4, f"disabled_users = {answer['disabled_users']} (se esperaba 4: A, B, X y G)"
+        )
+        problems = self.disabled_problems("a", "o2")
+        check(not problems, "\n".join(problems))
+        return (
+            f"«{o2}» (la última de la prueba) bloqueada y eliminada → disabled_users = 4 (A reactivado, B, X y G, sin "
+            "otra organización); A, desactivado otra vez, ya no inicia sesión y su clave nueva se rechaza. Quedan "
+            f"cuentas huerf-{self.nonce}-* sin organización (las cuentas no se eliminan)"
+        )
+
     # --- el recorrido ------------------------------------------------------------------------------
     def run(self, runner: Runner) -> None:
         a = self.args
@@ -1437,6 +2194,38 @@ class E2EH4:
             step("9.7 la auditoría conserva org.deleted", self.audit_survives, needs=[deleted])
             if self.inspector is not None:
                 step("9.8 vault vacío, Redis sin claves y MCP en cuarentena", self.inside, needs=[deleted])
+        if "huerfanos" in groups:
+            base = [s0, s1, s3]
+            setup = "11.1 crear 4 organizaciones y 7 usuarios (invitar, activar, claves personales)"
+            serve = "11.2 las claves personales valen (handshake, proxy y MCP)"
+            preview = "11.3 vista previa: lista a quien se quedaría sin organización y a nadie más"
+            perms = "11.4 vista previa: solo el PLATFORM_ADMIN (y solo lectura)"
+            explicit = "11.5 eliminar con disable_orphans: true desactiva solo a quien no tiene otra organización"
+            disabled = "11.6 el usuario desactivado: sin inicio de sesión, sesión cerrada y clave rechazada"
+            intact = "11.7 quien conserva otra organización no cambia"
+            audit = "11.8 auditoría user.disabled: causa y claves revocadas, sin email ni nombre"
+            keep = "11.9 disable_orphans: false no desactiva a nadie"
+            default = "11.10 sin el campo disable_orphans se desactiva (el valor por omisión es true)"
+            denied = "11.11 un ORG_ADMIN no reactiva a un desactivado: 409 USER_DISABLED"
+            react_a = "11.12 el PLATFORM_ADMIN lo reactiva: contraseña, clave antigua revocada y user.reactivated"
+            visible = "11.12b auditoría (W10): el ORG_ADMIN ve user.reactivated y no user.disabled"
+            react_g = "11.13 un invitado sin activar vuelve a INVITED con un enlace nuevo"
+            step(setup, self.orph_setup, needs=base)
+            step(serve, self.orph_keys_serve, needs=[setup])
+            step(preview, self.orph_preview, needs=[serve])
+            step(perms, self.orph_preview_permissions, needs=[serve])
+            step(explicit, self.orph_delete_explicit, needs=[preview, perms])
+            step(disabled, self.orph_a_disabled, needs=[explicit])
+            step(intact, self.orph_b_intact, needs=[explicit])
+            step(audit, self.orph_audit_disabled, needs=[explicit])
+            step(keep, self.orph_keep, needs=[serve, intact])
+            step(default, self.orph_default, needs=[serve, intact])
+            step(denied, self.orph_reactivate_denied, needs=[disabled])
+            step(react_a, self.orph_reactivate_a, needs=[denied, audit])
+            step(visible, self.orph_audit_visibility, needs=[react_a])
+            step(react_g, self.orph_reactivate_g, needs=[default, react_a])
+            step("11.14 eliminar la última organización de la prueba: 4 usuarios desactivados",
+                 self.orph_cleanup, needs=[react_a, visible, react_g, keep])  # fmt: skip
 
 
 def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> int:
