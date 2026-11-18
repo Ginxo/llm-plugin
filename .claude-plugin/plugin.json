@@ -1,7 +1,7 @@
 {
   "name": "baas",
   "displayName": "BaaS-AI-IP",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Conecta Claude Code con BaaS-AI-IP: vincula el proyecto a una organización (/baas-init), muestra su estado (/baas-status), sincroniza las skills de la organización como /<organización>:<skill> (/baas-sync), publica y exporta skills de la organización (/baas-publish, /baas-export), enseña al agente a usar el MCP `baas` y ejecuta scripts verificados por hash.",
   "author": {
     "name": "BaaS-AI-IP",

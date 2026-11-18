@@ -2,7 +2,7 @@
 # lo carga desde el marketplace y sus scripts usan únicamente la biblioteca estándar.
 [project]
 name = "baas-llm-plugin"
-version = "0.1.0"
+version = "0.2.0"
 description = "Plugin de Claude Code para BaaS-AI-IP (skills + scripts Python, solo biblioteca estándar)"
 readme = "README.md"
 requires-python = ">=3.10"
