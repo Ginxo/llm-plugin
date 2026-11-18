@@ -2,7 +2,13 @@
 
 Códigos de salida (las skills los interpretan): 0 ok · 2 configuración (falta la clave o la URL)
 · 3 hay que elegir organización · 4 sin organizaciones · 5 clave no válida · 6 red o servidor
-· 7 proyecto inseguro · 8 organización ajena · 9 hash del script no coincide · 10 error del MCP.
+· 7 proyecto inseguro · 8 organización ajena · 9 hash de un fichero no coincide · 10 error del MCP
+· 11 paquete inválido (ruta insegura) · 12 sincronización incompleta · 13 directorio ajeno.
+
+`run-script` es la excepción: devuelve **íntegro** el código de salida del script, que puede ser
+cualquiera (también 9 o 10). Sus errores propios salen, además, con una línea `BAAS_ERROR=<código>` en
+stderr (p. ej. `SCRIPT_HASH_MISMATCH`, `AUTHORIZATION_DENIED`, `KILL_SWITCH_ACTIVE`): sin esa línea, el
+código de salida es el del script.
 """
 
 from __future__ import annotations
@@ -333,6 +339,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except BaasError as exc:
+        if args.command == "run-script":
+            # Un script puede salir con cualquier código (también 9 o 10): esta línea marca un error del plugin.
+            print(f"BAAS_ERROR={exc.error_code}", file=sys.stderr)
         print(exc.render(), file=sys.stderr)
         return exc.exit_code
     except KeyboardInterrupt:
