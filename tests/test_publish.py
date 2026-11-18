@@ -565,3 +565,10 @@ def test_dependencies_are_published_first_and_the_warning_goes_away(brain: Brain
     package = store._tool_baas_get_skill_package({"skill": "facturacion"})
     assert [d["name"] for d in package["depends_on"]["skills"]] == ["gestor", "md-to-doc"]
     assert all(d["accessible"] for d in package["depends_on"]["skills"])
+
+
+def test_a_file_name_that_is_not_utf8_is_refused_before_calling_the_server(brain: Brain, store: FakeStore) -> None:
+    (brain.skill / "assets" / os.fsdecode(b"raro-\xff.bin")).write_bytes(b"x")
+    with pytest.raises(ConfigError, match="UTF-8"):
+        publish.run_publish(DirectClient(store), opts(brain))
+    assert writes(store) == []

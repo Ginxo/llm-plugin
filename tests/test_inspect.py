@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -492,3 +493,11 @@ def test_big_text_files_are_still_analysed_without_being_kept_in_memory(brain: B
     entry = next(f for f in rep["files"] if f["path"] == "references/grande.txt")
     assert entry["text"] is True
     assert entry["size"] > 1024 * 1024
+
+
+def test_a_file_name_that_is_not_utf8_does_not_break_the_report(
+    brain: Brain, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (brain.skill / "references").joinpath(os.fsdecode(b"raro-\xff.md")).write_text("x\n")
+    assert cli.main(["inspect", str(brain.skill), "--json"]) == 0
+    assert "raro-" in capsys.readouterr().out

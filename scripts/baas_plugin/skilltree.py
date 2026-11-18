@@ -211,6 +211,10 @@ def check_store_path(path: str) -> str | None:
     """Reglas de ruta del almacén (contrato §7.4). Devuelve el motivo del rechazo o `None` si vale."""
     if not path or path.startswith("/") or "\\" in path or _CONTROL.search(path):
         return "ruta vacía, absoluta o con `\\` o caracteres de control"
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return "el nombre no es UTF-8 válido"
     if len(path.encode("utf-8")) > 1024:
         return "más de 1024 bytes"
     for seg in path.split("/"):

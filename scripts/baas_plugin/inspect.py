@@ -1020,7 +1020,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         excludes=args.exclude,
         default_excludes=not args.no_default_excludes,
     )
-    sys.stdout.write(json.dumps(rep, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(rep))
+    text = json.dumps(rep, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(rep)
+    sys.stdout.write(text.encode("utf-8", "backslashreplace").decode("utf-8"))  # un nombre no UTF-8 no rompe la salida
     return 0
 
 

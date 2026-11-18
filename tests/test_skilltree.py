@@ -155,6 +155,7 @@ def test_encoding_is_utf8_only_for_valid_text_without_nul(data: bytes, encoding:
         ("skills/f/x\x00y", False),
         ("skills/f/x\ny", False),
         ("skills/f/./x", False),
+        ("skills/f/\udcff.txt", False),  # nombre que no es UTF-8 válido
         ("", False),
         ("skills/f/" + "a" * 256, False),
         ("skills/" + "/".join(["abcdefgh"] * 200), False),
