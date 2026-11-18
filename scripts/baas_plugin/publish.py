@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -297,7 +298,7 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
             f"«{skill_dir}» no es una skill: no contiene SKILL.md.",
             hint="Indica la carpeta de la skill; los scripts y el conocimiento van en --include-scripts y --knowledge.",
         )
-    name = opts.name or skill_dir.resolve().name
+    name = opts.name or Path(os.path.abspath(skill_dir)).name  # el nombre dado, no el del destino de un enlace
     _check_name(name)
     for label, paths in (("--include-scripts", opts.scripts), ("--knowledge", [p for p, _ in opts.knowledge])):
         for p in paths:
@@ -477,6 +478,12 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
     if pkg_size > LARGE_PACKAGE_BYTES:
         warnings.append(
             f"LARGE_PACKAGE: el paquete pesa {pkg_size / 1048576:.0f} MiB; cada sincronización lo descarga."
+        )
+    fm_name = rep["frontmatter"]["name"]
+    if fm_name and fm_name != name:
+        warnings.append(
+            f"El `name` de SKILL.md («{fm_name}») no coincide con el nombre de publicación («{name}»): "
+            f"la skill se invocará como /<organización>:{name}."
         )
     if "roles" not in manifest:
         warnings.append("Sin roles: la skill quedará solo para administradores (usa --roles).")

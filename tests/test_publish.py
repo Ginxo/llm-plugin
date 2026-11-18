@@ -539,3 +539,15 @@ def test_directory_mapping_warns_that_acl_covers_the_whole_directory(brain: Brai
         opts(brain, knowledge=[(brain.knowledge / "templates", "fiscal/templates")], knowledge_roles=["revisor"]),
     )
     assert any("_acl.yaml" in w and "todo ese directorio" in w for w in result.plan.warnings)
+
+
+def test_publishing_through_a_symlink_uses_the_given_name(brain: Brain, store: FakeStore, tmp_path: Path) -> None:
+    link = tmp_path / "otro-nombre"
+    os.symlink(brain.skill, link)
+    publish.run_publish(DirectClient(store), PublishOptions(skill_dir=link, roles=["*"]))
+    assert "skills/otro-nombre/SKILL.md" in store.files
+
+
+def test_name_mismatch_with_the_frontmatter_is_warned(brain: Brain, store: FakeStore) -> None:
+    result = publish.run_publish(DirectClient(store), opts(brain, name="facturas", dry_run=True))
+    assert any("facturacion" in w and "facturas" in w for w in result.plan.warnings)

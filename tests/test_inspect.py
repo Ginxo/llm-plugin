@@ -449,3 +449,36 @@ def test_knowledge_with_a_known_prefix_is_shown_under_its_store_path(brain: Brai
     assert targets["knowledge/fiscal/ledger-facturas.json"]["exists_locally"] is True
     assert targets["knowledge/fiscal/templates/factura-pro.typ"]["exists_locally"] is True
     assert any(i["file"] == "knowledge/fiscal/perfil-fiscal-y-regimen.md" for i in rep["sensitive"]["items"])
+
+
+def test_rewrites_never_repeat_sensitive_data_from_the_surrounding_line(report: dict) -> None:
+    cmds = [r for r in report["rewrites"] if r["kind"] == "md_script_command"]
+    # la línea `scripts/facturacion.py client-add --nif … --email …` solo aporta el trozo que cambia
+    assert any(r["before"] == " scripts/facturacion.py " for r in cmds)
+    dumped = json.dumps(report["rewrites"])
+    for secret in (NIF, EMAIL):
+        assert secret not in dumped
+    assert all(len(r["before"]) < 60 for r in cmds)
+
+
+def test_two_scripts_on_one_line_are_rewritten_independently(tmp_path: Path, brain: Brain) -> None:
+    skill = brain.skill
+    (skill / "SKILL.md").write_text(
+        "---\nname: facturacion\ndescription: d\n---\n\n```bash\n"
+        "python3 scripts/facturacion.py x && python3 scripts/render_doc.py y\n```\n"
+    )
+    rep = skill_inspect.inspect_skill(skill, scripts=[brain.scripts])
+    mine = [r for r in rep["rewrites"] if r["file"] == "SKILL.md"]
+    new = skill_inspect.apply_rewrites((skill / "SKILL.md").read_text(), mine)
+    expected = 'python3 "${CLAUDE_SKILL_DIR}/scripts/facturacion.py" x && '
+    expected += 'python3 "${CLAUDE_SKILL_DIR}/scripts/render_doc.py" y'
+    assert expected in new
+
+
+def test_name_is_the_one_given_even_through_a_symlink(brain: Brain, tmp_path: Path) -> None:
+    import os
+
+    link = tmp_path / "enlace-a-facturacion"
+    os.symlink(brain.skill, link)
+    rep = skill_inspect.inspect_skill(link)
+    assert rep["skill"]["name"] == "enlace-a-facturacion"

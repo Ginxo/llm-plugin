@@ -51,6 +51,7 @@ El emisor es la persona con NIF {NIF} (CIF de la sociedad {CIF}), IBAN {IBAN} y 
 ```bash
 python3 scripts/facturacion.py preflight
 python3 scripts/render_doc.py --template knowledge/fiscal/templates/factura-pro.typ
+python3 scripts/facturacion.py client-add --nif {NIF} --email {EMAIL}
 ```
 
 Sandbox: `typst` (`/home/ana/.local/bin/typst`) no es visible dentro del sandbox; usa `mmdc` para los diagramas.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import posixpath
 import re
 import sys
@@ -206,7 +207,7 @@ def inspect_skill(
                 f"Colisión de rutas: {disp} aparece {len(group)} veces (skill y scripts); se subiría una sola."
             )
 
-    skill_name = skill.name
+    skill_name = Path(os.path.abspath(skill_dir)).name or skill.name  # el nombre dado (no el destino de un enlace)
     skill_md = next(i for i in items if i.area == "skill" and i.rel == "SKILL.md")
     fm = skillmeta.parse_frontmatter(skill_md.text or "")
     fm_name = fm.data.get("name") if isinstance(fm.data.get("name"), str) else None
@@ -611,7 +612,7 @@ def inspect_skill(
                     rewrites.append(_command_rewrite(it, ref, md))
             else:
                 missing_scripts.setdefault(tgt, {"target": tgt, "from": it.disp, "line": ref["line"]})
-    rewrites = _merge_command_rewrites(rewrites)
+    rewrites = _sort_rewrites(rewrites)
 
     # --- grafo de scripts y cierre ----------
     edges: dict[str, set[str]] = {}
@@ -807,45 +808,32 @@ def _root_rewrite(it: Item, chain: dict[str, Any], kind: str) -> dict[str, Any] 
 
 
 def _command_rewrite(it: Item, ref: dict[str, Any], md: scan_md.MdResult) -> dict[str, Any]:
-    line = md.lines[ref["line"] - 1]
+    """Una reescritura por cada aparición de `scripts/x`, con solo un carácter de contexto a cada lado.
+
+    Así el informe no repite el resto de la línea (que puede llevar datos sensibles) y cada cambio es mínimo.
+    """
+    lineno = ref["line"]
+    line = md.lines[lineno - 1]
+    token = ref["target"]
+    start = ref["start"]
+    end = start + len(token)
+    prev = line[start - 1] if start > 0 else ""
+    nxt = line[end] if end < len(line) else ""
+    new = "${CLAUDE_SKILL_DIR}/" + token
+    quote = md.fenced[lineno - 1] and prev in ("", " ", "\t") and nxt in ("", " ", "\t", "\\")
     return {
         "kind": "md_script_command",
         "file": it.disp,
-        "line": ref["line"],
-        "before": line.strip(),
-        "after": _rewrite_command_line(line, md.fenced[ref["line"] - 1]).strip(),
-        "target": ref["target"],
+        "line": lineno,
+        "before": prev + token + nxt,
+        "after": prev + (f'"{new}"' if quote else new) + nxt,
+        "target": token,
         "note": "los scripts del paquete se invocan con ${CLAUDE_SKILL_DIR}",
     }
 
 
-_BARE = re.compile(r"(?<![\w./~$-])(scripts/[A-Za-z0-9_][A-Za-z0-9_./-]*[A-Za-z0-9_])")
-
-
-def _rewrite_command_line(line: str, fenced: bool) -> str:
-    def sub(m: re.Match[str]) -> str:
-        new = "${CLAUDE_SKILL_DIR}/" + m.group(1)
-        prev = line[m.start() - 1] if m.start() > 0 else " "
-        nxt = line[m.end()] if m.end() < len(line) else " "
-        if fenced and prev in " \t" and nxt in " \t\\":
-            return f'"{new}"'
-        return new
-
-    return _BARE.sub(sub, line)
-
-
-def _merge_command_rewrites(rewrites: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Una línea con varios scripts da una sola reescritura (con todos), y no se repiten las de la misma línea."""
-    out: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, int]] = set()
-    for r in rewrites:
-        key = (r["kind"], r["file"], r["line"])
-        if r["kind"] == "md_script_command":
-            if key in seen:
-                continue
-            seen.add(key)
-        out.append(r)
-    return sorted(out, key=lambda r: (r["file"], r["line"], r["kind"]))
+def _sort_rewrites(rewrites: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(rewrites, key=lambda r: (r["file"], r["line"], r["kind"]))
 
 
 def filter_rewrites(rewrites: list[dict[str, Any]], included: set[str]) -> list[dict[str, Any]]:
