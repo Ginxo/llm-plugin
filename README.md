@@ -46,6 +46,7 @@ Los comandos también responden con su nombre completo: `/baas:baas-init`, `/baa
 | :--- | :--- | :--- |
 | `~/baas-ai-ip/.env` (0600, directorio 0700) | `BAAS_API_KEY` y `BAAS_APP_URL` | No: está en tu `HOME` |
 | `~/baas-ai-ip/bin/baas_mcp_headers.py` | *Helper* que da a Claude Code la cabecera del MCP leyendo `.env` | No |
+| `~/baas-ai-ip/bin/baas_desktop_credentials.py` | Solo con Claude Desktop en modo gateway (`desktop-config`): da a Desktop la API key de Anthropic y la cabecera `X-Baas-Api-Key` leyendo `.env` | No |
 | `<proyecto>/.claude/settings.local.json` (0600) | `ANTHROPIC_BASE_URL` (proxy de la organización) y `ANTHROPIC_CUSTOM_HEADERS` con `X-Baas-Api-Key`. Se conservan tus otros ajustes | **No**: el plugin lo añade a `.gitignore` y se niega a escribir si ya está versionado |
 | `<proyecto>/.claude/baas.local.json` | Organización y URLs (sin secretos) | **No** (`.gitignore`) |
 | `~/.claude.json` (ámbito *local* del proyecto) | Servidor MCP `baas` (URL y `headersHelper`, **sin** la clave) | No |
@@ -71,6 +72,27 @@ Límite aceptado: un script ya ejecutado no se puede «revocar» (riesgo S6).
 
 El plugin `baas` es de Claude Code, pero **Codex CLI** también puede pasar por el proxy de OpenAI de tu organización con un perfil de usuario y `env_http_headers` (la clave de BaaS-AI-IP solo en el entorno de Codex, nunca en un fichero): ver [docs/codex.md](docs/codex.md).
 
+## Claude Desktop (pestaña Code)
+
+La pestaña Code de Claude Desktop **no aplica el proxy del proyecto**: con cuenta de claude.ai, Desktop arranca Claude Code con `ANTHROPIC_BASE_URL=https://api.anthropic.com` e ignora la de `.claude/settings.local.json`. Las peticiones irían directas a Anthropic, sin AI-IP ni trazas, y con la cabecera `X-Baas-Api-Key` (que sí se aplica).
+
+**Guardia (fallo cerrado).** El plugin trae dos *hooks* (`hooks/hooks.json` → `scripts/baas_guard.py`): en un proyecto vinculado cuya sesión no pase por el proxy, `SessionStart` avisa y `UserPromptSubmit` **bloquea cada prompt** con la explicación. En proyectos no vinculados no hacen nada. Cubre también el CLI sin la confianza aceptada.
+
+**Para trabajar en un proyecto BaaS**, elige:
+
+1. **CLI o IDE** (recomendado): usan el proxy del proyecto y tu suscripción de claude.ai.
+2. **Desktop en modo gateway** («configuración de inferencia de terceros»):
+   - Es **global** a Desktop: todas sus sesiones pasan por el proxy de **una** organización.
+   - Desktop **deja de usar la suscripción de claude.ai**: necesitas una API key de **Anthropic Console**, que el proxy reenvía a Anthropic.
+   - El soporte de este modo en Desktop para Linux no está confirmado.
+
+   ```bash
+   python3 <plugin>/scripts/baas.py set-key --anthropic     # en una terminal: guarda ANTHROPIC_API_KEY en ~/baas-ai-ip/.env
+   python3 <plugin>/scripts/baas.py desktop-config --project <proyecto>
+   ```
+
+   `desktop-config` instala `~/baas-ai-ip/bin/baas_desktop_credentials.py` e imprime (sin secretos) los valores para Developer → Configure Third-Party Inference: `inferenceProvider: gateway`, `inferenceGatewayBaseUrl` = proxy de la organización, `inferenceGatewayAuthScheme: x-api-key` y `inferenceCredentialHelper` = el *helper*, que devuelve `{"token": <API key de Anthropic>, "headers": {"X-Baas-Api-Key": <API key de BaaS>}}`. Con Desktop en ese modo, `/baas-status` debe decir «Proxy activo en esta sesión: sí» y la guardia deja pasar los prompts.
+
 ## Solución de problemas
 
 | Síntoma | Causa y solución |
@@ -82,7 +104,7 @@ El plugin `baas` es de Claude Code, pero **Codex CLI** también puede pasar por 
 | `[BAAS_PROJECT_UNSAFE]` | `.claude/settings.local.json` está versionado (`git rm --cached …`) o no es JSON válido |
 | `/mcp` no muestra `baas` | Reinicia Claude Code. Si `/baas-init` avisó de que no encontró `claude`, ejecuta el comando que imprimió |
 | `baas` conecta pero falla con 401 | No aceptaste la confianza en la carpeta: el `headersHelper` solo se ejecuta en carpetas de confianza |
-| `/baas-status`: «esta sesión no pasa por el proxy» | Reinicia la sesión y acepta la confianza. En la **pestaña Code de Claude Desktop** el proxy por proyecto no se aplica (Desktop fija su propia Base URL): usa el CLI o el IDE |
+| Prompt bloqueado / `/baas-status`: «esta sesión no pasa por el proxy» | Reinicia la sesión y acepta la confianza. En la **pestaña Code de Claude Desktop** ver [Claude Desktop](#claude-desktop-pestaña-code) |
 | `KILL_SWITCH_ACTIVE` o 403 «Acceso bloqueado por BaaS-AI-IP» | La plataforma está detenida o tu organización bloqueada o pausada: habla con tu administrador |
 | `[BAAS_SCRIPT_HASH_MISMATCH]` | El script no coincide con su hash: no se ejecutó. Avisa al administrador de la organización |
 

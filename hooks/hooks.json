@@ -1,0 +1,27 @@
+{
+  "description": "Guardia de BaaS-AI-IP: en un proyecto vinculado, avisa al iniciar y bloquea los prompts si la sesión no pasa por el proxy de la organización (p. ej. pestaña Code de Claude Desktop).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/baas_guard.py\" --event session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/baas_guard.py\" --event prompt",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

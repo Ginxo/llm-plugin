@@ -1,4 +1,4 @@
-"""CLI del plugin: `set-key`, `init`, `status` y `run-script`. Mensajes en español.
+"""CLI del plugin: `set-key`, `init`, `status`, `desktop-config` y `run-script`. Mensajes en español.
 
 Códigos de salida (las skills los interpretan): 0 ok · 2 configuración (falta la clave o la URL)
 · 3 hay que elegir organización · 4 sin organizaciones · 5 clave no válida · 6 red o servidor
@@ -9,13 +9,25 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, handshake, mcp_config, project
-from .envfile import BaasPaths, load_credentials, missing_key_error, normalize_app_url, update_env, validate_api_key
+import baas_guard
+
+from . import __version__, desktop_config, handshake, mcp_config, project
+from .envfile import (
+    BaasPaths,
+    load_credentials,
+    missing_key_error,
+    normalize_app_url,
+    read_env,
+    update_env,
+    validate_api_key,
+)
 from .errors import BaasError, ConfigError, MissingAppUrlError
 
 
@@ -31,18 +43,38 @@ def key_prefix(key: str) -> str:
 # --- set-key ---------------------------------------------------------------------------------
 
 
+ANTHROPIC_KEY_RE = re.compile(r"^sk-ant-[A-Za-z0-9_-]{20,}$")
+
+
+def validate_anthropic_key(value: str) -> str:
+    key = value.strip()
+    if not ANTHROPIC_KEY_RE.match(key):
+        raise ConfigError(
+            "La clave no tiene el formato de una API key de Anthropic Console (`sk-ant-…`).",
+            hint="Créala en console.anthropic.com (API keys). La suscripción de claude.ai no sirve en modo gateway.",
+        )
+    return key
+
+
 def cmd_set_key(args: argparse.Namespace) -> int:
     paths = BaasPaths.default()
+    label = "API key de Anthropic Console" if args.anthropic else "API key de BaaS-AI-IP"
     if args.stdin:
         raw = sys.stdin.readline()
     elif sys.stdin is not None and sys.stdin.isatty():
-        raw = getpass.getpass("API key de BaaS-AI-IP (no se mostrará): ")
+        raw = getpass.getpass(f"{label} (no se mostrará): ")
     else:
         raise ConfigError(
             "`set-key` necesita una terminal interactiva para leer la clave sin mostrarla.",
             hint="Ejecútalo en una terminal aparte, o pásala por tubería con --stdin "
             "(p. ej. desde tu gestor de contraseñas).",
         )
+    if args.anthropic:
+        key = validate_anthropic_key(raw)
+        warnings = update_env(paths, {"ANTHROPIC_API_KEY": key})
+        _p(*warnings, f"{label} {key[:10]}… guardada en {paths.env_file} (permisos 0600).")
+        _p("La usa solo el helper de Claude Desktop en modo gateway (ver `desktop-config`).")
+        return 0
     key = validate_api_key(raw)
     updates = {"BAAS_API_KEY": key}
     if args.app_url:
@@ -183,16 +215,60 @@ def _check_local_config(proj: Path, org: handshake.Organization) -> None:
     ):
         _p("AVISO: .claude/settings.local.json no coincide con la organización; lanza /baas-init.")
     if os.environ.get("CLAUDECODE") == "1":
-        current = os.environ.get("ANTHROPIC_BASE_URL")
-        if current != org.proxy_anthropic_url:
-            _p(
-                "AVISO: esta sesión de Claude Code no pasa por el proxy"
-                f" (ANTHROPIC_BASE_URL={current or 'sin definir'}). Reinicia la sesión y acepta la confianza"
-                " en la carpeta. En la pestaña Code de Claude Desktop"
-                " el proxy por proyecto no se aplica (ver README).",
-            )
+        # Mismo diagnóstico que la guardia de los hooks (scripts/baas_guard.py).
+        problem = baas_guard.diagnose(project.read_binding(proj), dict(os.environ))
+        if problem:
+            _p(f"AVISO: {problem.removeprefix('BaaS-AI-IP: ')}")
         else:
             _p("Proxy activo en esta sesión: sí.")
+
+
+# --- desktop-config --------------------------------------------------------------------------
+
+
+def cmd_desktop_config(args: argparse.Namespace) -> int:
+    paths = BaasPaths.default()
+    if not paths.env_file.exists():
+        raise missing_key_error(paths)
+    creds = load_credentials(paths)
+    if not creds.app_url:
+        raise MissingAppUrlError("Falta BAAS_APP_URL en ~/baas-ai-ip/.env; lanza /baas-init con --app-url.")
+    proj = _project_dir(args)
+    current = (project.read_binding(proj) or {}).get("org")
+    hs = handshake.perform_handshake(creds.app_url, creds.api_key)
+    org = handshake.select_organization(hs, requested=args.org, current=current)
+    helper = desktop_config.install_credentials_helper(paths)
+    config = desktop_config.gateway_config(org.proxy_anthropic_url, helper)
+    values, _ = read_env(paths)
+    _p(
+        f"Claude Desktop en modo gateway hacia el proxy de la organización {org.describe()}.",
+        "",
+        "Ten en cuenta:",
+        "  - Es GLOBAL a Claude Desktop: todas sus sesiones pasarán por esta organización.",
+        "  - Desktop deja de usar tu suscripción de claude.ai: el proxy reenvía a Anthropic la API key"
+        " de Anthropic Console guardada en ~/baas-ai-ip/.env (ANTHROPIC_API_KEY).",
+        "  - El soporte del modo gateway en Desktop para Linux no está confirmado.",
+        "",
+        "Pasos:",
+        "  1. Claude Desktop → Help → Troubleshooting → Enable Developer Mode.",
+        "  2. Developer → Configure Third-Party Inference… e introduce estos valores"
+        " (o distribúyelos por MDM / fichero de configuración):",
+        "",
+        json.dumps(config, indent=2, ensure_ascii=False),
+        "",
+        "  3. Reinicia Claude Desktop y elige el modo de terceros (no «Sign in to Claude.ai»).",
+        "  4. En un proyecto vinculado, /baas-status debe decir «Proxy activo en esta sesión: sí».",
+        "",
+        f"Helper de credenciales instalado en {helper} (lee las claves de {paths.env_file}; no contiene secretos).",
+    )
+    if not values.get("ANTHROPIC_API_KEY"):
+        _p(
+            "AVISO: falta ANTHROPIC_API_KEY en ~/baas-ai-ip/.env. Guárdala en una terminal, sin pasar por el chat:",
+            f"  python3 {Path(__file__).resolve().parent.parent / 'baas.py'} set-key --anthropic",
+        )
+    for warning in handshake.kill_switch_warnings(hs, org):
+        _p(f"AVISO: {warning}")
+    return 0
 
 
 def _check_mcp(api_key: str, mcp_url: str) -> None:
@@ -217,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("set-key", help="Guarda la API key en ~/baas-ai-ip/.env sin mostrarla")
     p.add_argument("--stdin", action="store_true", help="Lee la clave de la entrada estándar (tubería)")
     p.add_argument("--app-url", help="URL de la webapp, p. ej. https://app.<dominio>")
+    p.add_argument(
+        "--anthropic",
+        action="store_true",
+        help="Guarda la API key de Anthropic Console (ANTHROPIC_API_KEY) para Claude Desktop en modo gateway",
+    )
     p.set_defaults(func=cmd_set_key)
 
     p = sub.add_parser("init", help="Handshake y vinculación del proyecto a una organización")
@@ -229,6 +310,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project")
     p.add_argument("--no-mcp", action="store_true", help="No comprobar la conexión con el MCP")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("desktop-config", help="Configuración de Claude Desktop en modo gateway hacia el proxy")
+    p.add_argument("--project", help="Proyecto cuya organización se toma por defecto")
+    p.add_argument("--org", help="Slug de la organización (obligatorio si perteneces a varias y no hay proyecto)")
+    p.set_defaults(func=cmd_desktop_config)
 
     from .runner import add_run_script_parser  # el ejecutor vive en su propio módulo
 
