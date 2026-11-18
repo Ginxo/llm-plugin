@@ -361,12 +361,14 @@ def resolve_plans(
 # --- escritura -----------------------------------------------------------------------------------
 
 
-def _install_skill(
-    plugin_dir: Path, tmp_root: Path, name: str, contents: dict[str, bytes], executable: set[str]
-) -> None:
-    """Escribe la skill en un temporal junto al destino y la renombra; si falla, deja la anterior."""
+def _install_skill(client: Any, plugin_dir: Path, tmp_root: Path, name: str, manifest: Manifest) -> None:
+    """Descarga la skill a un temporal junto al destino y la renombra; si falla, deja la anterior.
+
+    Los ficheros grandes se escriben a disco según llegan (por trozos): sincronizar no carga en memoria un fichero
+    de cientos de MiB.
+    """
     staged = tmp_root / f"new-{name}"
-    package_fetch.materialize(staged, contents, executable)
+    package_fetch.fetch_to_dir(client, manifest, staged)
     final = plugin_dir / "skills" / name
     backup = tmp_root / f"old-{name}"
     had_previous = final.is_symlink() or final.exists()
@@ -557,8 +559,7 @@ def _apply(
             plan = plans[name]
             assert plan.manifest is not None
             try:
-                contents = package_fetch.fetch_contents(client, plan.manifest)
-                _install_skill(plugin_dir, tmp_root, name, contents, plan.manifest.executable_paths())
+                _install_skill(client, plugin_dir, tmp_root, name, plan.manifest)
             except McpToolError as exc:
                 if exc.code not in NOT_FOR_YOU:
                     raise  # kill switch o servidor no disponible a mitad: se aborta (el estado ya es coherente)

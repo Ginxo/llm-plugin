@@ -10,6 +10,10 @@ Parte mecánica de la publicación (diseño H5 §8); la entrevista la hace la sk
 
 Único tope de tamaño: 500 MiB por fichero (se rechaza antes de subir); el resto solo avisa (LARGE_FILE desde
 25 MiB, LARGE_PACKAGE desde 100 MiB).
+
+Los ficheros grandes (más de `transfer.CHUNK_THRESHOLD`) no se cargan en memoria ni viajan en el mensaje del lote:
+se suben por trozos (`transfer.upload`) y el lote atómico los referencia con `upload_id`. Lo pequeño sigue yendo
+inline, hasta `transfer.INLINE_BUDGET` por mensaje.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import inspect as skill_inspect
-from . import sensitive, skillmeta
+from . import sensitive, skillmeta, transfer
 from .errors import ConfigError, McpToolError, ScriptIntegrityError
 from .skilltree import (
     LARGE_FILE_BYTES,
@@ -78,6 +82,7 @@ class PlanFile:
     area: str  # skill | scripts | knowledge | manifest | acl
     rewritten: bool = False
     note: str | None = None
+    source: Path | None = None  # un fichero grande no se carga: `data` va vacío y se sube por trozos desde aquí
 
 
 @dataclass
@@ -112,8 +117,11 @@ class Plan:
     def upload_bytes(self) -> int:
         total = 0
         for f in self.to_send:
-            content, _ = encode_content(f.data)
-            total += len(content) + len(f.path) + 90
+            if f.source is not None or transfer.is_large(f.size):  # por trozos: base64 y poco más
+                total += 4 * ((f.size + 2) // 3) + len(f.path) + 120
+            else:
+                content, _ = encode_content(f.data)
+                total += len(content) + len(f.path) + 90
         return total
 
     @property
@@ -293,6 +301,14 @@ def _gather(
     return gathered, omitted, warnings, local_manifest
 
 
+def _starts_with_shebang(lf: LocalFile, data: bytes | None) -> bool:
+    """Si el fichero empieza por `#!` (sin leerlo entero si es grande)."""
+    if data is not None:
+        return data.startswith(b"#!")
+    with lf.path.open("rb") as fh:
+        return fh.read(2) == b"#!"
+
+
 def build_plan(client: Any, opts: PublishOptions) -> Plan:
     skill_dir = Path(opts.skill_dir)
     if not (skill_dir / "SKILL.md").is_file():
@@ -319,7 +335,10 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
         excludes=opts.excludes,
         default_excludes=opts.default_excludes,
     )
-    contents: dict[str, bytes] = {p: g["lf"].read_bytes() for p, g in gathered.items()}
+    # Lo grande no se carga (ni se reescribe): se hashea por trozos y se sube por trozos desde el disco.
+    contents: dict[str, bytes] = {
+        p: g["lf"].read_bytes() for p, g in gathered.items() if not transfer.is_large(g["lf"].size)
+    }
     rewritten_paths: set[str] = set()
     applied: list[dict[str, Any]] = []
     if opts.rewrite_paths:
@@ -362,7 +381,11 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
         if t["target"] in uploaded_knowledge
         or any(u.startswith(t["target"].rstrip("/") + "/") for u in uploaded_knowledge)
     )
-    executable = sorted(pkg_of(p) for p in skill_paths if gathered[p]["lf"].exec_bit or contents[p].startswith(b"#!"))
+    executable = sorted(
+        pkg_of(p)
+        for p in skill_paths
+        if gathered[p]["lf"].exec_bit or _starts_with_shebang(gathered[p]["lf"], contents.get(p))
+    )
     package_paths = {pkg_of(p) for p in skill_paths} | {"baas.yaml"}
     manifest, notes = skillmeta.merge_manifest(
         base,
@@ -398,8 +421,8 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
                     "DIR:PREFIJO para fijarlos con un _acl.yaml."
                 )
                 continue
-            try:
-                text = contents[path].decode("utf-8")
+            try:  # un .md grande al que hay que añadir roles sí se lee entero (se edita su cabecera)
+                text = (contents[path] if path in contents else gathered[path]["lf"].read_bytes()).decode("utf-8")
             except UnicodeDecodeError:
                 continue
             new_text, state = skillmeta.with_roles(text, opts.knowledge_roles)
@@ -417,8 +440,12 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
     files: list[PlanFile] = []
     for path in sorted(gathered):
         g = gathered[path]
-        data = contents[path]
-        digest = sha256_bytes(data)
+        if path in contents:
+            data, source = contents[path], None
+            digest, size = sha256_bytes(data), len(data)
+        else:  # fichero grande: ni se lee entero ni se guarda; su `sha256` se calcula por trozos
+            data, source = b"", Path(g["lf"].path)
+            digest, size = g["lf"].sha256, g["lf"].size
         previous = remote.get(path)
         status = "new" if previous is None else "unchanged" if previous == digest else "changed"
         guard = previous if previous is not None else None if g["area"] == "acl" else "none"
@@ -427,7 +454,7 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
                 path,
                 data,
                 digest,
-                len(data),
+                size,
                 status,
                 previous,
                 guard,
@@ -435,6 +462,7 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
                 g["area"],
                 path in rewritten_paths,
                 notes_by_path.get(path),
+                source,
             )
         )
 
@@ -514,20 +542,54 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
 
 
 def write_plan(client: Any, plan: Plan, *, dry_run: bool) -> dict[str, Any]:
-    """UNA llamada `baas_write_files` con todo lo que cambia (y `delete[]`). Sin cambios: no llama."""
+    """UNA llamada `baas_write_files` con todo lo que cambia (y `delete[]`). Sin cambios: no llama.
+
+    Los ficheros grandes (y los pequeños que no caben en el presupuesto de un mensaje) se suben antes por trozos y
+    el lote los referencia con `upload_id`: el mensaje que confirma el lote pesa poco y sigue siendo atómico. En un
+    ensayo (`dry_run`) no se sube nada: lo grande se anota en `chunked` y se ensaya al publicar de verdad.
+    """
     if not plan.to_send and not plan.delete:
         return {}
-    sent = []
-    for f in plan.to_send:
-        content, encoding = encode_content(f.data)
-        entry: dict[str, Any] = {"path": f.path, "content": content, "encoding": encoding}
-        if f.guard:
-            entry["expected_sha256"] = f.guard
-        sent.append(entry)
-    arguments = _args(plan.org, files=sent, dry_run=dry_run)
-    if plan.delete:
-        arguments["delete"] = plan.delete
-    return client.call_tool("baas_write_files", arguments)  # type: ignore[no-any-return]
+    lazy = [f for f in plan.to_send if f.source is not None]
+    _, by_chunks = transfer.split_by_budget([f for f in plan.to_send if f.source is None], lambda f: f.size)
+    chunked = {f.path for f in [*lazy, *by_chunks]}
+    uploads: dict[str, str] = {}
+    try:
+        if not dry_run:
+            for f in plan.to_send:
+                if f.path in chunked:
+                    uploads[f.path] = transfer.upload(
+                        client,
+                        f.path,
+                        f.source if f.source is not None else f.data,
+                        f.sha256,
+                        size=f.size,
+                        org=plan.org,
+                    )
+        sent = []
+        for f in plan.to_send:
+            if f.path in chunked and (f.path in uploads):
+                entry: dict[str, Any] = {"path": f.path, "upload_id": uploads[f.path]}
+            elif f.path in chunked:
+                continue  # ensayo: se sube al publicar de verdad
+            else:
+                content, encoding = encode_content(f.data)
+                entry = {"path": f.path, "content": content, "encoding": encoding}
+            if f.guard:
+                entry["expected_sha256"] = f.guard
+            sent.append(entry)
+        server: dict[str, Any] = {}
+        if sent or plan.delete:
+            arguments = _args(plan.org, files=sent, dry_run=dry_run)
+            if plan.delete:
+                arguments["delete"] = plan.delete
+            server = client.call_tool("baas_write_files", arguments)
+    except BaseException:
+        transfer.abort(client, list(uploads.values()), plan.org)  # no se deja ninguna carga a medias
+        raise
+    if dry_run and chunked:
+        server = {**server, "chunked": [{"path": f.path, "size": f.size} for f in plan.to_send if f.path in chunked]}
+    return server
 
 
 def verify_plan(client: Any, plan: Plan) -> tuple[list[str], str | None]:
@@ -648,6 +710,12 @@ def render_plan(result: PublishResult) -> str:
         out.append(f"Reescritas (solo la copia que se sube): {', '.join(f.path.split('/', 2)[-1] for f in rewrites)}")
     out += ["", "Se enviarán:" if result.dry_run else "Enviados:"]
     sendable = plan.to_send
+    chunked = result.server.get("chunked") or []
+    if result.dry_run and chunked:
+        out.append(
+            f"  ({len(chunked)} fichero(s) grande(s) se subirán por trozos al publicar y no se ensayan: "
+            f"{', '.join(c['path'] for c in chunked[:3])}{'…' if len(chunked) > 3 else ''})"
+        )
     for f in sendable[:MAX_LISTED]:
         mark = "+" if f.status == "new" else "~"
         extra = (", reescrito" if f.rewritten else "") + (f", {f.note}" if f.note else "")

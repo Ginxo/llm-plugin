@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from fake_baas import FakeBaasServer, PkgFile, dev_api_key
 
-from baas_plugin import cli, envfile
+from baas_plugin import cli, envfile, transfer
 
 BINARY = bytes(range(256)) * 4  # no es UTF-8 válido: viaja en base64
 KEY = "analista@demo.test"
@@ -964,3 +964,71 @@ def test_hooks_manifest_registers_start_and_end() -> None:
     assert "--event session-end" in end[0]["command"]
     assert end[0]["timeout"] <= 5
     assert "UserPromptSubmit" in manifest
+
+
+# --- ficheros grandes (D64): por trozos y directo a disco --------------------------------------------
+
+
+def big_skill(env: Env, big: bytes, monkeypatch: pytest.MonkeyPatch, **extra) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(transfer, "CHUNK_THRESHOLD", 3000)
+    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
+    env.server.state.chunk_size = 1000
+    files = {
+        "SKILL.md": "---\nname: grande\ndescription: x\n---\nUsa data/blob.bin\n",
+        "scripts/run.sh": "#!/bin/sh\necho hola\n",
+        "data/blob.bin": big,
+    }
+    env.publish("grande", files=files, **extra)
+
+
+def test_a_big_file_is_synced_by_chunks_and_never_inline(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    big = os.urandom(10_500)
+    big_skill(env, big, monkeypatch)
+    code, out = env.run()
+    assert code == 0, out
+    assert env.tree()["grande/data/blob.bin"] == big
+    assert (env.skills / "grande/scripts/run.sh").stat().st_mode & 0o111  # el bit de ejecución sigue donde toca
+    asked = [p for _, a in env.server.state.tool_calls("baas_get_skill_files") for p in a["paths"]]
+    assert "skills/grande/data/blob.bin" not in asked
+    assert "skills/grande/SKILL.md" in asked
+    reads = [a for _, a in env.server.state.tool_calls("baas_read_chunk")]
+    assert [r["offset"] for r in reads] == list(range(0, 10_500, 1000))
+    assert {r["path"] for r in reads} == {"skills/grande/data/blob.bin"}
+    entry = {f["path"]: f for f in env.state()["skills"]["grande"]["files"]}["data/blob.bin"]
+    assert entry["sha256"] == hashlib.sha256(big).hexdigest()
+
+
+def test_a_corrupt_big_file_is_not_installed(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    big = os.urandom(8000)
+    big_skill(env, big, monkeypatch)
+    pkg = env.server.state.skills["demo"]["grande"]
+    pkg.files["data/blob.bin"] = PkgFile(big, sha256_override="0" * 64)  # declara un hash y sirve otros bytes
+    code, out = env.run()
+    assert code == 12, out
+    assert "data/blob.bin" in out
+    assert not (env.skills / "grande").exists()
+    assert not any(p.name.startswith(".baas-tmp") for p in env.plugin.iterdir())
+
+
+def test_a_big_file_that_changes_on_the_server_while_syncing_is_not_mixed(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    big = os.urandom(8000)
+    big_skill(env, big, monkeypatch)
+    pkg = env.server.state.skills["demo"]["grande"]
+    real = pkg.files["data/blob.bin"]
+    # el manifiesto se lee con el hash viejo y, al pedir los trozos, el servidor ya tiene otro fichero
+    original = type(real).sha256.fget  # type: ignore[attr-defined]
+    calls = {"n": 0}
+
+    def drifting(self):  # type: ignore[no-untyped-def]
+        if self is real:
+            calls["n"] += 1
+            return original(self) if calls["n"] <= 3 else "f" * 64
+        return original(self)
+
+    monkeypatch.setattr(type(real), "sha256", property(drifting))
+    code, out = env.run()
+    assert code == 12
+    assert "cambió en el servidor" in out
+    assert not (env.skills / "grande").exists()

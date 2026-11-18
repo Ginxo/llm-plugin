@@ -1,6 +1,7 @@
 """`baas.py export <skill> <dir>`: la inversa de `publish` (diseño H5 §8).
 
-Descarga el paquete de una skill (`baas_get_skill_package` + `baas_get_skill_files`), verifica el `sha256` de cada
+Descarga el paquete de una skill (`baas_get_skill_package` + `baas_get_skill_files`; lo grande, por trozos con
+`baas_read_chunk` y escrito a disco según llega, sin cargarlo en memoria), verifica el `sha256` de cada
 fichero ANTES de dejar nada en su sitio, restaura el bit de ejecución y escribe con las rutas confinadas al
 directorio de destino: se rechazan `..`, rutas absolutas, `\\`, caracteres de control y cualquier enlace simbólico
 del destino. El directorio resultante es una skill válida en cualquier cliente (incluye `baas.yaml`, que los
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import transfer
 from .errors import ConfigError, McpToolError, ProjectSafetyError, ScriptIntegrityError
 from .skilltree import decode_content, package_sha256, sha256_bytes
 
@@ -164,7 +166,9 @@ def run_export(client: Any, opts: ExportOptions) -> ExportResult:
     staging = Path(tempfile.mkdtemp(prefix=".baas-export-", dir=dest.parent))
     try:
         exported: list[ExportedFile] = []
-        for group in _chunks(entries):
+        small = [e for e in entries if not transfer.is_large(int(e.get("size") or 0))]
+        large = [e for e in entries if transfer.is_large(int(e.get("size") or 0))]
+        for group in _chunks(small):
             reply = client.call_tool(
                 "baas_get_skill_files", _args(opts.org, skill=opts.skill, paths=[e["path"] for e in group])
             )
@@ -190,6 +194,28 @@ def run_export(client: Any, opts: ExportOptions) -> ExportResult:
                     raise ProjectSafetyError(f"No se puede escribir {e['rel']}: {exc.strerror}.") from exc
                 target.chmod(0o755 if e["rel"] in executable else 0o644)
                 exported.append(ExportedFile(e["rel"], len(data), digest, e["rel"] in executable))
+        for e in large:  # por trozos y directo a disco: ni un fichero de cientos de MiB cabe en memoria
+            target = _check_no_symlinks(staging, e["rel"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                raise ProjectSafetyError(f"Conflicto de rutas en el paquete: {e['rel']}.")
+            try:
+                with target.open("xb") as fh:
+                    digest = transfer.download(
+                        client, f"skills/{opts.skill}/{e['rel']}", fh, size=int(e["size"]), sha256=e["sha256"],
+                        org=opts.org,
+                    )  # fmt: skip
+            except OSError as exc:
+                raise ProjectSafetyError(f"No se puede escribir {e['rel']}: {exc.strerror}.") from exc
+            if digest != e["sha256"]:
+                raise ExportVerificationError(
+                    f"El SHA-256 de {e['rel']} no coincide con el que declara el MCP; no se escribe nada.",
+                    hint=f"Declarado {e['sha256']}, calculado {digest}. Informa al administrador.",
+                )
+            target.chmod(0o755 if e["rel"] in executable else 0o644)
+            exported.append(ExportedFile(e["rel"], int(e["size"]), digest, e["rel"] in executable))
+        order = {e["rel"]: i for i, e in enumerate(entries)}
+        exported.sort(key=lambda f: order[f.rel])
         replaced = _install(staging, dest, [f.rel for f in exported])
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

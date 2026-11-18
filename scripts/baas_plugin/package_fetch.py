@@ -3,10 +3,13 @@
 Lo comparten el ejecutor bajo demanda (`runner`) y la sincronización (`sync`):
 
 1. `fetch_manifest`: `baas_get_skill_package` → rutas, hashes y bit de ejecución de cada fichero.
-2. `fetch_contents`: `baas_get_skill_files` por lotes. **Cada fichero se verifica** con el `sha256` del
-   manifiesto; el servidor no puede añadir ficheros que no se pidieron.
+2. `fetch_contents`: `baas_get_skill_files` por lotes (lo pequeño) y `baas_read_chunk` por trozos (lo que pasa de
+   `transfer.CHUNK_THRESHOLD`). **Cada fichero se verifica** con el `sha256` del manifiesto; el servidor no puede
+   añadir ficheros que no se pidieron.
 3. `materialize`: escribe el árbol en un directorio propio, con el bit de ejecución solo donde el
    manifiesto lo declara. Nunca crea enlaces simbólicos ni sale del directorio de destino.
+   `fetch_to_dir` hace 2 y 3 a la vez **sin guardar los ficheros grandes en memoria**: los escribe a disco según
+   llegan (lo usan `sync` y `export`).
 
 Las rutas del manifiesto pueden venir como `skills/<skill>/<ruta>` (las del almacén) o relativas a la skill;
 aquí se normalizan a relativas y se pide al servidor cada una tal como la declaró. `baas.yaml` es el
@@ -19,6 +22,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import io
 import os
 import re
 from collections.abc import Iterable
@@ -26,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import transfer
 from .errors import PackageError, ScriptIntegrityError
 
 MANIFEST_FILE = "baas.yaml"
@@ -257,15 +262,36 @@ def _batches(files: list[PackageFile]) -> Iterable[list[PackageFile]]:
         yield batch
 
 
-def fetch_contents(
-    client: Any, manifest: Manifest, paths: Iterable[str] | None = None, org: str | None = None
-) -> dict[str, bytes]:
-    """Descarga y verifica los ficheros (por omisión, todos los del manifiesto). `{ruta: bytes}`."""
+def _store_path(manifest: Manifest, f: PackageFile) -> str:
+    """La ruta completa en el almacén (`skills/<skill>/<ruta>`): la que entiende `baas_read_chunk`."""
+    return f"skills/{manifest.skill}/{f.path}"
+
+
+def _split_large(files: list[PackageFile]) -> tuple[list[PackageFile], list[PackageFile]]:
+    """`(pequeños, grandes)`: lo grande se descarga por trozos; lo pequeño, inline por lotes."""
+    return [f for f in files if not transfer.is_large(f.size)], [f for f in files if transfer.is_large(f.size)]
+
+
+def _wanted(manifest: Manifest, paths: Iterable[str] | None) -> list[PackageFile]:
     wanted = list(manifest.files)
     if paths is not None:
         names = set(paths)
         wanted = [f for f in wanted if f.path in names]
-    contents: dict[str, bytes] = {}
+    return wanted
+
+
+def _verify_download(manifest: Manifest, f: PackageFile, digest: str) -> None:
+    if not hmac.compare_digest(digest, f.sha256.lower()):
+        raise ScriptIntegrityError(
+            f"El SHA-256 de {manifest.skill}/{f.path} no coincide con el que declara el MCP; no se usa.",
+            hint=f"Declarado {f.sha256}, calculado {digest}. Informa al administrador de la organización.",
+        )
+
+
+def _fetch_inline(
+    client: Any, manifest: Manifest, wanted: list[PackageFile], org: str | None
+) -> Iterable[tuple[PackageFile, bytes]]:
+    """Los ficheros pequeños, por lotes de `BATCH_BYTES`, verificados; cada lote se entrega antes de pedir otro."""
     for batch in _batches(wanted):
         by_server = {f.server_path: f for f in batch}
         data = client.call_tool(
@@ -274,22 +300,71 @@ def fetch_contents(
         items = data.get("files") if isinstance(data, dict) else None
         if not isinstance(items, list):
             raise PackageError(f"Respuesta de baas_get_skill_files incompleta para «{manifest.skill}».")
+        seen: dict[str, bytes] = {}
         for item in items:
             entry = by_server.get(item.get("path")) if isinstance(item, dict) else None
             if entry is None:
                 raise PackageError(f"baas_get_skill_files devolvió un fichero no pedido: {item.get('path')!r}.")
-            if entry.path in contents:
+            if entry.path in seen:
                 raise PackageError(f"baas_get_skill_files devolvió {entry.path} dos veces.")
             body = _decode(item, entry.path)
             verify_bytes(manifest.skill, entry.path, body, entry.sha256)
             reported = item.get("sha256")
             if isinstance(reported, str) and reported.lower() != entry.sha256:
                 verify_bytes(manifest.skill, entry.path, body, reported)  # el servidor se contradice
-            contents[entry.path] = body
-        missing = sorted(f.path for f in batch if f.path not in contents)
+            seen[entry.path] = body
+        missing = sorted(f.path for f in batch if f.path not in seen)
         if missing:
             raise PackageError(f"baas_get_skill_files no devolvió {missing[0]} (y {len(missing) - 1} más).")
+        for f in batch:
+            yield f, seen[f.path]
+
+
+def fetch_contents(
+    client: Any, manifest: Manifest, paths: Iterable[str] | None = None, org: str | None = None
+) -> dict[str, bytes]:
+    """Descarga y verifica los ficheros (por omisión, todos los del manifiesto). `{ruta: bytes}` en memoria.
+
+    Lo grande se pide por trozos (`baas_read_chunk`), nunca inline; pero aquí acaba entero en memoria: para escribir
+    un árbol a disco sin cargarlo, `fetch_to_dir`.
+    """
+    small, large = _split_large(_wanted(manifest, paths))
+    contents: dict[str, bytes] = {}
+    for f, body in _fetch_inline(client, manifest, small, org):
+        contents[f.path] = body
+    for f in large:
+        sink = io.BytesIO()
+        digest = transfer.download(client, _store_path(manifest, f), sink, size=f.size, sha256=f.sha256, org=org)
+        _verify_download(manifest, f, digest)
+        contents[f.path] = sink.getvalue()
     return contents
+
+
+def fetch_to_dir(client: Any, manifest: Manifest, dest: Path, org: str | None = None) -> None:
+    """Descarga el paquete y lo escribe en `dest` (se crea, 0700), verificando cada fichero.
+
+    Los ficheros pequeños se piden inline por lotes; los grandes, por trozos y se escriben a disco según llegan: la
+    memoria no crece con su tamaño. Si algo falla (red, hash) se lanza la excepción y **el que llama** descarta
+    `dest` (es un directorio temporal). Mismas garantías que `materialize`: rutas confinadas, sin enlaces
+    simbólicos, bit de ejecución solo donde lo declara el manifiesto.
+    """
+    for f in manifest.files:
+        safe_rel_path(f.path)
+    check_tree(f.path for f in manifest.files)
+    _make_root(dest)
+    executable = manifest.executable_paths()
+    small, large = _split_large(list(manifest.files))
+    for f, body in _fetch_inline(client, manifest, small, org):
+        fd = _open_new(dest, f.path)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+        os.chmod(dest.joinpath(*f.path.split("/")), EXEC_MODE if f.path in executable else FILE_MODE)
+    for f in large:
+        target = dest.joinpath(*f.path.split("/"))
+        with os.fdopen(_open_new(dest, f.path), "wb") as fh:
+            digest = transfer.download(client, _store_path(manifest, f), fh, size=f.size, sha256=f.sha256, org=org)
+        _verify_download(manifest, f, digest)
+        os.chmod(target, EXEC_MODE if f.path in executable else FILE_MODE)
 
 
 def fetch_package(client: Any, skill: str, org: str | None = None) -> Package:
@@ -300,23 +375,31 @@ def fetch_package(client: Any, skill: str, org: str | None = None) -> Package:
 # --- escritura -----------------------------------------------------------------------------------
 
 
+def _make_root(root: Path) -> None:
+    root.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
+    os.chmod(root, DIR_MODE)
+
+
+def _open_new(root: Path, rel: str) -> int:
+    """Crea (sin seguir enlaces, sin pisar) el fichero `rel` bajo `root` y devuelve su descriptor de escritura."""
+    target = root.joinpath(*rel.split("/"))
+    for parent in reversed(target.relative_to(root).parents):
+        if parent != Path("."):
+            directory = root / parent
+            directory.mkdir(mode=DIR_MODE, exist_ok=True)
+            os.chmod(directory, DIR_MODE)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(target, flags, FILE_MODE)
+
+
 def materialize(root: Path, contents: dict[str, bytes], executable: Iterable[str] = ()) -> None:
     """Escribe el árbol en `root` (se crea, 0700). Solo `executable` lleva el bit de ejecución."""
     exec_set = set(executable)
     for rel in contents:
         safe_rel_path(rel)
     check_tree(contents)
-    root.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
-    os.chmod(root, DIR_MODE)
+    _make_root(root)
     for rel in sorted(contents):
-        target = root.joinpath(*rel.split("/"))
-        for parent in reversed(target.relative_to(root).parents):
-            if parent != Path("."):
-                directory = root / parent
-                directory.mkdir(mode=DIR_MODE, exist_ok=True)
-                os.chmod(directory, DIR_MODE)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(target, flags, FILE_MODE)
-        with os.fdopen(fd, "wb") as fh:
+        with os.fdopen(_open_new(root, rel), "wb") as fh:
             fh.write(contents[rel])
-        os.chmod(target, EXEC_MODE if rel in exec_set else FILE_MODE)
+        os.chmod(root.joinpath(*rel.split("/")), EXEC_MODE if rel in exec_set else FILE_MODE)
