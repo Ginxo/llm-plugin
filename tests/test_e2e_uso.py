@@ -1,0 +1,402 @@
+"""Grupo «uso» (12.x) de la prueba de punta a punta de H4 (`dev/e2e_uso.py` y el inspector de `dev/e2e_h4.py`).
+
+Los pasos 12.1–12.10 se ejecutan contra la pila real (la pila simulada de `dev/fake_h4_stack.py` no simula la
+observabilidad de uso de la Fase 4); aquí se prueban las utilidades puras con las que deciden y las consultas que el
+inspector hace dentro de los contenedores (con un motor de contenedores falso que anota sus argumentos). Con
+`unittest` (se ejecutan con `pytest` en la CI).
+"""
+
+from __future__ import annotations
+
+import json
+import stat
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev"))
+
+import e2e_h4
+import e2e_uso
+
+ORG_ID = "5963754d-a8c6-4822-9b1b-17edadd88c99"
+USER_ID = "562fcbf4-4d2d-45df-87fa-cc2b4730fc53"
+
+
+class DiskTest(unittest.TestCase):
+    """La clasificación del disco del contrato de la Fase 4, §4 (la misma que `OrgStore.usage()` del MCP)."""
+
+    def test_each_file_falls_in_one_category_by_precedence(self) -> None:
+        cases = {
+            "index.sqlite": "index",
+            "index.sqlite-wal": "index",
+            "index.sqlite-shm": "index",
+            ".versions/skills/a/SKILL.md/current.json": "versions",
+            ".versions/knowledge/x.md/v1.md": "versions",
+            "skills/a/scripts/calc.py": "scripts",
+            "skills/a/scripts/datos.json": "scripts",  # bajo scripts/ gana a la extensión
+            "skills/a/scripts/lib/util.py": "scripts",
+            "skills/a/esquema.json": "schemas",
+            "skills/a/baas.yaml": "schemas",
+            "skills/_acl.yaml": "schemas",
+            "knowledge/fin/_acl.yaml": "schemas",
+            "knowledge/fin/consulta.SQL": "schemas",
+            "knowledge/fin/tabla.xsd": "schemas",
+            "knowledge/fin/x.yml": "schemas",
+            "skills/a/SKILL.md": "skills",
+            "skills/a/assets/scripts/x.py": "skills",  # solo el scripts/ directo de la skill
+            "skills/scripts": "skills",
+            "knowledge/fin/doc.md": "knowledge",
+            "knowledge/raiz.md": "knowledge",
+            "knowledge/scripts/x.py": "knowledge",
+            "knowledge/.json": "knowledge",  # sin nombre no hay extensión
+        }
+        for path, category in cases.items():
+            self.assertEqual(e2e_uso.disk_category(path), category, path)
+
+    def test_what_is_outside_the_measurement(self) -> None:
+        for path in (".uploads/u1/part", ".lock", ".tmp/x", "index.sqlite.bak", "otro.txt", "notas/skills/a.md",
+                     "skills", "knowledge", ".quarantine/x"):  # fmt: skip
+            self.assertIsNone(e2e_uso.disk_category(path), path)
+
+    def test_expected_usage_sums_files_and_bytes_per_category(self) -> None:
+        files = [("skills/a/SKILL.md", 10), ("skills/a/scripts/x.py", 20), ("skills/a/e.json", 30),
+                 ("knowledge/f/d.md", 40), (".versions/a", 50), ("index.sqlite", 60), (".uploads/u", 999),
+                 (".lock", 0)]  # fmt: skip
+        got = e2e_uso.disk_expected(files)
+        self.assertEqual(
+            got,
+            {"files": 6, "skills": 10, "scripts": 20, "schemas": 30, "knowledge": 40, "versions": 50, "index": 60},
+        )
+        self.assertEqual(e2e_uso.disk_total(got), 210)
+
+    def test_problems_with_a_one_percent_margin(self) -> None:
+        expected = {"files": 3, "skills": 1000, "scripts": 0, "schemas": 0, "knowledge": 0, "versions": 0, "index": 0}
+        self.assertEqual(e2e_uso.disk_problems(expected, dict(expected)), [])
+        self.assertEqual(e2e_uso.disk_problems(expected, {**expected, "skills": 1010}), [])
+        problems = e2e_uso.disk_problems(expected, {**expected, "skills": 1011})
+        self.assertTrue(any("skills" in p for p in problems), problems)
+        self.assertTrue(any("total" in p for p in problems), problems)
+        problems = e2e_uso.disk_problems(expected, {**expected, "scripts": 1})
+        self.assertTrue(any("scripts" in p for p in problems), "una categoría vacía tiene que seguir vacía")
+        self.assertTrue(e2e_uso.disk_problems(expected, {**expected, "files": 4}))
+        self.assertTrue(e2e_uso.disk_problems(expected, {"skills": 1000}), "falta una categoría")
+
+    def test_snapshot_bytes_read_from_the_api(self) -> None:
+        latest = {"files": 2, "total_bytes": 30, "bytes": {"skills": 10, "scripts": 20, "schemas": 0,
+                                                            "knowledge": 0, "versions": 0, "index": 0}}  # fmt: skip
+        self.assertEqual(
+            e2e_uso.snapshot_usage(latest),
+            {"files": 2, "skills": 10, "scripts": 20, "schemas": 0, "knowledge": 0, "versions": 0, "index": 0},
+        )
+        self.assertEqual(e2e_uso.snapshot_usage(None), {})
+
+
+class HoursTest(unittest.TestCase):
+    def test_window_and_its_complement(self) -> None:
+        self.assertEqual(e2e_uso.hour_window(10, 10), ("10-11", "11-10"))
+        self.assertEqual(e2e_uso.hour_window(23, 23), ("23-24", "0-23"))
+        self.assertEqual(e2e_uso.hour_window(0, 0), ("0-1", "1-24"))
+        self.assertEqual(e2e_uso.hour_window(9, 10), ("9-11", "11-9"))
+        self.assertEqual(e2e_uso.hour_window(23, 0), ("23-1", "1-23"), "cruza la medianoche")
+
+    def test_the_window_covers_exactly_its_hours(self) -> None:
+        def hours(text: str) -> set[int]:
+            h1, h2 = (int(x) for x in text.split("-"))
+            return set(range(h1, h2)) if h1 < h2 else set(range(h1, 24)) | set(range(h2))
+
+        for first in range(24):
+            for span in (0, 1):
+                last = (first + span) % 24
+                inside, outside = e2e_uso.hour_window(first, last)
+                self.assertEqual(hours(inside), {first, last}, inside)
+                self.assertEqual(hours(outside), set(range(24)) - {first, last}, outside)
+
+    def test_local_keys(self) -> None:
+        madrid = ZoneInfo("Europe/Madrid")
+        at = datetime(2026, 11, 18, 22, 19, tzinfo=timezone.utc).astimezone(madrid)  # miércoles, 23:19 local
+        self.assertEqual(e2e_uso.weekday_hour_key(at), "3-23")
+        self.assertEqual(e2e_uso.hour_key(at), "2026-11-18T23:00:00+01:00")
+        summer = datetime(2026, 7, 1, 8, 5, tzinfo=timezone.utc).astimezone(madrid)
+        self.assertEqual(e2e_uso.hour_key(summer), "2026-07-01T10:00:00+02:00")
+
+
+class TokensTest(unittest.TestCase):
+    def test_messages(self) -> None:
+        body = json.dumps({"usage": {"input_tokens": 65, "output_tokens": 18}}).encode()
+        self.assertEqual(e2e_uso.reply_tokens("messages", body, stream=False), (65, 18))
+        sse = (
+            b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":117,'
+            b'"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+            b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}\n\n'
+        )
+        self.assertEqual(e2e_uso.reply_tokens("messages", sse, stream=True), (117, 9))
+
+    def test_openai(self) -> None:
+        chat = json.dumps({"usage": {"prompt_tokens": 50, "completion_tokens": 3}}).encode()
+        self.assertEqual(e2e_uso.reply_tokens("chat", chat, stream=False), (50, 3))
+        responses = json.dumps({"usage": {"input_tokens": 61, "output_tokens": 4}}).encode()
+        self.assertEqual(e2e_uso.reply_tokens("responses", responses, stream=False), (61, 4))
+        sse = (
+            b'event: response.completed\ndata: {"type":"response.completed","response":{"usage":'
+            b'{"input_tokens":7,"output_tokens":2}}}\n\n'
+        )
+        self.assertEqual(e2e_uso.reply_tokens("responses", sse, stream=True), (7, 2))
+        chunks = 'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1}}\n\ndata: [DONE]\n\n'
+        self.assertEqual(e2e_uso.reply_tokens("chat", chunks.encode(), stream=True), (5, 1))
+
+    def test_without_usage(self) -> None:
+        self.assertIsNone(e2e_uso.reply_tokens("chat", b'data: {"choices":[]}\n\ndata: [DONE]\n\n', stream=True))
+        self.assertIsNone(e2e_uso.reply_tokens("messages", b"no es json", stream=False))
+        self.assertIsNone(e2e_uso.reply_tokens("messages", b'{"usage": {"input_tokens": "1"}}', stream=False))
+
+
+class LatencyTest(unittest.TestCase):
+    def test_quantiles(self) -> None:
+        values = [float(v) for v in range(1, 101)]
+        self.assertEqual(e2e_uso.quantile(values, 0.95), 96.0)
+        self.assertEqual(e2e_uso.quantile([3.0], 0.95), 3.0)
+        self.assertEqual(e2e_uso.median([1.0, 3.0, 2.0, 10.0]), 2.5)
+
+    def test_overhead_is_the_difference_of_the_quantiles(self) -> None:
+        direct = [1.0] * 95 + [2.0] * 5
+        proxied = [3.0] * 95 + [6.0] * 5
+        got = e2e_uso.overhead(direct, proxied)
+        self.assertEqual((got["p50"], got["p95"]), (2.0, 4.0))
+        self.assertEqual((got["direct_p50"], got["proxy_p95"]), (1.0, 6.0))
+
+    def test_degradation(self) -> None:
+        before = [10.0] * 20
+        self.assertEqual(e2e_uso.degradation(before, [12.0] * 20), [])
+        self.assertTrue(e2e_uso.degradation(before, [40.0] * 20), "el triple no es «igual»")
+        problems = e2e_uso.degradation(before, [10.0] * 18 + [200.0] * 2)
+        self.assertTrue(any("p95" in p for p in problems), problems)
+        self.assertEqual(e2e_uso.degradation([1.0] * 20, [4.0] * 20), [], "un margen absoluto para lo muy rápido")
+
+
+class StreamsTest(unittest.TestCase):
+    def test_entries_of_redis_cli_raw(self) -> None:
+        raw = '1795040370082-0\ndata\n{"type":"content.usage","org_slug":"a"}\n1795040370083-1\ndata\n{"x":1}\n'
+        self.assertEqual(
+            e2e_uso.stream_entries(raw),
+            [("1795040370082-0", '{"type":"content.usage","org_slug":"a"}'), ("1795040370083-1", '{"x":1}')],
+        )
+        self.assertEqual(e2e_uso.stream_entries(""), [])
+        self.assertEqual(e2e_uso.stream_entries("1-0\notro\nvalor\n"), [], "solo el campo data")
+
+    def test_events_of_an_organization(self) -> None:
+        mine = {"type": "content.usage", "org_slug": "a", "event_id": "E1"}
+        entries = [("1-0", json.dumps(mine)), ("2-0", json.dumps({**mine, "org_slug": "b"})), ("3-0", "no json"),
+                   ("4-0", json.dumps({**mine, "type": "storage.snapshot"}))]  # fmt: skip
+        found = e2e_uso.events_of(entries, "content.usage", "a")
+        self.assertEqual([(i, e["event_id"]) for i, e, _ in found], [("1-0", "E1")])
+        self.assertEqual(found[0][2], json.dumps(mine), "conserva el texto tal cual para reinyectarlo")
+
+    def test_group_info(self) -> None:
+        raw = "name\nwebapp\nconsumers\n1\npending\n0\nlast-delivered-id\n1-0\nentries-read\n29\nlag\n0\n"
+        self.assertEqual(e2e_uso.group_info(raw, "webapp"), {"consumers": "1", "pending": "0",
+                                                             "last-delivered-id": "1-0", "entries-read": "29",
+                                                             "lag": "0"})  # fmt: skip
+        self.assertIsNone(e2e_uso.group_info(raw, "otro"))
+        self.assertIsNone(e2e_uso.group_info("", "webapp"))
+
+    def test_event_ids_are_ulids(self) -> None:
+        ids = {e2e_uso.new_event_id() for _ in range(50)}
+        self.assertEqual(len(ids), 50)
+        for event_id in ids:
+            self.assertRegex(event_id, r"^[0-9A-HJKMNP-TV-Z]{26}$")
+
+
+class ContentTest(unittest.TestCase):
+    def test_counts_by_key(self) -> None:
+        series = [{"key": "a", "counts": {"INVOKED": 1, "SYNCED": 0}}, {"key": "", "counts": {"KNOWLEDGE_READ": 2}}]
+        self.assertEqual(e2e_uso.counts_by_key(series), {"a": {"INVOKED": 1}, "": {"KNOWLEDGE_READ": 2}})
+        self.assertEqual(e2e_uso.counts_by_key(None), {})
+
+    def test_leaks(self) -> None:
+        self.assertEqual(e2e_uso.leaks("x secreto-abc y", ["secreto-abc", "raiz-abc"]), ["secreto-abc"])
+        self.assertEqual(e2e_uso.leaks(b"nada", ["secreto-abc"]), [])
+        self.assertEqual(e2e_uso.leaks('{"p":"secreto\\u002dabc"}', ["secreto-abc"]), ["secreto-abc"],
+                         "también con escapes de JSON")  # fmt: skip
+
+
+# --- el inspector: lo que el grupo «uso» mira y toca dentro de los contenedores ----------------------------
+
+
+class UsageInspectorTest(unittest.TestCase):
+    """`ContainerInspector` (métodos de la Fase 4) con un motor falso que anota sus argumentos y responde lo dado."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.log = root / "calls.jsonl"
+        self.replies = root / "replies.json"
+        self.replies.write_text("{}")
+        engine = root / "engine"
+        engine.write_text(
+            f"""#!{sys.executable}
+import json, sys
+argv = sys.argv[1:]
+open({str(self.log)!r}, "a").write(json.dumps(argv) + "\\n")
+if argv[0] == "ps":
+    print("cid-" + [a for a in argv if a.startswith("label=com.docker.compose.service=")][0].split("=")[-1])
+    sys.exit(0)
+replies = json.load(open({str(self.replies)!r}))
+for needle, (out, err, rc) in replies.items():
+    if needle in " ".join(argv):
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        sys.exit(rc)
+"""
+        )
+        engine.chmod(engine.stat().st_mode | stat.S_IXUSR)
+        self.inspector = e2e_h4.ContainerInspector(str(engine), "f4-uso")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def reply(self, **by_needle: tuple[str, str, int]) -> None:
+        self.replies.write_text(json.dumps({k.replace("_", " "): v for k, v in by_needle.items()}))
+
+    def runs(self) -> list[list[str]]:
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return [c for c in calls if c[0] != "ps"]
+
+    def test_usage_rows_of_an_organization(self) -> None:
+        self.reply(psql=("3|1|0\n", "", 0))
+        self.assertEqual(self.inspector.usage_rows(ORG_ID), {"traffic": 3, "content": 1, "snapshots": 0})
+        [run] = self.runs()
+        self.assertEqual(run[:7], ["exec", "cid-postgres", "psql", "-U", "postgres", "-d", "baas_control"])
+        for table in ("usage_traffic_hourly", "usage_content_hourly", "storage_snapshots"):
+            self.assertIn(f"FROM {table} WHERE org_id = '{ORG_ID}'", run[-1])
+
+    def test_unsafe_values_are_refused_before_any_command(self) -> None:
+        for bad in ("x'; DROP TABLE users; --", "", ORG_ID.upper() + "x"):
+            with self.assertRaises(e2e_h4.StepError):
+                self.inspector.usage_rows(bad)
+            with self.assertRaises(e2e_h4.StepError):
+                self.inspector.insert_old_usage(bad, USER_ID, months=3, tag="viejo-abc")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.insert_old_usage(ORG_ID, USER_ID, months=3, tag="Viejo'")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.insert_old_usage(ORG_ID, USER_ID, months=0, tag="viejo-abc")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.snapshot_count("x' OR '1'='1")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.mcp_files("../demo")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.stream_entries("redis", "baas:policy:org:demo")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.stream_add("redis-ephemeral", "baas:audit", "{}")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.service_control("postgres", "stop")
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.service_control("webapp-api", "restart")
+        self.assertEqual(self.runs(), [])
+
+    def test_insert_old_usage_writes_three_rows_in_the_past(self) -> None:
+        self.reply(psql=("INSERT 0 1\n", "", 0))
+        self.inspector.insert_old_usage(ORG_ID, USER_ID, months=3, tag="viejo-abc")
+        sql = self.runs()[0][-1]
+        self.assertIn("make_interval(months => 3)", sql)
+        for table in ("usage_traffic_hourly", "usage_content_hourly", "storage_snapshots"):
+            self.assertIn(f"INSERT INTO {table}", sql)
+        self.assertIn("'viejo-abc'", sql)
+
+    def test_source_status_and_dump(self) -> None:
+        self.reply(psql=("TRAFFIC|2026-11-18 22:19:20.549+00\nCONTENT|2026-11-18 22:19:20.453+00\n", "", 0))
+        self.assertEqual(
+            self.inspector.source_status(),
+            {"TRAFFIC": "2026-11-18 22:19:20.549+00", "CONTENT": "2026-11-18 22:19:20.453+00"},
+        )
+        self.reply(psql=("usage_content_hourly|(a,b)\n", "", 0))
+        self.assertIn("(a,b)", self.inspector.usage_dump())
+        sql = self.runs()[-1][-1]
+        for table in ("usage_traffic_hourly", "usage_content_hourly", "storage_snapshots", "storage_snapshot_items"):
+            self.assertIn(table, sql)
+
+    def test_streams(self) -> None:
+        self.reply(XRANGE=("1-0\ndata\n{}\n", "", 0), XADD=("1795-0\n", "", 0), EXISTS=("1\n", "", 0),
+                   XINFO=("name\nwebapp\npending\n0\n", "", 0))  # fmt: skip
+        self.assertEqual(self.inspector.stream_entries("redis", "baas:usage"), [("1-0", "{}")])
+        self.assertEqual(self.inspector.stream_add("redis", "baas:usage", '{"a":1}'), "1795-0")
+        self.assertTrue(self.inspector.key_exists("redis-ephemeral", "baas:usage"))
+        self.assertEqual(self.inspector.stream_group("redis", "baas:usage", "webapp"), {"pending": "0"})
+        runs = self.runs()
+        self.assertEqual(runs[0][:3], ["exec", "cid-redis", "sh"])
+        self.assertEqual(runs[0][-5:], ["--raw", "XRANGE", "baas:usage", "-", "+"])
+        self.assertEqual(runs[1][-5:], ["XADD", "baas:usage", "*", "data", '{"a":1}'])
+        self.assertEqual(runs[2][1], "cid-redis-ephemeral")
+        self.assertEqual(runs[2][-2:], ["EXISTS", "baas:usage"])
+        self.reply(XADD=("ERR wrong\n", "", 0))
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.stream_add("redis", "baas:usage", "{}")
+
+    def test_entry_present(self) -> None:
+        self.reply(XRANGE=("", "", 0))
+        self.assertFalse(self.inspector.stream_has("redis-ephemeral", "baas:traces", "17-0"))
+        self.assertEqual(self.runs()[-1][-5:], ["--raw", "XRANGE", "baas:traces", "17-0", "17-0"])
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.stream_has("redis", "baas:usage", "17-0 +")
+
+    def test_services(self) -> None:
+        self.inspector.service_control("webapp-api", "stop")
+        self.inspector.service_control("mcp-server", "unpause")
+        self.reply(logs=("salida\n", "error\n", 0))
+        logs = self.inspector.service_logs("mcp-server", "2026-11-18T22:00:00Z")
+        self.assertIn("salida", logs)
+        self.assertIn("error", logs, "los logs de la aplicación salen por stderr")
+        runs = self.runs()
+        self.assertEqual(runs[0], ["stop", "cid-webapp-api"])
+        self.assertEqual(runs[1], ["unpause", "cid-mcp-server"])
+        self.assertEqual(runs[2], ["logs", "--since", "2026-11-18T22:00:00Z", "cid-mcp-server"])
+
+    def test_mcp_files(self) -> None:
+        self.reply(find=("f\t73\tskills/a/SKILL.md\nf\t49152\tindex.sqlite\nl\t9\tskills/b\n", "", 0))
+        self.assertEqual(self.inspector.mcp_files("uso-abc-dk"), [("skills/a/SKILL.md", 73), ("index.sqlite", 49152)])
+        run = self.runs()[0]
+        self.assertEqual(run[:3], ["exec", "cid-mcp-server", "find"])
+        self.assertIn("/data/orgs/uso-abc-dk", run)
+
+    def test_missing_inspector_says_how_to_continue(self) -> None:
+        missing = e2e_h4.MissingInspector("podman no está instalado")
+        for name in ("usage_rows", "tagged_rows", "usage_dump", "source_status", "insert_old_usage", "snapshot_count",
+                     "key_exists", "stream_group", "stream_entries", "stream_add", "stream_has",
+                     "service_control", "service_logs", "mcp_files"):  # fmt: skip
+            with self.assertRaises(e2e_h4.StepError, msg=name):
+                getattr(missing, name)("x")
+
+
+class GroupTest(unittest.TestCase):
+    def test_uso_is_a_group_and_runs_alone(self) -> None:
+        self.assertIn("uso", e2e_h4.GROUPS)
+        self.assertEqual(e2e_h4.parse_args(["--only", "uso"]).only, ["uso"])
+        ns = e2e_h4.parse_args([])
+        self.assertIn("uso", ns.only)
+        self.assertEqual((ns.usage_timeout, ns.overhead_n), (90.0, 200))
+
+    def test_steps_are_registered_in_order(self) -> None:
+        ns = e2e_h4.parse_args(["--only", "uso", "--inspect", "none"])
+        names: list[str] = []
+
+        class Recorder:
+            def step(self, name: str, fn: object, *, needs: object = ()) -> None:
+                names.append(name)
+
+        e2e_h4.E2EH4(ns, inspector=None).run(Recorder())  # type: ignore[arg-type]
+        uso = [n for n in names if n.startswith("12.")]
+        self.assertEqual([n.split(" ")[0] for n in uso], ["12.1", "12.2", "12.3", "12.6", "12.10"],
+                         "sin inspector solo los pasos que no miran dentro de los contenedores")  # fmt: skip
+        self.assertFalse([n for n in names if n.startswith(("5.", "8.", "9.", "10.", "11."))])
+        inspector = e2e_h4.MissingInspector("prueba")
+        names.clear()
+        e2e_h4.E2EH4(ns, inspector=inspector).run(Recorder())  # type: ignore[arg-type]
+        uso = [n.split(" ")[0] for n in names if n.startswith("12.")]
+        self.assertEqual(uso, [f"12.{i}" for i in range(1, 11)])
+
+
+if __name__ == "__main__":
+    unittest.main()

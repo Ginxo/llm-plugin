@@ -304,7 +304,7 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(ns.fake_url, "http://127.0.0.1:48090")
         self.assertEqual((ns.org, ns.email), ("observacion", "observador@observacion.test"))
         self.assertEqual((ns.admin_email, ns.orgadmin_email), ("admin@baas.test", "orgadmin@demo.test"))
-        self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar", "originales", "huerfanos"])
+        self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso"])
         self.assertEqual((ns.anon_org, ns.anon_email), ("privada", "analista@privada.test"))
         self.assertEqual(ns.flush_wait, 2.0, "Redis con appendfsync everysec puede retrasar la escritura hasta 2 s")
         self.assertEqual(ns.apis, ["messages", "chat", "responses"])
@@ -999,10 +999,17 @@ class MissingInspectorTest(unittest.TestCase):
 # --- recorrido completo contra la pila simulada ------------------------------------------------------
 
 
+# La pila simulada no simula la observabilidad de uso (Fase 4): el grupo «uso» se prueba contra la pila real y aquí
+# solo sus utilidades (tests/test_e2e_uso.py). Sin `--only`, el recorrido es el de los grupos de H4.
+H4_GROUPS = ",".join(g for g in e2e_h4.GROUPS if g != "uso")
+
+
 def run_e2e(
     stack: fake_h4_stack.FakeH4Stack, *extra: str, inspector: object = "stack"
 ) -> tuple[int, dict[str, dict], str]:
     """Ejecuta `e2e_h4.main` contra la pila simulada; devuelve el código, los pasos por nombre y la salida."""
+    if "--only" not in extra:
+        extra = ("--only", H4_GROUPS, *extra)
     if inspector is None:
         extra = (*extra, "--inspect", "none")  # nunca el motor real del equipo
     with tempfile.TemporaryDirectory() as tmp:

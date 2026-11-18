@@ -28,15 +28,20 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         reactiva (`409 USER_DISABLED`) y el PLATFORM_ADMIN sí (`user.reactivated`, visible para el ORG_ADMIN de la
         organización; `user.disabled`, no). Crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y exige
         `BAAS_DEV_SKIP_TOTP=1` para activarlos.
+  12.   Observabilidad de uso (Fase 4, grupo «uso», `dev/e2e_uso.py`): tráfico con tokens, bytes y franja local;
+        invocaciones de skill (`/<org>:<skill>` y la herramienta `Skill`); sincronización; lecturas por área sin rutas
+        en ningún dato; foto de disco frente al volumen del MCP; permisos y `usage.viewed`; el proxy con el consumidor
+        y el MCP parados; retención y borrado; eventos repetidos; sobrecoste del proxy. Cada paso crea y elimina su
+        organización (`uso-<ejecución>-…`).
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
     uv run python dev/e2e_h4.py --app-url http://app.localhost:8080 --fake-url http://127.0.0.1:18090
 
-Los pasos 9.1b y 9.8 (vault, Redis y cuarentena) y el grupo 10 miran dentro de los contenedores con
-`podman`/`docker exec` (`--inspect none` los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los
-argumentos no valen. No se distribuye con el plugin. `dev/fake_h4_stack.py` simula la pila para probar este script sin
-ella.
+Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10 y los pasos 12.4, 12.5, 12.7, 12.8 y 12.9 miran
+dentro de los contenedores (o los paran) con `podman`/`docker` (`--inspect none` los omite). Sale con 0 si todo pasa,
+1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el plugin. `dev/fake_h4_stack.py` simula la
+pila (sin el grupo 12) para probar este script sin ella.
 """
 
 from __future__ import annotations
@@ -65,6 +70,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import e2e_h3 as h3
+import e2e_uso
 from e2e_h2 import DEV_PASSWORD, DEV_TOTP_SECRET, Http, Runner, StepError, check, dev_api_key
 
 from baas_plugin.errors import AuthError, McpToolError
@@ -73,7 +79,7 @@ from baas_plugin.mcp_client import McpClient
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
 APIS, API_NAMES = h3.APIS, h3.API_NAMES
-GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos")
+GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso")
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
@@ -488,6 +494,21 @@ class Inspector(Protocol):
     def redis_delete(self, service: str, key: str) -> None: ...
     def mcp_org_dirs(self) -> list[str]: ...
     def mcp_quarantine(self) -> list[str]: ...
+    # Fase 4 (grupo «uso»)
+    def usage_rows(self, org_id: str) -> dict[str, int]: ...
+    def tagged_rows(self, tag: str) -> dict[str, int]: ...
+    def usage_dump(self) -> str: ...
+    def source_status(self) -> dict[str, str]: ...
+    def insert_old_usage(self, org_id: str, user_id: str, *, months: int, tag: str) -> None: ...
+    def snapshot_count(self, event_id: str) -> int: ...
+    def key_exists(self, service: str, key: str) -> bool: ...
+    def stream_group(self, service: str, stream: str, group: str) -> dict[str, str] | None: ...
+    def stream_entries(self, service: str, stream: str) -> list[tuple[str, str]]: ...
+    def stream_add(self, service: str, stream: str, data: str) -> str: ...
+    def stream_has(self, service: str, stream: str, entry_id: str) -> bool: ...
+    def service_control(self, service: str, action: str) -> None: ...
+    def service_logs(self, service: str, since: str) -> str: ...
+    def mcp_files(self, slug: str) -> list[tuple[str, int]]: ...
 
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -510,6 +531,16 @@ done
 _ERE_SPECIAL = frozenset("\\.[](){}*+?|^$")
 _SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "/": "\\/", "\b": "\\b", "\f": "\\f", "\r": "\\r", "\t": "\\t"}
 MAX_NEEDLE = 200
+# Fase 4 (grupo «uso»): lo único que el inspector lee, escribe, para o arranca
+CONTROL_DB = "baas_control"
+USAGE_STREAMS = {PERSISTENT: ("baas:usage",), EPHEMERAL: ("baas:traces",)}
+USAGE_KEYS = ("baas:usage",)  # EXISTS en cualquiera de las dos instancias
+CONTROLLED_SERVICES = ("webapp-api", "mcp-server")
+SERVICE_ACTIONS = ("stop", "start", "pause", "unpause")
+_TAG = re.compile(r"^[a-z0-9-]{1,26}$")
+_EVENT_ID = re.compile(r"^[0-9A-Z]{1,26}$")
+_ENTRY = re.compile(r"^[0-9]+-[0-9]+$")
+_SINCE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$")
 
 
 def _ere_literal(text: str) -> str:
@@ -554,16 +585,17 @@ class ContainerInspector:
         ids = out.split()
         return ids[0] if ids else None
 
-    def _run(self, argv: Sequence[str], *, check_rc: bool = True) -> str:
+    def _run(self, argv: Sequence[str], *, check_rc: bool = True, merge: bool = False) -> str:
         try:
-            done = subprocess.run([self.engine, *argv], capture_output=True, text=True, timeout=60, check=False)
+            done = subprocess.run([self.engine, *argv], capture_output=True, text=True, timeout=60, check=False,
+                                  errors="replace")  # fmt: skip
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise StepError(f"{self.engine} {' '.join(argv[:3])}: {type(exc).__name__}") from None
         if check_rc and done.returncode != 0:
             raise StepError(
                 f"{self.engine} {' '.join(argv[:3])} salió con {done.returncode}: {done.stderr.strip()[:200]}"
             )
-        return done.stdout
+        return done.stdout + done.stderr if merge else done.stdout
 
     def _exec(self, service: str, *argv: str, check_rc: bool = True) -> str:
         cid = self.container(service)
@@ -751,6 +783,158 @@ class ContainerInspector:
         out = self._exec("mcp-server", "ls", "-1", f"{self.mcp_data_dir}/.quarantine", check_rc=False)
         return self._lines(out)
 
+    # --- Fase 4: métricas de uso (grupo «uso», `dev/e2e_uso.py`) ---------------------------------------------
+    @staticmethod
+    def _uuid(value: str) -> str:
+        if not _UUID.fullmatch(value):
+            raise StepError(f"identificador no válido: {value!r}")
+        return value
+
+    def _control(self, sql: str) -> list[str]:
+        """`psql` contra la base de la webapp (`baas_control`); cada fila, una línea con `|` entre columnas."""
+        return self._lines(self._exec("postgres", "psql", "-U", "postgres", "-d", CONTROL_DB, "-Atc", sql))
+
+    def _counts(self, sql: str, names: Sequence[str]) -> dict[str, int]:
+        row = (self._control(sql) or [""])[0].split("|")
+        if len(row) != len(names) or not all(v.isdigit() for v in row):
+            raise StepError(f"psql no devolvió {len(names)} número(s): {'|'.join(row)[:100]!r}")
+        return dict(zip(names, map(int, row), strict=True))
+
+    def usage_rows(self, org_id: str) -> dict[str, int]:
+        """Filas de métricas de la organización: tráfico, contenido y fotos de disco."""
+        o = self._uuid(org_id)
+        tables = ("usage_traffic_hourly", "usage_content_hourly", "storage_snapshots")
+        sql = "SELECT " + ", ".join(f"(SELECT count(*) FROM {t} WHERE org_id = '{o}')" for t in tables)  # noqa: S608
+        return self._counts(sql, ("traffic", "content", "snapshots"))
+
+    def tagged_rows(self, tag: str) -> dict[str, int]:
+        """Las filas que `insert_old_usage` escribió con `tag` (modelo, skill e identificador de la foto)."""
+        t = self._tag(tag)
+        sql = (
+            f"SELECT (SELECT count(*) FROM usage_traffic_hourly WHERE model = '{t}'),"  # noqa: S608
+            f" (SELECT count(*) FROM usage_content_hourly WHERE skill = '{t}'),"
+            f" (SELECT count(*) FROM storage_snapshots WHERE event_id = '{t.upper()}')"
+        )
+        return self._counts(sql, ("traffic", "content", "snapshots"))
+
+    @staticmethod
+    def _tag(tag: str) -> str:
+        if not _TAG.fullmatch(tag):
+            raise StepError(f"etiqueta no válida: {tag!r}")
+        return tag
+
+    def usage_dump(self) -> str:
+        """Todas las filas de las tablas de métricas como texto (para buscar valores centinela)."""
+        tables = ("usage_traffic_hourly", "usage_content_hourly", "storage_snapshots", "storage_snapshot_items",
+                  "usage_source_status")  # fmt: skip
+        sql = " UNION ALL ".join(f"SELECT '{t}', x::text FROM {t} x" for t in tables)  # noqa: S608
+        return "\n".join(self._control(sql))
+
+    def source_status(self) -> dict[str, str]:
+        """«Datos hasta» de cada tubería (`usage_source_status`): `source` → `last_event_at`."""
+        rows = self._control("SELECT source, last_event_at FROM usage_source_status")
+        return dict(line.split("|", 1) for line in rows if "|" in line)
+
+    def insert_old_usage(self, org_id: str, user_id: str, *, months: int, tag: str) -> None:
+        """Una fila de tráfico, una de contenido y una foto de disco de hace `months` meses, marcadas con `tag`."""
+        o, u, t = self._uuid(org_id), self._uuid(user_id), self._tag(tag)
+        if not 1 <= months <= 120:
+            raise StepError(f"meses no válidos: {months!r}")
+        at = f"now() - make_interval(months => {int(months)})"
+        sql = (
+            "INSERT INTO usage_traffic_hourly (org_id, user_id, hour, model, provider, requests) VALUES "  # noqa: S608
+            f"('{o}', '{u}', date_trunc('hour', {at}), '{t}', 'ANTHROPIC', 1); "
+            "INSERT INTO usage_content_hourly (org_id, user_id, hour, source, skill, area, count) VALUES "
+            f"('{o}', '{u}', date_trunc('hour', {at}), 'SYNCED', '{t}', '', 1); "
+            "INSERT INTO storage_snapshots (id, org_id, taken_at, event_id, files, bytes_skills, bytes_scripts, "
+            "bytes_schemas, bytes_knowledge, bytes_versions, bytes_index) VALUES "
+            f"(gen_random_uuid(), '{o}', {at}, '{t.upper()}', 1, 1, 0, 0, 0, 0, 0)"
+        )
+        self._control(sql)
+
+    def snapshot_count(self, event_id: str) -> int:
+        if not _EVENT_ID.fullmatch(event_id):
+            raise StepError(f"event_id no válido: {event_id!r}")
+        sql = f"SELECT count(*) FROM storage_snapshots WHERE event_id = '{event_id}'"  # noqa: S608
+        return self._counts(sql, ("n",))["n"]
+
+    @staticmethod
+    def _stream(service: str, stream: str) -> tuple[str, str]:
+        if stream not in USAGE_STREAMS.get(service, ()):
+            raise StepError(f"stream no permitido: {stream!r} en {service!r}")
+        return service, stream
+
+    def key_exists(self, service: str, key: str) -> bool:
+        svc = self._service(service)
+        if key not in USAGE_KEYS:
+            raise StepError(f"clave no permitida: {key!r}")
+        reply = self._redis_cli(svc, "EXISTS", key).strip()
+        if reply not in ("0", "1"):
+            raise StepError(f"EXISTS {key} en «{svc}»: {reply[:100]!r}")
+        return reply == "1"
+
+    def stream_group(self, service: str, stream: str, group: str) -> dict[str, str] | None:
+        svc, key = self._stream(service, stream)
+        return e2e_uso.group_info(self._redis_cli(svc, "--raw", "XINFO", "GROUPS", key, check_rc=False), group)
+
+    def stream_entries(self, service: str, stream: str) -> list[tuple[str, str]]:
+        svc, key = self._stream(service, stream)
+        return e2e_uso.stream_entries(self._redis_cli(svc, "--raw", "XRANGE", key, "-", "+"))
+
+    def stream_add(self, service: str, stream: str, data: str) -> str:
+        """`XADD <stream> * data <data>` (como el MCP y el proxy): devuelve el id de la entrada."""
+        svc, key = self._stream(service, stream)
+        reply = self._redis_cli(svc, "XADD", key, "*", "data", data).strip()
+        if not _ENTRY.fullmatch(reply):
+            raise StepError(f"XADD {key} en «{svc}»: {reply[:100]!r}")
+        return reply
+
+    def stream_has(self, service: str, stream: str, entry_id: str) -> bool:
+        svc, key = self._stream(service, stream)
+        if not _ENTRY.fullmatch(entry_id):
+            raise StepError(f"id de entrada no válido: {entry_id!r}")
+        return bool(e2e_uso.stream_entries(self._redis_cli(svc, "--raw", "XRANGE", key, entry_id, entry_id)))
+
+    @staticmethod
+    def _controlled(service: str) -> str:
+        if service not in CONTROLLED_SERVICES:
+            raise StepError(f"servicio no permitido: {service!r} (solo {', '.join(CONTROLLED_SERVICES)})")
+        return service
+
+    def service_control(self, service: str, action: str) -> None:
+        """`stop`, `start`, `pause` o `unpause` de la webapp o del MCP (con podman, `start` arranca también las
+        dependencias que ya terminaron: la migración y la semilla de la webapp, que son idempotentes)."""
+        svc = self._controlled(service)
+        if action not in SERVICE_ACTIONS:
+            raise StepError(f"acción no permitida: {action!r}")
+        cid = self.container(svc)
+        if cid is None:
+            raise StepError(f"no hay contenedor «{svc}» en el proyecto «{self.project}» ({self.engine})")
+        self._run([action, cid])
+
+    def service_logs(self, service: str, since: str) -> str:
+        """Los logs (salida y errores) del contenedor desde `since` (RFC 3339 UTC)."""
+        svc = self._controlled(service)
+        if not _SINCE.fullmatch(since):
+            raise StepError(f"instante no válido: {since!r}")
+        cid = self.container(svc)
+        if cid is None:
+            raise StepError(f"no hay contenedor «{svc}» en el proyecto «{self.project}» ({self.engine})")
+        return self._run(["logs", "--since", since, cid], merge=True)
+
+    def mcp_files(self, slug: str) -> list[tuple[str, int]]:
+        """Los ficheros regulares de `orgs/<slug>/` del MCP (sin seguir enlaces): ruta relativa y `st_size`."""
+        s = self._slug(slug)
+        out = self._exec("mcp-server", "find", f"{self.mcp_data_dir}/orgs/{s}", "-mindepth", "1",
+                         "-printf", "%y\t%s\t%P\n")  # fmt: skip
+        files = []
+        for line in out.splitlines():
+            kind, _, rest = line.partition("\t")
+            size, _, path = rest.partition("\t")
+            if kind == "f" and size.isdigit() and path:
+                files.append((path, int(size)))
+        return files
+
 
 class MissingInspector:
     """No se encontró el motor de contenedores: cada consulta falla diciendo cómo seguir."""
@@ -763,6 +947,8 @@ class MissingInspector:
 
     vault_rows = conversation_ids = redis_services = redis_keys = redis_setting = redis_residue = disk_files = _fail
     force_aof_rewrite = disk_contains = redis_set_temp = redis_delete = mcp_org_dirs = mcp_quarantine = _fail
+    usage_rows = tagged_rows = usage_dump = source_status = insert_old_usage = snapshot_count = key_exists = _fail
+    stream_group = stream_entries = stream_add = stream_has = service_control = service_logs = mcp_files = _fail
 
 
 def build_inspector(args: argparse.Namespace) -> Inspector | None:
@@ -815,7 +1001,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--apis", type=h3._csv(APIS), default=list(APIS),
                    help=f"APIs que se prueban, separadas por comas: {', '.join(APIS)} (todas)")  # fmt: skip
     p.add_argument("--inspect", choices=("auto", "podman", "docker", "none"), default="auto",
-                   help="Motor para mirar los contenedores («none» omite 9.1b, 9.8 y el grupo 10)")  # fmt: skip
+                   help="Motor para mirar los contenedores («none» omite 9.1b, 9.8, el grupo 10 y 12.4-12.5, "
+                        "12.7-12.9)")  # fmt: skip
     p.add_argument("--compose-project", default=os.environ.get("COMPOSE_PROJECT_NAME") or "baas-dev",
                    help="Proyecto de compose de la pila (por defecto, $COMPOSE_PROJECT_NAME o baas-dev)")  # fmt: skip
     p.add_argument("--mcp-data-dir", default="/data", help="BAAS_DATA_DIR del contenedor del MCP")
@@ -825,6 +1012,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--flush-wait", type=float, default=2.0,
                    help="Segundos de espera antes de mirar el AOF vivo (Redis lo escribe con retraso)")  # fmt: skip
     p.add_argument("--timeout", type=float, default=60, help="Tiempo máximo de cada petición HTTP")
+    p.add_argument("--usage-timeout", type=float, default=90,
+                   help="Grupo uso: espera (s) del uso del MCP, de la foto y de un servicio reiniciado")  # fmt: skip
+    p.add_argument("--overhead-n", type=int, default=200, help="Grupo uso (12.10): pares de peticiones medidos")
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
     ns.app_url, ns.fake_url = ns.app_url.rstrip("/"), ns.fake_url.rstrip("/")
@@ -2604,6 +2794,8 @@ class E2EH4:
             + ([a.anon_email] if "originales" in groups else [])
             + ([a.orgadmin_email] if groups & {"interruptor", "eliminar"} else [])
         )
+        uso = e2e_uso.UsoGroup(self) if "uso" in groups else None
+        logins += uso.logins() if uso else []
         step(s3, lambda: self.login(*logins), needs=[s0])
         cases = [(api, stream) for api in APIS for stream in (False, True)]
         if groups & {"observacion", "interruptor", "originales"}:
@@ -2713,18 +2905,22 @@ class E2EH4:
             step(react_g, self.orph_reactivate_g, needs=[default, react_a])
             step("11.14 eliminar la última organización de la prueba: 4 usuarios desactivados",
                  self.orph_cleanup, needs=[react_a, visible, react_g, keep])  # fmt: skip
+        if uso is not None:
+            uso.register(runner, [s0, s1, s3])
 
 
 def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> int:
     args = parse_args(argv)
     runner = Runner()
-    wants_containers = bool({"eliminar", "originales"} & set(args.only))
+    wants_containers = bool({"eliminar", "originales", "uso"} & set(args.only))
     inspector = inspector if inspector is not None else build_inspector(args) if wants_containers else None
     e2e = E2EH4(args, inspector)
     print(f"Prueba de punta a punta H4 · webapp {args.app_url} · proveedor falso {args.fake_url}"
           f" · organización {args.org} · ejecución {e2e.nonce}")  # fmt: skip
     if "originales" in args.only and inspector is None:
         print("NOTA: el grupo «originales» mira dentro de los contenedores (--inspect podman|docker): se omite")
+    if "uso" in args.only and inspector is None:
+        print("NOTA: sin --inspect, el grupo «uso» omite 12.4, 12.5, 12.7, 12.8 y 12.9 (miran o paran contenedores)")
     e2e.run(runner)
     report = {**runner.report(), "app_url": args.app_url, "fake_url": args.fake_url, "nonce": e2e.nonce,
               "only": args.only, "apis": args.apis,
