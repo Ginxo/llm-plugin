@@ -97,6 +97,7 @@ FAULTS = {
     # eliminar una organización
     "delete-no-block-check": "se puede eliminar una organización sin bloquear",
     "delete-no-slug-check": "se elimina aunque el slug de confirmación no coincida",
+    "delete-no-reauth": "se elimina sin contraseña o con una incorrecta (sin reautenticar al PLATFORM_ADMIN)",
     "delete-meta-allowed": "se puede eliminar la organización meta",
     "delete-orgadmin-allowed": "un ORG_ADMIN puede eliminar su organización",
     "delete-twice-ok": "eliminar dos veces responde 200 la segunda",
@@ -339,6 +340,16 @@ class StackState:
                 return 403, {"error": "FORBIDDEN", "message": "Only the platform administrator can delete"}
             if slug == META_ORG and "delete-meta-allowed" not in self.faults:
                 return 403, {"error": "ORG_PROTECTED", "message": "The platform organization cannot be deleted"}
+            if viewer.platform_admin and "delete-no-reauth" not in self.faults:  # H4-17: contraseña (dev sin TOTP)
+                password = body.get("current_password")
+                if not password:
+                    return 422, {
+                        "error": "VALIDATION_ERROR",
+                        "message": "Your password is required",
+                        "field": "current_password",
+                    }
+                if password != DEV_PASSWORD:
+                    return 401, {"error": "INVALID_CREDENTIALS", "message": "Invalid credentials"}
             reason = str(body.get("reason") or "").strip()
             if not 3 <= len(reason) <= 500:
                 return 422, {"error": "REASON_REQUIRED", "message": "A reason of 3 to 500 characters is required"}

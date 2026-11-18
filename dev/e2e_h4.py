@@ -1044,6 +1044,11 @@ class E2EH4:
     def admin_post(self, path: str, payload: Any = None, who: str | None = None, method: str = "POST") -> Http:
         return self.webapp(method, path, who or self.args.admin_email, payload)
 
+    def delete_body(self, **fields: Any) -> dict[str, Any]:
+        """Cuerpo de eliminar una organización: lleva la reautenticación del PLATFORM_ADMIN (H4-17).
+        La pila de desarrollo tiene BAAS_DEV_SKIP_TOTP=1, así que basta la contraseña."""
+        return {**fields, "current_password": self.args.password}
+
     def member_chat(self) -> Http:
         """Un turno de Chat Completions de `orgadmin_email` por la ruta de la organización que se elimina."""
         tag = h3.case_tag(self.nonce, "eliminar", "chat", "json")
@@ -1094,18 +1099,28 @@ class E2EH4:
     def delete_rules(self) -> str:
         a, slug, problems = self.args, self.slug, []
         expect = lambda *args: self.expect(problems, *args)  # noqa: E731
-        body = {"reason": REASON, "confirm_slug": slug}
+        body = self.delete_body(reason=REASON, confirm_slug=slug)
         expect("sin bloquear", self.admin_post(f"/api/v1/orgs/{slug}/delete", body), 409, "ORG_NOT_BLOCKED")
         expect(f"{a.orgadmin_email} (ORG_ADMIN de la organización)",
                self.admin_post(f"/api/v1/orgs/{slug}/delete", body, who=a.orgadmin_email), 403)  # fmt: skip
         expect(
             "la organización meta",
-            self.admin_post(f"/api/v1/orgs/{META_ORG}/delete", {"reason": REASON, "confirm_slug": META_ORG}),
+            self.admin_post(f"/api/v1/orgs/{META_ORG}/delete", self.delete_body(reason=REASON, confirm_slug=META_ORG)),
             403,
             "ORG_PROTECTED",
         )
         expect(
-            "sin motivo", self.admin_post(f"/api/v1/orgs/{slug}/delete", {"confirm_slug": slug}), 422, "REASON_REQUIRED"
+            "sin motivo",
+            self.admin_post(f"/api/v1/orgs/{slug}/delete", self.delete_body(confirm_slug=slug)),
+            422,
+            "REASON_REQUIRED",
+        )
+        # H4-17: sin contraseña o con otra no se elimina nada (el 401 cuenta para el bloqueo de la cuenta)
+        no_password = {"reason": REASON, "confirm_slug": slug}
+        expect("sin contraseña", self.admin_post(f"/api/v1/orgs/{slug}/delete", no_password), 422, "VALIDATION_ERROR")
+        wrong = {**no_password, "current_password": "no-es-la-contraseña"}
+        expect(
+            "contraseña incorrecta", self.admin_post(f"/api/v1/orgs/{slug}/delete", wrong), 401, "INVALID_CREDENTIALS"
         )
         res = self.webapp("GET", f"/api/v1/orgs/{slug}", a.admin_email)
         if res.status != 200:
@@ -1113,6 +1128,7 @@ class E2EH4:
         check(not problems, "\n".join(problems))
         return (
             "sin bloquear → 409 ORG_NOT_BLOCKED; ORG_ADMIN → 403; meta → 403 ORG_PROTECTED; sin motivo → 422; "
+            "sin contraseña → 422; contraseña incorrecta → 401; "
             "la organización sigue existiendo"
         )
 
@@ -1133,7 +1149,10 @@ class E2EH4:
 
         problems = self.poll(blocked)
         check(not problems, "\n".join(problems))
-        res = self.admin_post(f"/api/v1/orgs/{slug}/delete", {"reason": REASON, "confirm_slug": f"{slug}-otro"})
+        res = self.admin_post(
+            f"/api/v1/orgs/{slug}/delete",
+            {"reason": REASON, "confirm_slug": f"{slug}-otro", "current_password": self.args.password},
+        )
         err = (res.json() or {}).get("error") if isinstance(res.json(), dict) else None
         check(
             res.status == 422 and err == "SLUG_MISMATCH",
@@ -1146,7 +1165,7 @@ class E2EH4:
 
     def delete_org(self) -> str:
         slug = self.slug
-        res = self.admin_post(f"/api/v1/orgs/{slug}/delete", {"reason": REASON, "confirm_slug": slug})
+        res = self.admin_post(f"/api/v1/orgs/{slug}/delete", self.delete_body(reason=REASON, confirm_slug=slug))
         check(res.status == 200, f"POST …/delete → HTTP {res.status}: {h3.snippet(res.body, 200)}")
         propagated = (res.json() or {}).get("propagated")
         check(isinstance(propagated, bool), f"la respuesta no trae «propagated»: {h3.snippet(res.body, 200)}")
@@ -1158,7 +1177,7 @@ class E2EH4:
         res = self.webapp("GET", f"/api/v1/orgs/{slug}", a.admin_email)
         if res.status != 404:
             problems.append(f"GET /api/v1/orgs/{slug} → HTTP {res.status} (se esperaba 404)")
-        again = self.admin_post(f"/api/v1/orgs/{slug}/delete", {"reason": REASON, "confirm_slug": slug})
+        again = self.admin_post(f"/api/v1/orgs/{slug}/delete", self.delete_body(reason=REASON, confirm_slug=slug))
         if again.status != 404:
             problems.append(f"la segunda eliminación → HTTP {again.status} (se esperaba 404)")
         listing = self.webapp("GET", f"/api/v1/conversations?org={slug}", a.admin_email)

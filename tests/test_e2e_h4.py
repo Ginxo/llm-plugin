@@ -508,6 +508,7 @@ class FaultsTest(unittest.TestCase):
         "no-quarantine": {"9.8": (".quarantine", "no hay ninguna entrada")},
         "audit-missing": {"9.7": ("org.deleted",)},
         "delete-removes-users": {"9.5": ("handshake",)},
+        "delete-no-reauth": {"9.2": ("sin contraseña", "contraseña incorrecta")},
     }
 
     def run_fault(self, fault: str) -> dict[str, dict]:

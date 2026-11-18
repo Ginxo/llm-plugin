@@ -1,8 +1,9 @@
 """Mediciones del hito H4 sobre una pila real: kill switch → rechazo (proxy y MCP) y petición al proxy → WebSocket.
 
-Pila de `deploy/scripts/dev-up.sh --fake-upstream` (por defecto en `*.localhost:28080`: ajusta las constantes
-APP, PROXY y MCP si usas otros puertos). Usa usuarios de desarrollo y cambia el kill switch global de la pila
-(lo deja apagado). Resultados de H4 en `knowledge/01-producto/fases/fase-1-h4-mediciones.md`.
+Pila de `deploy/scripts/dev-up.sh --fake-upstream` (por defecto en `*.localhost:28080`: ajusta las
+constantes APP, PROXY y MCP si usas otros puertos). Usa usuarios de desarrollo y cambia el kill switch
+global de la pila (lo deja apagado); con BAAS_DEV_SKIP_TOTP=1 basta la contraseña para reautenticar
+(H4-17). Resultados de H4 en `knowledge/01-producto/fases/fase-1-h4-mediciones.md`.
 
     uv run python dev/measure_h4.py salida.json [repeticiones=30]
 """
@@ -127,14 +128,24 @@ def kill_switch(admin_cookie: str) -> dict:
         threads = [threading.Thread(target=watch_proxy), threading.Thread(target=watch_mcp)]
         for t in threads:
             t.start()
-        s, body, _ = req("PUT", f"{APP}/api/v1/platform/kill-switch", hdr, {"active": True, "reason": f"medicion {i}"})
+        s, body, _ = req(
+            "PUT",
+            f"{APP}/api/v1/platform/kill-switch",
+            hdr,
+            {"active": True, "reason": f"medicion {i}", "current_password": PASSWORD},
+        )
         put_t.append(time.perf_counter() - t0)
         assert s == 200, (s, body[:120])
         for t in threads:
             t.join()
         proxy_t.append(res.get("proxy", 10.0))
         mcp_t.append(res.get("mcp", 10.0))
-        s, body, _ = req("PUT", f"{APP}/api/v1/platform/kill-switch", hdr, {"active": False, "reason": f"fin {i}"})
+        s, body, _ = req(
+            "PUT",
+            f"{APP}/api/v1/platform/kill-switch",
+            hdr,
+            {"active": False, "reason": f"fin {i}", "current_password": PASSWORD},
+        )
         assert s == 200, (s, body[:120])
         for _ in range(400):  # vuelve a aceptar
             if proxy_status("demo", "analista@demo.test", "vuelta") == 200 and mcp_state() == "ok":
