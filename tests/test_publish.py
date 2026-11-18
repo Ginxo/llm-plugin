@@ -581,7 +581,10 @@ def test_dependencies_are_published_first_and_the_warning_goes_away(brain: Brain
 
 
 def test_a_file_name_that_is_not_utf8_is_refused_before_calling_the_server(brain: Brain, store: FakeStore) -> None:
-    (brain.skill / "assets" / os.fsdecode(b"raro-\xff.bin")).write_bytes(b"x")
+    try:
+        (brain.skill / "assets" / os.fsdecode(b"raro-\xff.bin")).write_bytes(b"x")
+    except OSError:  # macOS (APFS) no admite nombres que no sean UTF-8 válido
+        pytest.skip("el sistema de ficheros no admite nombres que no sean UTF-8")
     with pytest.raises(ConfigError, match="UTF-8"):
         publish.run_publish(DirectClient(store), opts(brain))
     assert writes(store) == []

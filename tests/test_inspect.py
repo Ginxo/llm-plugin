@@ -500,7 +500,10 @@ def test_big_text_files_are_still_analysed_without_being_kept_in_memory(brain: B
 def test_a_file_name_that_is_not_utf8_does_not_break_the_report(
     brain: Brain, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    (brain.skill / "references").joinpath(os.fsdecode(b"raro-\xff.md")).write_text("x\n")
+    try:
+        (brain.skill / "references").joinpath(os.fsdecode(b"raro-\xff.md")).write_text("x\n")
+    except OSError:  # macOS (APFS) no admite nombres que no sean UTF-8 válido
+        pytest.skip("el sistema de ficheros no admite nombres que no sean UTF-8")
     assert cli.main(["inspect", str(brain.skill), "--json", "--list-files"]) == 0
     assert "raro-" in capsys.readouterr().out
 
