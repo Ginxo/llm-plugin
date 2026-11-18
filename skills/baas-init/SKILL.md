@@ -27,7 +27,7 @@ Configura este proyecto para BaaS-AI-IP. El trabajo lo hace un script; tú lo ej
 
    | Salida | Qué hacer |
    | :--- | :--- |
-   | `0` | Resume al usuario la organización, las URLs y los `AVISO:` (kill switch, MCP sin registrar). Dile que **reinicie Claude Code** en este proyecto (y acepte la confianza en la carpeta) para cargar el MCP `baas` y el proxy, y que lo compruebe con `/baas-status`. |
+   | `0` | Resume al usuario la organización, las URLs y los `AVISO:` (kill switch, MCP sin registrar). Dile que **reinicie Claude Code** en este proyecto (y acepte la confianza en la carpeta) para cargar el MCP `baas` y el proxy, que lo compruebe con `/baas-status` y que lance `/baas-sync` para traer las skills de la organización. |
    | `2` `[BAAS_KEY_MISSING]` | Falta la API key. Pide al usuario que la guarde **fuera del chat**, en una terminal aparte: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" set-key --app-url <URL de la webapp>` (la pide sin mostrarla y la guarda en `~/baas-ai-ip/.env` con permisos 0600), o que edite ese fichero con la línea `BAAS_API_KEY=...`. Cuando confirme, vuelve al paso 1. |
    | `2` `[BAAS_APP_URL_MISSING]` | Pregunta la URL de la webapp (p. ej. `https://app.<dominio>`; no es secreta) y repite el paso 1 con `--app-url <URL>`. |
    | `3` `[BAAS_ORG_SELECTION_REQUIRED]` | El usuario pertenece a varias organizaciones: muéstrale la lista y pregúntale cuál vincular (AskUserQuestion si está disponible). Repite el paso 1 con `--org <slug>`. |

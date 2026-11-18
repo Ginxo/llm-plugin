@@ -108,10 +108,14 @@ def test_hooks_silent_when_proxied_or_unbound(project: Path, event: str) -> None
 def test_hooks_manifest_points_to_guard() -> None:
     manifest = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
     commands = {
-        event: [h["command"] for group in groups for h in group["hooks"]] for event, groups in manifest["hooks"].items()
+        event: [h["command"] for group in groups for h in group["hooks"] if "baas_guard.py" in h["command"]]
+        for event, groups in manifest["hooks"].items()
     }
-    assert set(commands) == {"SessionStart", "UserPromptSubmit"}
+    # H5: la sincronización añade hooks propios (SessionEnd y un lanzador en SessionStart; ver test_sync.py);
+    # la guardia de Desktop sigue donde estaba, una vez en SessionStart y otra en UserPromptSubmit.
+    assert {event: len(cs) for event, cs in commands.items() if cs} == {"SessionStart": 1, "UserPromptSubmit": 1}
     assert all("${CLAUDE_PLUGIN_ROOT}/scripts/baas_guard.py" in c for cs in commands.values() for c in cs)
+    assert "--event session-start" in commands["SessionStart"][0]
     assert "--event prompt" in commands["UserPromptSubmit"][0]
 
 

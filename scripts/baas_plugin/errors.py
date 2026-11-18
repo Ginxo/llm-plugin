@@ -20,6 +20,11 @@ class BaasError(Exception):
             text += f"\n{self.hint}"
         return text
 
+    @property
+    def error_code(self) -> str:
+        """Código simbólico estable (el de `BAAS_ERROR=<código>`): la marca sin el prefijo `BAAS_`."""
+        return self.marker.removeprefix("BAAS_")
+
 
 class ConfigError(BaasError):
     exit_code = 2
@@ -80,6 +85,31 @@ class McpToolError(BaasError):
         self.code = code
         self.payload = payload or {}
         self.marker = f"BAAS_MCP_{code}"
+
+    @property
+    def error_code(self) -> str:
+        return self.code
+
+
+class PackageError(BaasError):
+    """Paquete de skill inválido: ruta insegura (`..`, absoluta), manifiesto o respuesta mal formados."""
+
+    exit_code = 11
+    marker = "BAAS_PACKAGE_INVALID"
+
+
+class SyncIncompleteError(BaasError):
+    """La sincronización terminó, pero alguna skill no se pudo instalar (el resto sí se aplicó)."""
+
+    exit_code = 12
+    marker = "BAAS_SYNC_INCOMPLETE"
+
+
+class ForeignDirectoryError(BaasError):
+    """El directorio del plugin de la organización existe y no lo gestiona BaaS: no se toca nada."""
+
+    exit_code = 13
+    marker = "BAAS_SYNC_FOREIGN_DIR"
 
 
 def _tool_hint(code: str) -> str | None:

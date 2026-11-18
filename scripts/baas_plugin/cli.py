@@ -1,8 +1,15 @@
-"""CLI del plugin: `set-key`, `init`, `status`, `desktop-config` y `run-script`. Mensajes en español.
+"""CLI del plugin: `set-key`, `init`, `status`, `desktop-config`, `run-script`, `sync`, `inspect`, `publish`
+y `export`. Mensajes en español.
 
 Códigos de salida (las skills los interpretan): 0 ok · 2 configuración (falta la clave o la URL)
 · 3 hay que elegir organización · 4 sin organizaciones · 5 clave no válida · 6 red o servidor
-· 7 proyecto inseguro · 8 organización ajena · 9 hash del script no coincide · 10 error del MCP.
+· 7 proyecto inseguro · 8 organización ajena · 9 hash de un fichero no coincide · 10 error del MCP
+· 11 paquete inválido (ruta insegura) · 12 sincronización incompleta · 13 directorio ajeno.
+
+`run-script` es la excepción: devuelve **íntegro** el código de salida del script, que puede ser
+cualquiera (también 9 o 10). Sus errores propios salen, además, con una línea `BAAS_ERROR=<código>` en
+stderr (p. ej. `SCRIPT_HASH_MISMATCH`, `AUTHORIZATION_DENIED`, `KILL_SWITCH_ACTIVE`): sin esa línea, el
+código de salida es el del script.
 """
 
 from __future__ import annotations
@@ -18,7 +25,8 @@ from pathlib import Path
 
 import baas_guard
 
-from . import __version__, desktop_config, handshake, mcp_config, project
+from . import __version__, desktop_config, handshake, mcp_config, project, sync
+from .claude_home import ClaudePaths
 from .envfile import (
     BaasPaths,
     load_credentials,
@@ -155,6 +163,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     _p(
         "Siguiente paso: reinicia Claude Code en este proyecto (acepta la confianza en la carpeta si la pide)"
         " para cargar el MCP `baas` y el proxy; comprueba con /baas-status.",
+        "Después, /baas-sync trae las skills de tu organización (también se sincronizan solas al iniciar y"
+        " cerrar la sesión).",
     )
     return 0
 
@@ -203,8 +213,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     for warning in handshake.kill_switch_warnings(hs, org):
         _p(f"AVISO: {warning}")
     _check_local_config(proj, org)
-    if not args.no_mcp:
-        _check_mcp(creds.api_key, org.mcp_url)
+    claude = sync.claude_paths(args)
+    if args.no_mcp:
+        _p(*sync.status_lines(binding, proj, claude))
+    else:
+        _check_mcp(creds.api_key, org.mcp_url, binding, proj, claude)
     return 0
 
 
@@ -271,15 +284,25 @@ def cmd_desktop_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def _check_mcp(api_key: str, mcp_url: str) -> None:
+def _check_mcp(
+    api_key: str, mcp_url: str, binding: dict | None = None, proj: Path | None = None, claude: ClaudePaths | None = None
+) -> None:
     from .mcp_client import McpClient  # import diferido: status sin MCP no lo necesita
 
+    client = None
     try:
         with McpClient(mcp_url, api_key) as client:
-            client.call_tool("baas_whoami", {})
-        _p("MCP `baas`: accesible.")
+            try:
+                client.call_tool("baas_whoami", {})
+                _p("MCP `baas`: accesible.")
+            except BaasError as exc:
+                _p(f"MCP `baas`: ERROR · {exc.message}")
+            if proj is not None and claude is not None:  # skills sincronizadas, desfasadas y revocadas (H5)
+                _p(*sync.status_lines(binding, proj, claude, client))
     except BaasError as exc:
         _p(f"MCP `baas`: ERROR · {exc.message}")
+        if proj is not None and claude is not None and client is None:
+            _p(*sync.status_lines(binding, proj, claude))
 
 
 # --- main ------------------------------------------------------------------------------------
@@ -289,6 +312,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="baas", description="Plugin de BaaS-AI-IP para Claude Code")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    from .skillcmds import add_skill_package_parsers  # inspect, publish y export (H5)
+
+    add_skill_package_parsers(sub)
 
     p = sub.add_parser("set-key", help="Guarda la API key en ~/baas-ai-ip/.env sin mostrarla")
     p.add_argument("--stdin", action="store_true", help="Lee la clave de la entrada estándar (tubería)")
@@ -306,9 +333,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--app-url", help="URL de la webapp (se guarda en ~/baas-ai-ip/.env)")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("status", help="Usuario, organización, roles, kill switch y AI-IP")
+    p = sub.add_parser("status", help="Usuario, organización, roles, kill switch, AI-IP y skills sincronizadas")
     p.add_argument("--project")
     p.add_argument("--no-mcp", action="store_true", help="No comprobar la conexión con el MCP")
+    sync.add_claude_home_args(p)
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("desktop-config", help="Configuración de Claude Desktop en modo gateway hacia el proxy")
@@ -319,6 +347,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .runner import add_run_script_parser  # el ejecutor vive en su propio módulo
 
     add_run_script_parser(sub)
+    sync.add_sync_parser(sub)
     return parser
 
 
@@ -333,6 +362,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except BaasError as exc:
+        if args.command == "run-script":
+            # Un script puede salir con cualquier código (también 9 o 10): esta línea marca un error del plugin.
+            print(f"BAAS_ERROR={exc.error_code}", file=sys.stderr)
         print(exc.render(), file=sys.stderr)
         return exc.exit_code
     except KeyboardInterrupt:
