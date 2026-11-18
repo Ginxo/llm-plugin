@@ -1100,7 +1100,11 @@ class FullRunTest(unittest.TestCase):
         self.assert_all_ok(code, steps, out)
         self.assertEqual(len([n for n in steps if n.startswith("11.")]), 15)
         self.assertFalse([n for n in steps if n.startswith(("5.", "8.", "9."))])
-        self.assertEqual(leftovers, ["baas-ai-ip", "demo", "observacion"], "las cuatro organizaciones se eliminaron")
+        # «privada» la siembra la pila simulada para el tercer modo del grupo «originales» (H4-02);
+        # este grupo no la toca
+        self.assertEqual(
+            leftovers, ["baas-ai-ip", "demo", "observacion", "privada"], "las cuatro organizaciones se eliminaron"
+        )
         self.assertEqual(len(users), 7)
         # B, X, A y G (las de O2) y F quedan desactivados; C (O3, false) sigue ACTIVE y E sigue INVITED
         self.assertEqual(statuses, {"DISABLED", "ACTIVE", "INVITED"})
