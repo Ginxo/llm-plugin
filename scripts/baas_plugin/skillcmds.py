@@ -22,8 +22,10 @@ def connection(project_arg: str | None) -> tuple[str, str]:
 
 
 def add_skill_package_parsers(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    from .export import add_export_parser
     from .inspect import add_inspect_parser
     from .publish import add_publish_parser
 
     add_inspect_parser(sub)
     add_publish_parser(sub)
+    add_export_parser(sub)
