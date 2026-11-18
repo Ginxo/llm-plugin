@@ -67,6 +67,10 @@ python3 "<ruta del plugin>/scripts/baas.py" run-script <ruta del script> [--sha2
 
 Límite aceptado: un script ya ejecutado no se puede «revocar» (riesgo S6).
 
+## Codex (OpenAI)
+
+El plugin `baas` es de Claude Code, pero **Codex CLI** también puede pasar por el proxy de OpenAI de tu organización con un perfil de usuario y `env_http_headers` (la clave de BaaS-AI-IP solo en el entorno de Codex, nunca en un fichero): ver [docs/codex.md](docs/codex.md).
+
 ## Solución de problemas
 
 | Síntoma | Causa y solución |
@@ -94,4 +98,4 @@ claude plugin validate --strict .         # validación oficial (usa un HOME tem
 python3 dev/fake_baas.py --port 8765      # BaaS falso (handshake + MCP) para pruebas manuales
 ```
 
-`dev/e2e_h2.py` es la prueba de punta a punta contra la pila de desarrollo de `deploy` ([docs/e2e.md](docs/e2e.md)) y `dev/spike_s13_codex.sh`, el spike de Codex CLI ([docs/spike-s13.md](docs/spike-s13.md)). `dev/spike_s1.py` reproduce las pruebas del spike S1 con el CLI real, sin red (ver [docs/spike-s1.md](docs/spike-s1.md)). CI: `.github/workflows/ci.yml`; al etiquetar `v*`, `release.yml` publica una *release* (sin despliegue). La versión vive en `.claude-plugin/plugin.json` y debe coincidir con la etiqueta.
+`dev/e2e_h2.py` es la prueba de punta a punta contra la pila de desarrollo de `deploy` ([docs/e2e.md](docs/e2e.md); `dev/e2e_h3.py` y `dev/e2e_h4.py` son las de AI-IP y las de H4: el anonimizador apagado y eliminar una organización) y `dev/spike_s13_codex.sh`, el spike de Codex CLI ([docs/spike-s13.md](docs/spike-s13.md)). `dev/spike_s1.py` reproduce las pruebas del spike S1 con el CLI real, sin red (ver [docs/spike-s1.md](docs/spike-s1.md)). CI: `.github/workflows/ci.yml`; al etiquetar `v*`, `release.yml` publica una *release* (sin despliegue). La versión vive en `.claude-plugin/plugin.json` y debe coincidir con la etiqueta.
