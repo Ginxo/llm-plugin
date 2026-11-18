@@ -1,5 +1,5 @@
 {
-  "description": "Guardia de BaaS-AI-IP: en un proyecto vinculado, avisa al iniciar y bloquea los prompts si la sesión no pasa por el proxy de la organización (p. ej. pestaña Code de Claude Desktop).",
+  "description": "BaaS-AI-IP: guardia de sesión (avisa al iniciar y bloquea los prompts si la sesión no pasa por el proxy de la organización, p. ej. pestaña Code de Claude Desktop) y sincronización en segundo plano de las skills de la organización al iniciar y al cerrar la sesión (falla en abierto: nunca retrasa ni bloquea).",
   "hooks": {
     "SessionStart": [
       {
@@ -8,6 +8,16 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/baas_guard.py\" --event session-start",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/baas_sync_hook.py\" --event session-start",
+            "timeout": 5
           }
         ]
       }
@@ -19,6 +29,17 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/baas_guard.py\" --event prompt",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/baas_sync_hook.py\" --event session-end",
+            "timeout": 5
           }
         ]
       }

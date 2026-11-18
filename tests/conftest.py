@@ -16,6 +16,8 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.delenv("BAAS_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("BAAS_CLAUDE_HOME", str(fake_home / ".claude"))  # `baas.py sync` nunca toca el real
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)

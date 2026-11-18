@@ -113,7 +113,7 @@ class McpClient:
     def close(self) -> None:
         if self.session_id:
             with contextlib.suppress(NetworkError):
-                httpclient.request("DELETE", self.url, headers=self._headers(), timeout=10)
+                httpclient.request("DELETE", self.url, headers=self._headers(), timeout=min(10, self.timeout))
             self.session_id = None
 
     # --- tools ------------------------------------------------------------------------------------

@@ -3,12 +3,15 @@
 - `.claude/settings.local.json`: bloque `env` con `ANTHROPIC_BASE_URL` y `ANTHROPIC_CUSTOM_HEADERS`
   (la cabecera `X-Baas-Api-Key` es el único sitio del proyecto donde va la clave; ver docs/spike-s1.md).
 - `.claude/baas.local.json`: organización y URLs devueltas por el handshake (sin secretos).
+- `enabledPlugins` de `.claude/settings.local.json` (hito H5): activa en este proyecto el plugin de la
+  organización que mantiene `baas.py sync` (`<slug>@skills-dir`); mismas reglas que el resto del fichero.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +98,35 @@ def write_settings_local(project: Path, proxy_anthropic_url: str, api_key: str) 
     env["ANTHROPIC_CUSTOM_HEADERS"] = merge_custom_headers(env.get("ANTHROPIC_CUSTOM_HEADERS"), api_key)
     data["env"] = env
     return _write_json(path, data)
+
+
+def read_enabled_plugins(project: Path) -> dict[str, Any]:
+    plugins = _load_json(project / SETTINGS_LOCAL).get("enabledPlugins")
+    return plugins if isinstance(plugins, dict) else {}
+
+
+def set_enabled_plugins(project: Path, enable: str, drop: Iterable[str] = ()) -> bool:
+    """Activa el plugin `enable` y quita las claves `drop` de `enabledPlugins` en `settings.local.json`.
+
+    Respeta las reglas del fichero (no versionable, en `.gitignore`) y conserva el resto. Devuelve `True`
+    si lo modificó; si ya estaba como se pide, no lo toca. Lanza `ProjectSafetyError` si está versionado.
+    """
+    path = project / SETTINGS_LOCAL
+    data = _load_json(path)
+    plugins = data.get("enabledPlugins")
+    if plugins is None:
+        plugins = {}
+    if not isinstance(plugins, dict):
+        raise ProjectSafetyError(f"El bloque `enabledPlugins` de {path} no es un objeto JSON.")
+    wanted = {k: v for k, v in plugins.items() if k not in set(drop) or k == enable}
+    wanted[enable] = True
+    if wanted == plugins:
+        return False
+    check_not_tracked(project)
+    data["enabledPlugins"] = wanted
+    _write_json(path, data)
+    ensure_gitignore(project)
+    return True
 
 
 def _present(lines: list[str], entry: str) -> bool:
