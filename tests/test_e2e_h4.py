@@ -104,7 +104,7 @@ class PureUtilitiesTest(unittest.TestCase):
 
 
 class OrphanUtilitiesTest(unittest.TestCase):
-    """Las utilidades puras del grupo «huérfanos» (10) y el cliente de inicio de sesión."""
+    """Las utilidades puras del grupo «huérfanos» (11) y el cliente de inicio de sesión."""
 
     ADMIN = "admin@baas.test"
     A = e2e_h4.Person("a", "huerf-abc-a@huerf.test", "Huerfano A abc", user_id="u-a")
@@ -575,8 +575,8 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 6)
         once = ["0.", "1.", "2.", "2b.", "3.", "4.", "6.", "7.1", "7.2", "7.3", "8.1 ", "8.2", "8.3", "8.4", "8.5"]
         once += ["8.6", "8.7", "8.8", "8.9", "8.10", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5", "9.6", "9.7", "9.8"]
-        once += ["10.1 ", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7", "10.8", "10.9", "10.10", "10.11", "10.12 "]
-        once += ["10.12b", "10.13", "10.14"]
+        once += ["11.1 ", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7", "11.8", "11.9", "11.10", "11.11", "11.12 "]
+        once += ["11.12b", "11.13", "11.14"]
         for prefix in once:
             self.assertEqual(len([n for n in steps if n.startswith(prefix)]), 1, prefix)
         self.assertFalse(initial, "el interruptor debe quedar apagado, como al empezar")
@@ -608,16 +608,16 @@ class FullRunTest(unittest.TestCase):
             code, steps, out = run_e2e(stack, "--only", "observacion", "--apis", "chat")
         self.assert_all_ok(code, steps, out)
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 2)
-        self.assertFalse([n for n in steps if n.startswith(("8.", "9.", "10."))])
+        self.assertFalse([n for n in steps if n.startswith(("8.", "9.", "11."))])
         with fake_h4_stack.FakeH4Stack() as stack:
             code, steps, out = run_e2e(stack, "--only", "interruptor", "--apis", "messages")
         self.assert_all_ok(code, steps, out)
-        self.assertFalse([n for n in steps if n.startswith(("5.", "9.", "10."))])
+        self.assertFalse([n for n in steps if n.startswith(("5.", "9.", "11."))])
         with fake_h4_stack.FakeH4Stack() as stack:
             code, steps, out = run_e2e(stack, "--only", "eliminar", "--inspect", "none", inspector=None)
         self.assert_all_ok(code, steps, out)
         self.assertEqual(len([n for n in steps if n.startswith("9.")]), 7, "sin inspector no hay pasos 9.1b ni 9.8")
-        self.assertFalse([n for n in steps if n.startswith("10.")])
+        self.assertFalse([n for n in steps if n.startswith("11.")])
 
     def test_only_the_orphans_group(self) -> None:
         with fake_h4_stack.FakeH4Stack() as stack:
@@ -627,7 +627,7 @@ class FullRunTest(unittest.TestCase):
             statuses = {u.status for u in stack.state.users.values() if u.email.startswith("huerf-")}
             keys = [k for u in stack.state.users.values() if u.email.startswith("huerf-") for k in u.keys]
         self.assert_all_ok(code, steps, out)
-        self.assertEqual(len([n for n in steps if n.startswith("10.")]), 15)
+        self.assertEqual(len([n for n in steps if n.startswith("11.")]), 15)
         self.assertFalse([n for n in steps if n.startswith(("5.", "8.", "9."))])
         self.assertEqual(leftovers, ["baas-ai-ip", "demo", "observacion"], "las cuatro organizaciones se eliminaron")
         self.assertEqual(len(users), 7)
@@ -709,29 +709,29 @@ class FaultsTest(unittest.TestCase):
         "audit-missing": {"9.7": ("org.deleted",)},
         "delete-removes-users": {"9.5": ("handshake",)},
         "delete-no-reauth": {"9.2": ("sin contraseña", "contraseña incorrecta")},
-        "preview-lists-all": {"10.3": ("lista a quien no se quedaría sin organización",)},
-        "preview-open": {"10.4": ("USER de la organización", "403")},
-        "preview-needs-block": {"10.3": ("409 ORG_NOT_BLOCKED",)},
-        "orphans-kept": {"10.5": ("disabled_users = 0",)},
-        "orphans-ignore-flag": {"10.9": ("disabled_users = 2",)},
-        "orphans-default-off": {"10.10": ("disabled_users = 0",)},
-        "orphans-other-org": {"10.5": ("disabled_users = 2",)},
-        "orphans-invited-skipped": {"10.10": ("no lista a",)},
-        "orphans-keys-kept": {"10.6": ("baas_invalid_api_key", "handshake"), "10.8": ("keys_revoked",)},
-        "orphans-sessions-kept": {"10.6": ("su sesión de antes sigue abierta",)},
-        "orphans-links-kept": {"10.13": ("vuelve a valer",)},
-        "orphans-audit-missing": {"10.8": ("0 fila(s)",)},
-        "orphans-audit-email": {"10.8": ("no debe llevar el email ni el nombre",)},
-        "disabled-can-login": {"10.6": ("inicia sesión con la contraseña correcta",)},
-        "reactivate-orgadmin": {"10.11": ("USER_DISABLED",)},
-        "reactivate-no-audit": {"10.12 ": ("user.reactivated",)},
-        "reactivate-restores-keys": {"10.12 ": ("clave de antes", "revocada")},
-        "reactivate-audit-no-org": {"10.12 ": ("user.reactivated: org_slug = None",)},
-        "audit-orgadmin-sees-disabled": {"10.12b": ("X ve 1 fila(s) user.disabled", "no debe ver ninguna")},
-        "audit-orgadmin-blind": {"10.12b": ("X ve 0 fila(s) user.reactivated",)},
+        "preview-lists-all": {"11.3": ("lista a quien no se quedaría sin organización",)},
+        "preview-open": {"11.4": ("USER de la organización", "403")},
+        "preview-needs-block": {"11.3": ("409 ORG_NOT_BLOCKED",)},
+        "orphans-kept": {"11.5": ("disabled_users = 0",)},
+        "orphans-ignore-flag": {"11.9": ("disabled_users = 2",)},
+        "orphans-default-off": {"11.10": ("disabled_users = 0",)},
+        "orphans-other-org": {"11.5": ("disabled_users = 2",)},
+        "orphans-invited-skipped": {"11.10": ("no lista a",)},
+        "orphans-keys-kept": {"11.6": ("baas_invalid_api_key", "handshake"), "11.8": ("keys_revoked",)},
+        "orphans-sessions-kept": {"11.6": ("su sesión de antes sigue abierta",)},
+        "orphans-links-kept": {"11.13": ("vuelve a valer",)},
+        "orphans-audit-missing": {"11.8": ("0 fila(s)",)},
+        "orphans-audit-email": {"11.8": ("no debe llevar el email ni el nombre",)},
+        "disabled-can-login": {"11.6": ("inicia sesión con la contraseña correcta",)},
+        "reactivate-orgadmin": {"11.11": ("USER_DISABLED",)},
+        "reactivate-no-audit": {"11.12 ": ("user.reactivated",)},
+        "reactivate-restores-keys": {"11.12 ": ("clave de antes", "revocada")},
+        "reactivate-audit-no-org": {"11.12 ": ("user.reactivated: org_slug = None",)},
+        "audit-orgadmin-sees-disabled": {"11.12b": ("X ve 1 fila(s) user.disabled", "no debe ver ninguna")},
+        "audit-orgadmin-blind": {"11.12b": ("X ve 0 fila(s) user.reactivated",)},
     }
 
-    ORPHAN_PREFIXES = ("preview-", "orphans-", "reactivate-", "disabled-")  # solo los pasos 10 los comprueban
+    ORPHAN_PREFIXES = ("preview-", "orphans-", "reactivate-", "disabled-")  # solo los pasos 11 los comprueban
 
     def run_fault(self, fault: str) -> dict[str, dict]:
         only = ("--only", "huerfanos") if fault.startswith(self.ORPHAN_PREFIXES) else ()

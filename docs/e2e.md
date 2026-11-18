@@ -232,7 +232,7 @@ Pendiente de la integración (C2). Contra la pila simulada, la ejecución comple
 > MCP con la cuarentena y `deploy` con el informe del monitor se desarrollan a la vez en otras ramas. El coordinador la
 > ejecuta entera sobre `h4-int` en la tarea C2 del plan del hito H4. Tarea L1 del plan; diseño §5.5 y §6.
 >
-> La parte `huerfanos` (pasos 10.x, usuarios que se quedan sin organización al eliminar una) se escribió después, **solo
+> La parte `huerfanos` (pasos 11.x, usuarios que se quedan sin organización al eliminar una) se escribió después, **solo
 > contra el contrato** (§6 de `knowledge/02-arquitectura/contratos-fase-1.md`: `delete-preview`, `disable_orphans`,
 > `user.disabled`, `USER_DISABLED`, `user.reactivated`) y contra la pila simulada: la webapp que lo implementa se
 > desarrolla a la vez. Los supuestos que conviene verificar al ejecutarla de verdad están en el apartado 5.
@@ -326,21 +326,21 @@ como PLATFORM_ADMIN (`POST …/members` → enlace de activación → `POST /api
 
 | Paso | Comprobación |
 | :--- | :--- |
-| 10.1 | Crear O1 a O4; invitar a los siete usuarios (nacen `INVITED` con enlace); activar a A, B, X, C y F; invitar a B a O2 (ya activa: sin enlace) y al PLATFORM_ADMIN a O1; sesión y clave personal de A, B, C y F |
-| 10.2 | Las claves valen: A en O1, B en O1 y O2, C en O3 y F en O4 (el handshake de cada uno lista exactamente sus organizaciones) |
-| 10.3 | `GET /api/v1/orgs/<O1>/delete-preview` como PLATFORM_ADMIN con O1 **sin bloquear** → `200` con `members: 3` y `orphans` con **solo** A (`id`, `email`, `name`, `status: ACTIVE`, `personal_keys: 1`): ni B (tiene O2) ni el PLATFORM_ADMIN |
-| 10.4 | La misma vista previa: A (USER de O1) y B (ORG_ADMIN de O1) → `403`; X (ORG_ADMIN de otra) → `403` o `404`; sin sesión → `401`; organización inexistente → `404`; ninguna respuesta lista a A; la vista previa no cambió nada (O1 existe, A sigue `ACTIVE` y con su sesión) |
-| 10.5 | Bloquear O1 y `POST …/delete` con `"disable_orphans": true` → `200` con `propagated` y **`disabled_users: 1`**; O1 → `404` |
-| 10.6 | A: no inicia sesión con su contraseña (`401`/`403`, sin cookie de sesión), su sesión de antes está cerrada (`GET /api/v1/me` → `401`), la clave se rechaza (handshake, proxy y MCP) |
-| 10.7 | B no cambia: su sesión de antes sigue (`ACTIVE`, solo con O2), inicia sesión, su clave sigue vigente en `GET /api/v1/api-keys` y vale en O2 (handshake lista solo O2, proxy `200`, MCP); el PLATFORM_ADMIN, X, C y F siguen `ACTIVE` |
-| 10.8 | `GET /api/v1/audit?action=user.disabled`: una fila de A con `actor` = el PLATFORM_ADMIN, `reason` = el motivo de la eliminación, sin organización, `metadata` `{cause: "org.deleted", org_slug: <O1>, previous_status: "ACTIVE", keys_revoked ≥ 1}` y **sin el email ni el nombre de A en ningún campo** (salvo `target_label`: la webapp lo deriva al leer, ver apartado 5); ninguna fila de B, X, C ni F |
-| 10.9 | O3 con `"disable_orphans": false` → `disabled_users: 0`: C sigue `ACTIVE` (sin organización), inicia sesión y su clave vale (handshake `200` sin organizaciones; proxy `403 baas_access_denied` y MCP `404`, no `401`); el enlace de activación de E sigue valiendo; ninguna fila `user.disabled` |
-| 10.10 | O4: la vista previa lista a F (`ACTIVE`, 1 clave) y a G (`INVITED`, 0). `POST …/delete` **sin** el campo `disable_orphans` → `disabled_users: 2` (el valor por omisión es `true`): F como A en 10.6; el enlace de G ya no vale ni activa la cuenta; una fila `user.disabled` por cada uno (`previous_status` `ACTIVE` e `INVITED`, `keys_revoked` ≥ 1 y 0), sin email ni nombre |
-| 10.11 | X (ORG_ADMIN de O2) invita a A, desactivado, a O2 → `409 USER_DISABLED`: A no figura entre los miembros de O2 y sigue sin poder iniciar sesión |
-| 10.12 | El PLATFORM_ADMIN invita a A a O2 → `201`, `member.status: ACTIVE`, sin enlace. A inicia sesión con la contraseña de siempre (solo O2); su clave de antes sigue **revocada** (`GET /api/v1/api-keys`, handshake `401`, proxy `401` y MCP `401` aunque ya sea miembro de O2: solo puede ser por la revocación) y una clave nueva vale; auditoría `user.reactivated` (`actor`, `org_slug: <O2>` —la fila lleva `org_id` de la organización a la que se invita— y `metadata` `{org_slug: <O2>, new_status: "ACTIVE"}`, sin `previous_status`) y `member.invited` en O2 |
-| 10.12b | Visibilidad en la auditoría (W10), tras reactivar a A: X (ORG_ADMIN de O2) ve en `GET /api/v1/audit` la fila `user.reactivated` de A (la de 10.12) y **ninguna** fila `user.disabled`, ni en la lista ni filtrando `action=user.disabled`; el PLATFORM_ADMIN ve las dos |
-| 10.13 | El PLATFORM_ADMIN invita a G (desactivado y sin activar) a O2 → `201`, `member.status: INVITED` con un enlace **nuevo**; el de antes no vale, el nuevo sí; con él G activa la cuenta, inicia sesión y queda `ACTIVE` en O2; auditoría `user.reactivated` con `metadata` `{org_slug: <O2>, new_status: "INVITED"}` |
-| 10.14 | **Limpieza**: bloquear y eliminar O2 (la última) → `disabled_users: 4` (A, B, X y G ya no tienen otra organización); A, desactivado otra vez, ya no inicia sesión y su clave nueva se rechaza. Las cuentas no se eliminan: quedan `huerf-<ejecución>-*` (C `ACTIVE` y E `INVITED` sin organización; A, B, X, F y G `DISABLED`) |
+| 11.1 | Crear O1 a O4; invitar a los siete usuarios (nacen `INVITED` con enlace); activar a A, B, X, C y F; invitar a B a O2 (ya activa: sin enlace) y al PLATFORM_ADMIN a O1; sesión y clave personal de A, B, C y F |
+| 11.2 | Las claves valen: A en O1, B en O1 y O2, C en O3 y F en O4 (el handshake de cada uno lista exactamente sus organizaciones) |
+| 11.3 | `GET /api/v1/orgs/<O1>/delete-preview` como PLATFORM_ADMIN con O1 **sin bloquear** → `200` con `members: 3` y `orphans` con **solo** A (`id`, `email`, `name`, `status: ACTIVE`, `personal_keys: 1`): ni B (tiene O2) ni el PLATFORM_ADMIN |
+| 11.4 | La misma vista previa: A (USER de O1) y B (ORG_ADMIN de O1) → `403`; X (ORG_ADMIN de otra) → `403` o `404`; sin sesión → `401`; organización inexistente → `404`; ninguna respuesta lista a A; la vista previa no cambió nada (O1 existe, A sigue `ACTIVE` y con su sesión) |
+| 11.5 | Bloquear O1 y `POST …/delete` con `"disable_orphans": true` → `200` con `propagated` y **`disabled_users: 1`**; O1 → `404` |
+| 11.6 | A: no inicia sesión con su contraseña (`401`/`403`, sin cookie de sesión), su sesión de antes está cerrada (`GET /api/v1/me` → `401`), la clave se rechaza (handshake, proxy y MCP) |
+| 11.7 | B no cambia: su sesión de antes sigue (`ACTIVE`, solo con O2), inicia sesión, su clave sigue vigente en `GET /api/v1/api-keys` y vale en O2 (handshake lista solo O2, proxy `200`, MCP); el PLATFORM_ADMIN, X, C y F siguen `ACTIVE` |
+| 11.8 | `GET /api/v1/audit?action=user.disabled`: una fila de A con `actor` = el PLATFORM_ADMIN, `reason` = el motivo de la eliminación, sin organización, `metadata` `{cause: "org.deleted", org_slug: <O1>, previous_status: "ACTIVE", keys_revoked ≥ 1}` y **sin el email ni el nombre de A en ningún campo** (salvo `target_label`: la webapp lo deriva al leer, ver apartado 5); ninguna fila de B, X, C ni F |
+| 11.9 | O3 con `"disable_orphans": false` → `disabled_users: 0`: C sigue `ACTIVE` (sin organización), inicia sesión y su clave vale (handshake `200` sin organizaciones; proxy `403 baas_access_denied` y MCP `404`, no `401`); el enlace de activación de E sigue valiendo; ninguna fila `user.disabled` |
+| 11.10 | O4: la vista previa lista a F (`ACTIVE`, 1 clave) y a G (`INVITED`, 0). `POST …/delete` **sin** el campo `disable_orphans` → `disabled_users: 2` (el valor por omisión es `true`): F como A en 11.6; el enlace de G ya no vale ni activa la cuenta; una fila `user.disabled` por cada uno (`previous_status` `ACTIVE` e `INVITED`, `keys_revoked` ≥ 1 y 0), sin email ni nombre |
+| 11.11 | X (ORG_ADMIN de O2) invita a A, desactivado, a O2 → `409 USER_DISABLED`: A no figura entre los miembros de O2 y sigue sin poder iniciar sesión |
+| 11.12 | El PLATFORM_ADMIN invita a A a O2 → `201`, `member.status: ACTIVE`, sin enlace. A inicia sesión con la contraseña de siempre (solo O2); su clave de antes sigue **revocada** (`GET /api/v1/api-keys`, handshake `401`, proxy `401` y MCP `401` aunque ya sea miembro de O2: solo puede ser por la revocación) y una clave nueva vale; auditoría `user.reactivated` (`actor`, `org_slug: <O2>` —la fila lleva `org_id` de la organización a la que se invita— y `metadata` `{org_slug: <O2>, new_status: "ACTIVE"}`, sin `previous_status`) y `member.invited` en O2 |
+| 11.12b | Visibilidad en la auditoría (W10), tras reactivar a A: X (ORG_ADMIN de O2) ve en `GET /api/v1/audit` la fila `user.reactivated` de A (la de 11.12) y **ninguna** fila `user.disabled`, ni en la lista ni filtrando `action=user.disabled`; el PLATFORM_ADMIN ve las dos |
+| 11.13 | El PLATFORM_ADMIN invita a G (desactivado y sin activar) a O2 → `201`, `member.status: INVITED` con un enlace **nuevo**; el de antes no vale, el nuevo sí; con él G activa la cuenta, inicia sesión y queda `ACTIVE` en O2; auditoría `user.reactivated` con `metadata` `{org_slug: <O2>, new_status: "INVITED"}` |
+| 11.14 | **Limpieza**: bloquear y eliminar O2 (la última) → `disabled_users: 4` (A, B, X y G ya no tienen otra organización); A, desactivado otra vez, ya no inicia sesión y su clave nueva se rechaza. Las cuentas no se eliminan: quedan `huerf-<ejecución>-*` (C `ACTIVE` y E `INVITED` sin organización; A, B, X, F y G `DISABLED`) |
 
 Los pasos que dependen de uno fallido quedan `SALTADO` (y cuentan como fallo). El bloqueo, la eliminación y la
 cuarentena se esperan hasta `--trace-timeout` s porque llegan a proxy y MCP por Pub/Sub; igual la revocación de claves y
@@ -358,7 +358,7 @@ recibe `429`.
 | Utilidades puras (SSE, comprobaciones de contenido, cliente WebSocket, inspector) | **Ejecutado**: `tests/test_e2e_h4.py` (la CI) |
 | Recorrido completo contra `dev/fake_h4_stack.py` (webapp, proxy, MCP y proveedor simulados) | **Ejecutado**: todos los pasos en verde con el cuerpo del proveedor guardado como objeto y como texto, y dos ejecuciones seguidas |
 | Cada fallo inyectable de la pila simulada (52) detectado por el paso que le corresponde | **Ejecutado** (tabla de abajo) |
-| Contra la pila real de H4 (`h4-int`): proxy real con el modo observación y el estado por conversación, webapp real con el interruptor, la eliminación, la vista del PLATFORM_ADMIN y el WebSocket, MCP real con la cuarentena, vault y Redis reales | **No ejecutado.** Lo hace el coordinador en C2. Los pasos 5, 6, 7, 8 y 9 dependen de los cuatro componentes; el 10 (usuarios sin organización), de la webapp, el proxy y el MCP con la revocación de claves |
+| Contra la pila real de H4 (`h4-int`): proxy real con el modo observación y el estado por conversación, webapp real con el interruptor, la eliminación, la vista del PLATFORM_ADMIN y el WebSocket, MCP real con la cuarentena, vault y Redis reales | **No ejecutado.** Lo hace el coordinador en C2. Los pasos 5, 6, 7, 8 y 9 dependen de los cuatro componentes; el 11 (usuarios sin organización), de la webapp, el proxy y el MCP con la revocación de claves |
 | La interfaz web (W3, W7, W8, W11 en el navegador, en `es` y `en`) y «el PLATFORM_ADMIN no ve el contenido **por la UI**» | **Fuera de esta prueba.** La UI pinta lo que devuelve la API que se comprueba aquí (`content_available`); el recorrido en el navegador es de C2 |
 | Claude Code real y Codex real | Fuera de esta prueba (prueba manual del usuario, C2; `docs/codex.md`) |
 
@@ -397,18 +397,18 @@ motivo; `test_every_fault_is_detected` falla si se añade un fallo sin su caso.
 | `delete-twice-ok` · `proxy-still-serves` · `mcp-still-serves` · `delete-removes-users` | 9.5 |
 | `slug-reusable` · `audit-missing` | 9.6 · 9.7 |
 | `vault-kept` · `redis-kept` · `no-quarantine` | 9.8 |
-| `preview-lists-all` (lista a todos los miembros) · `preview-needs-block` (exige la organización bloqueada) | 10.3 |
-| `preview-open` (la pide un ORG_ADMIN o un USER) | 10.4 |
-| `orphans-kept` (no desactiva a nadie) · `orphans-other-org` (desactiva también a quien conserva otra organización) | 10.5 |
-| `orphans-keys-kept` (no revoca sus claves) | 10.6, 10.8 y 10.10 |
-| `orphans-sessions-kept` (no cierra sus sesiones) · `disabled-can-login` (un desactivado inicia sesión) | 10.6 y 10.10 |
-| `orphans-audit-missing` (sin fila `user.disabled`) · `orphans-audit-email` (la fila lleva email y nombre) | 10.8 y 10.10 |
-| `orphans-ignore-flag` (ignora `disable_orphans: false`) | 10.9 |
-| `orphans-default-off` (sin el campo no desactiva) · `orphans-invited-skipped` (deja fuera a los `INVITED`) | 10.10 |
-| `reactivate-orgadmin` (un ORG_ADMIN reactiva) | 10.11 |
-| `reactivate-no-audit` (sin `user.reactivated`) · `reactivate-restores-keys` (vuelven a valer las claves revocadas) · `reactivate-audit-no-org` (la fila `user.reactivated` no lleva la organización) | 10.12 |
-| `audit-orgadmin-sees-disabled` (el ORG_ADMIN ve `user.disabled`) · `audit-orgadmin-blind` (no ve ni `user.reactivated`) | 10.12b |
-| `orphans-links-kept` (no invalida los enlaces de activación sin usar) | 10.13 |
+| `preview-lists-all` (lista a todos los miembros) · `preview-needs-block` (exige la organización bloqueada) | 11.3 |
+| `preview-open` (la pide un ORG_ADMIN o un USER) | 11.4 |
+| `orphans-kept` (no desactiva a nadie) · `orphans-other-org` (desactiva también a quien conserva otra organización) | 11.5 |
+| `orphans-keys-kept` (no revoca sus claves) | 11.6, 11.8 y 11.10 |
+| `orphans-sessions-kept` (no cierra sus sesiones) · `disabled-can-login` (un desactivado inicia sesión) | 11.6 y 11.10 |
+| `orphans-audit-missing` (sin fila `user.disabled`) · `orphans-audit-email` (la fila lleva email y nombre) | 11.8 y 11.10 |
+| `orphans-ignore-flag` (ignora `disable_orphans: false`) | 11.9 |
+| `orphans-default-off` (sin el campo no desactiva) · `orphans-invited-skipped` (deja fuera a los `INVITED`) | 11.10 |
+| `reactivate-orgadmin` (un ORG_ADMIN reactiva) | 11.11 |
+| `reactivate-no-audit` (sin `user.reactivated`) · `reactivate-restores-keys` (vuelven a valer las claves revocadas) · `reactivate-audit-no-org` (la fila `user.reactivated` no lleva la organización) | 11.12 |
+| `audit-orgadmin-sees-disabled` (el ORG_ADMIN ve `user.disabled`) · `audit-orgadmin-blind` (no ve ni `user.reactivated`) | 11.12b |
+| `orphans-links-kept` (no invalida los enlaces de activación sin usar) | 11.13 |
 
 ### 5. Supuestos sobre los demás componentes
 
@@ -441,7 +441,7 @@ confirmarlos al integrar:
   (su ORG_ADMIN la ve) y `metadata` `{org_slug, new_status}` (`ACTIVE` si el usuario ya tenía contraseña, `INVITED` si
   nunca activó), sin `previous_status`. Un ORG_ADMIN que lee la auditoría ve las filas de sus organizaciones y ninguna
   `user.disabled`. `target_label` (decidido: se deja así): la API lo resuelve al leer con el email de la cuenta
-  (`target_type: user`), la fila guardada no lo lleva; la prueba lo excluye en 10.8 y 10.10 y comprueba todo lo demás.
+  (`target_type: user`), la fila guardada no lo lleva; la prueba lo excluye en 11.8 y 11.10 y comprueba todo lo demás.
   Un PLATFORM_ADMIN que invita a un usuario existente que es miembro de otra organización lo añade sin enlace (`201`).
 - **Proxy y MCP (claves revocadas)**: una clave personal revocada se rechaza con `401 baas_invalid_api_key` (proxy) y `401`
   (MCP) en cuanto llega la revocación por Pub/Sub; una clave vigente de un usuario sin organización recibe

@@ -18,7 +18,7 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
   9.    Eliminar una organización: crear, bloquear y eliminar con confirmación del slug; la webapp, el proxy y el MCP
         dejan de servirla, el slug no se reutiliza, la auditoría lo recoge, el vault queda vacío, Redis sin sus
         claves y el directorio del MCP en cuarentena.
-  10.   Usuarios que se quedan sin organización al eliminar una (contrato §6): la vista previa los lista, la
+  11.   Usuarios que se quedan sin organización al eliminar una (contrato §6): la vista previa los lista, la
         eliminación los desactiva (`disable_orphans`, `true` por omisión) y revoca sus claves personales, quien
         conserva otra organización no cambia, la auditoría `user.disabled` no lleva su email, un ORG_ADMIN no los
         reactiva (`409 USER_DISABLED`) y el PLATFORM_ADMIN sí (`user.reactivated`, visible para el ORG_ADMIN de la
@@ -193,7 +193,7 @@ def org_data(body: Any) -> dict[str, Any]:
 
 @dataclass
 class Person:
-    """Un usuario que crea el grupo «huérfanos» (10): su email y su nombre son únicos de la ejecución."""
+    """Un usuario que crea el grupo «huérfanos» (11): su email y su nombre son únicos de la ejecución."""
 
     label: str
     email: str
@@ -640,7 +640,7 @@ class E2EH4:
         self.conversations: dict[str, dict[str, Conv]] = {"A": {}, "B": {}, "C": {}}
         self.slug = new_slug(self.nonce)
         self.member_binding: dict[str, Any] = {}  # handshake de orgadmin_email en la organización que se elimina
-        prefix = f"huerf-{self.nonce}"  # grupo «huérfanos» (10)
+        prefix = f"huerf-{self.nonce}"  # grupo «huérfanos» (11)
         self.orph_slugs = {key: f"{prefix}-{key}" for key in ORPHAN_ORGS}
         self.orph = {label: Person(label, f"{prefix}-{label}@{ORPHAN_DOMAIN}", f"Huerfano {label.upper()} {self.nonce}")
                      for label in ORPHAN_PEOPLE}  # fmt: skip
@@ -1424,7 +1424,7 @@ class E2EH4:
             problems.append(f"no hay ninguna entrada «{slug}-<fecha>» en .quarantine/ del MCP")
         return problems
 
-    # --- 10: usuarios que se quedan sin organización (huérfanos) --------------------------------------------
+    # --- 11: usuarios que se quedan sin organización (huérfanos) --------------------------------------------
     def slug_of(self, key: str) -> str:
         return self.orph_slugs[key]
 
@@ -1648,7 +1648,7 @@ class E2EH4:
         items = (self.audit_body(action) or {}).get("items") or []
         return {str(i.get("target_id")) for i in items if isinstance(i, dict)}
 
-    # 10.1
+    # 11.1
     def orph_setup(self) -> str:
         a = self.args
         for key, slug in self.orph_slugs.items():
@@ -1676,7 +1676,7 @@ class E2EH4:
             "O2: X (ORG_ADMIN) y B (USER); O3: C y E; O4: F y G"
         )
 
-    # 10.2
+    # 11.2
     def orph_keys_serve(self) -> str:
         expected = {"a": ["o1"], "b": ["o1", "o2"], "c": ["o3"], "f": ["o4"]}
         for label, orgs in expected.items():
@@ -1696,7 +1696,7 @@ class E2EH4:
         check(not problems, "\n".join(problems))
         return "A (O1), B (O1 y O2), C (O3) y F (O4): handshake, proxy (200) y MCP (baas_whoami) con su clave personal"
 
-    # 10.3
+    # 11.3
     def orph_preview(self) -> str:
         a, slug, person = self.args, self.slug_of("o1"), self.orph["a"]
         org = self.webapp("GET", f"/api/v1/orgs/{slug}", a.admin_email)
@@ -1713,7 +1713,7 @@ class E2EH4:
             f"no lista a B (tiene O2) ni a {a.admin_email}"
         )
 
-    # 10.4
+    # 11.4
     def orph_preview_permissions(self) -> str:
         a, slug, listed = self.args, self.slug_of("o1"), self.orph["a"].email
         path = f"/api/v1/orgs/{slug}/delete-preview"
@@ -1742,7 +1742,7 @@ class E2EH4:
             "organización inexistente → 404; la vista previa no cambió nada"
         )
 
-    # 10.5
+    # 11.5
     def orph_delete_explicit(self) -> str:
         slug = self.slug_of("o1")
         answer = self.delete_with("o1", disable_orphans=True)
@@ -1754,7 +1754,7 @@ class E2EH4:
             f"(propagated: {str(answer['propagated']).lower()})"
         )
 
-    # 10.6
+    # 11.6
     def orph_a_disabled(self) -> str:
         problems = self.disabled_problems("a", "o1")
         check(not problems, "\n".join(problems))
@@ -1763,7 +1763,7 @@ class E2EH4:
             "se rechaza (handshake 401, proxy 401 baas_invalid_api_key, MCP 401)"
         )
 
-    # 10.7
+    # 11.7
     def orph_b_intact(self) -> str:
         a, b, o2 = self.args, self.orph["b"], self.slug_of("o2")
         problems = self.status_problems(b.email, orgs={o2})  # la sesión que ya tenía sigue abierta
@@ -1785,7 +1785,7 @@ class E2EH4:
             "vigente (handshake, proxy y MCP en O2); el PLATFORM_ADMIN, X, C y F siguen ACTIVE"
         )
 
-    # 10.8
+    # 11.8
     def orph_audit_disabled(self) -> str:
         a, person, o1 = self.args, self.orph["a"], self.slug_of("o1")
         body = self.audit_body("user.disabled")
@@ -1805,7 +1805,7 @@ class E2EH4:
             "(salvo target_label, que la webapp deriva al leer); ninguna fila de B, X, C ni F"
         )
 
-    # 10.9
+    # 11.9
     def orph_keep(self) -> str:
         c, e, o3 = self.orph["c"], self.orph["e"], self.slug_of("o3")
         answer = self.delete_with("o3", disable_orphans=False)
@@ -1836,7 +1836,7 @@ class E2EH4:
             "sigue valiendo y no hay filas user.disabled de ellos"
         )
 
-    # 10.10
+    # 11.10
     def orph_default(self) -> str:
         f_, g, o4, app = self.orph["f"], self.orph["g"], self.slug_of("o4"), self.args.app_url
         pre = self.webapp("GET", f"/api/v1/orgs/{o4}/delete-preview", self.args.admin_email)
@@ -1876,7 +1876,7 @@ class E2EH4:
             "fila user.disabled de cada uno (previous_status ACTIVE e INVITED), sin email ni nombre"
         )
 
-    # 10.11
+    # 11.11
     def orph_reactivate_denied(self) -> str:
         a, x, o2 = self.orph["a"], self.orph["x"], self.slug_of("o2")
         res = self.member_invite("o2", a.email, "USER", who=x.email)
@@ -1897,7 +1897,7 @@ class E2EH4:
         check(not problems, "\n".join(problems))
         return f"el ORG_ADMIN de «{o2}» que invita a {a.email} recibe 409 USER_DISABLED: no se añade ni se reactiva"
 
-    # 10.12
+    # 11.12
     def orph_reactivate_a(self) -> str:
         a, o2, adm = self.orph["a"], self.slug_of("o2"), self.args.admin_email
         old_who, old_key, old_id = a.email + REVOKED_SUFFIX, self.keys[a.email], a.key_id
@@ -1943,7 +1943,7 @@ class E2EH4:
             "la nueva vale; auditoría user.reactivated (en O2, new_status ACTIVE) y member.invited"
         )
 
-    # 10.12b
+    # 11.12b
     def orph_audit_visibility(self) -> str:
         """W10: el ORG_ADMIN de O2 ve `user.reactivated` de A (es de su organización) y ninguna fila `user.disabled`
         (no tienen organización: pertenecen a la plataforma); el PLATFORM_ADMIN ve las dos."""
@@ -1979,7 +1979,7 @@ class E2EH4:
             "ni en la lista ni filtrando por la acción; el PLATFORM_ADMIN ve las dos"
         )
 
-    # 10.13
+    # 11.13
     def orph_reactivate_g(self) -> str:
         g, o2, app = self.orph["g"], self.slug_of("o2"), self.args.app_url
         old = g.link
@@ -2019,7 +2019,7 @@ class E2EH4:
             "auditoría user.reactivated (en O2, new_status INVITED)"
         )
 
-    # 10.14
+    # 11.14
     def orph_cleanup(self) -> str:
         o2 = self.slug_of("o2")
         answer = self.delete_with("o2", disable_orphans=True)
@@ -2117,20 +2117,20 @@ class E2EH4:
                 step("9.8 vault vacío, Redis sin claves y MCP en cuarentena", self.inside, needs=[deleted])
         if "huerfanos" in groups:
             base = [s0, s1, s3]
-            setup = "10.1 crear 4 organizaciones y 7 usuarios (invitar, activar, claves personales)"
-            serve = "10.2 las claves personales valen (handshake, proxy y MCP)"
-            preview = "10.3 vista previa: lista a quien se quedaría sin organización y a nadie más"
-            perms = "10.4 vista previa: solo el PLATFORM_ADMIN (y solo lectura)"
-            explicit = "10.5 eliminar con disable_orphans: true desactiva solo a quien no tiene otra organización"
-            disabled = "10.6 el usuario desactivado: sin inicio de sesión, sesión cerrada y clave rechazada"
-            intact = "10.7 quien conserva otra organización no cambia"
-            audit = "10.8 auditoría user.disabled: causa y claves revocadas, sin email ni nombre"
-            keep = "10.9 disable_orphans: false no desactiva a nadie"
-            default = "10.10 sin el campo disable_orphans se desactiva (el valor por omisión es true)"
-            denied = "10.11 un ORG_ADMIN no reactiva a un desactivado: 409 USER_DISABLED"
-            react_a = "10.12 el PLATFORM_ADMIN lo reactiva: contraseña, clave antigua revocada y user.reactivated"
-            visible = "10.12b auditoría (W10): el ORG_ADMIN ve user.reactivated y no user.disabled"
-            react_g = "10.13 un invitado sin activar vuelve a INVITED con un enlace nuevo"
+            setup = "11.1 crear 4 organizaciones y 7 usuarios (invitar, activar, claves personales)"
+            serve = "11.2 las claves personales valen (handshake, proxy y MCP)"
+            preview = "11.3 vista previa: lista a quien se quedaría sin organización y a nadie más"
+            perms = "11.4 vista previa: solo el PLATFORM_ADMIN (y solo lectura)"
+            explicit = "11.5 eliminar con disable_orphans: true desactiva solo a quien no tiene otra organización"
+            disabled = "11.6 el usuario desactivado: sin inicio de sesión, sesión cerrada y clave rechazada"
+            intact = "11.7 quien conserva otra organización no cambia"
+            audit = "11.8 auditoría user.disabled: causa y claves revocadas, sin email ni nombre"
+            keep = "11.9 disable_orphans: false no desactiva a nadie"
+            default = "11.10 sin el campo disable_orphans se desactiva (el valor por omisión es true)"
+            denied = "11.11 un ORG_ADMIN no reactiva a un desactivado: 409 USER_DISABLED"
+            react_a = "11.12 el PLATFORM_ADMIN lo reactiva: contraseña, clave antigua revocada y user.reactivated"
+            visible = "11.12b auditoría (W10): el ORG_ADMIN ve user.reactivated y no user.disabled"
+            react_g = "11.13 un invitado sin activar vuelve a INVITED con un enlace nuevo"
             step(setup, self.orph_setup, needs=base)
             step(serve, self.orph_keys_serve, needs=[setup])
             step(preview, self.orph_preview, needs=[serve])
@@ -2145,7 +2145,7 @@ class E2EH4:
             step(react_a, self.orph_reactivate_a, needs=[denied, audit])
             step(visible, self.orph_audit_visibility, needs=[react_a])
             step(react_g, self.orph_reactivate_g, needs=[default, react_a])
-            step("10.14 eliminar la última organización de la prueba: 4 usuarios desactivados",
+            step("11.14 eliminar la última organización de la prueba: 4 usuarios desactivados",
                  self.orph_cleanup, needs=[react_a, visible, react_g, keep])  # fmt: skip
 
 
