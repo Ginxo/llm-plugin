@@ -6,8 +6,8 @@ roles que decidas. Exportarla es la operación inversa. Diseño en `knowledge/01
 (§5 el modelo, §8 la publicación guiada) y contrato de las tools en `knowledge/02-arquitectura/contratos-fase-1.md` §7.4.
 
 Solo pueden publicar los **ORG_ADMIN** y los **PLATFORM_ADMIN**. Quien tenga el rol recibe la skill con
-`/baas-sync`. Sin límites de tamaño ni de extensión: el plugin solo **avisa** (`LARGE_FILE` desde 25 MiB,
-`LARGE_PACKAGE` desde 100 MiB).
+`/baas-sync`. Sin límites de extensión y con un único tope de tamaño de **500 MiB por fichero** (el plugin lo rechaza antes de
+subir; el servidor también); lo demás solo **avisa** (`LARGE_FILE` desde 25 MiB, `LARGE_PACKAGE` desde 100 MiB).
 
 ## El camino corto: `/baas-publish`
 

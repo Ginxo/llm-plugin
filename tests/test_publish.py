@@ -391,6 +391,19 @@ def test_large_files_warn_but_are_uploaded(brain: Brain, store: FakeStore, monke
     assert f"{SKILL_PATH}/assets/logo.png" in store.files
 
 
+def test_a_file_over_the_per_file_limit_is_refused_before_uploading(
+    brain: Brain, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(publish, "MAX_FILE_BYTES", 1024 * 1024)
+    (brain.skill / "assets" / "enorme.bin").write_bytes(b"\x00" * (1024 * 1024 + 1))
+    with pytest.raises(ConfigError, match=r"enorme\.bin.*máximo|no admite ficheros"):
+        publish.run_publish(DirectClient(store), opts(brain, dry_run=True))
+    assert not store.files  # no se escribió nada
+    (brain.skill / "assets" / "enorme.bin").write_bytes(b"\x00" * (1024 * 1024))  # justo el tope: se sube
+    publish.run_publish(DirectClient(store), opts(brain))
+    assert f"{SKILL_PATH}/assets/enorme.bin" in store.files
+
+
 def test_a_file_of_tens_of_megabytes_roundtrips(brain: Brain, store: FakeStore) -> None:
     blob = os.urandom(26 * 1024 * 1024)
     (brain.skill / "assets" / "grande.bin").write_bytes(blob)

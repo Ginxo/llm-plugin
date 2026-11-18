@@ -8,7 +8,8 @@ Parte mecánica de la publicación (diseño H5 §8); la entrevista la hace la sk
    `expected_sha256` para no pisar cambios ajenos (`"none"` para lo nuevo) y, con `--prune`, `delete[]`.
 4. Una sola llamada `baas_write_files` (con `dry_run: true` para ensayar) y verificación final por hash.
 
-Sin límites de tamaño: solo avisa (LARGE_FILE desde 25 MiB, LARGE_PACKAGE desde 100 MiB).
+Único tope de tamaño: 500 MiB por fichero (se rechaza antes de subir); el resto solo avisa (LARGE_FILE desde
+25 MiB, LARGE_PACKAGE desde 100 MiB).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from .errors import ConfigError, McpToolError, ScriptIntegrityError
 from .skilltree import (
     LARGE_FILE_BYTES,
     LARGE_PACKAGE_BYTES,
+    MAX_FILE_BYTES,
     SKILL_NAME_RE,
     LocalFile,
     check_store_path,
@@ -471,6 +473,13 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
     for n in rep["nonportable"]:
         if n["kind"] in ("browser_snippet", "native_binary", "windows_only"):
             warnings.append(f"{n['file']}: {n['detail']}.")
+    too_big = [f for f in files if f.size > MAX_FILE_BYTES]
+    if too_big:
+        listed = "; ".join(f"«{f.path}» ({f.size / 1048576:.0f} MiB)" for f in too_big[:5])
+        raise ConfigError(
+            f"El MCP no admite ficheros de más de {MAX_FILE_BYTES // 1048576} MiB: {listed}"
+            f"{'…' if len(too_big) > 5 else ''}. Divide o reduce el fichero, o déjalo fuera con --exclude."
+        )
     for f in files:
         if f.size > LARGE_FILE_BYTES:
             warnings.append(f"LARGE_FILE: {f.path} pesa {f.size / 1048576:.0f} MiB (se sube igualmente).")

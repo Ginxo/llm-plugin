@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+MAX_FILE_BYTES = 500 * 1024 * 1024  # único tope del MCP, por fichero (D64, contrato §7.4): se rechaza al planificar
 LARGE_FILE_BYTES = 25 * 1024 * 1024  # umbral de aviso LARGE_FILE (contrato §7.4)
 LARGE_PACKAGE_BYTES = 100 * 1024 * 1024  # umbral de aviso LARGE_PACKAGE
 
