@@ -40,8 +40,9 @@ python3 scripts/baas.py export <skill> <dir> [--org SLUG] [--force] [--no-manife
 ```
 
 Funcionan con la API key y la organización del proyecto vinculado (`/baas-init`). Códigos de salida: `0` bien ·
-`2` configuración o argumento (también «falta confirmar») · `9` un hash no coincide (tras publicar, o al exportar) ·
-`10` error del MCP, con su código en `[BAAS_MCP_<código>]`.
+`2` configuración o argumento (también «falta confirmar») · `6` red o servidor (tras un corte durante la escritura, repite
+`--dry-run`: publicar es idempotente) · `7` ruta insegura al exportar · `9` un hash no coincide (tras publicar, o al
+exportar) · `10` error del MCP, con su código en `[BAAS_MCP_<código>]`.
 
 ### `inspect`: qué hay en esa skill (solo lectura)
 

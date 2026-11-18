@@ -49,6 +49,7 @@ Llama a `baas_whoami`. Si `organization.is_admin` no es verdadero, dile que no p
 | `10` `INVALID_ARGUMENT` | No se ha escrito nada. Lista todos los fallos (roles inexistentes, rutas): corrige y repite desde el plan. |
 | `10` `CONFLICT` | Otro administrador cambió esos ficheros mientras tanto. No se ha escrito nada: vuelve a ensayar para recalcular el plan y enséñaselo. |
 | `10` `AUTHORIZATION_DENIED` / `KILL_SWITCH_ACTIVE` | Detente e informa (ver arriba). |
+| `6` `[BAAS_NETWORK_ERROR]` | No se sabe si el lote llegó a escribirse (es atómico: o está entero o no está). Vuelve a ensayar con `--dry-run`: lo ya publicado sale «sin cambios» y solo se envía lo que falte. |
 | `9` `[BAAS_PACKAGE_HASH_MISMATCH]` | El servidor no guarda lo mismo que se subió: informa y no lo reintentes en bucle. |
 
 Nunca leas ni muestres `~/baas-ai-ip/.env` ni la API key. Opciones sueltas de `publish`: `--name`, `--org` (otra organización; exige ser administrador en ella), `--depends-on-skills`, `--exclude PATRÓN`, `--no-default-excludes`, `--json`.
