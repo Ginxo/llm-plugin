@@ -7,6 +7,7 @@ distribuyen con el plugin.
 - [Hito H3 (AI-IP)](#hito-h3-ai-ip): `dev/e2e_h3.py`, anonimización y rehidratación por el proxy.
 - [Hito H4 (observación y eliminación de organizaciones)](#hito-h4-observación-y-eliminación-de-organizaciones):
   `dev/e2e_h4.py`, el anonimizador apagado, el interruptor y eliminar una organización.
+- [Mediciones de H4](#mediciones-de-h4): `dev/measure_h4.py` y `dev/measure_frozen_redis.py`.
 - [E9 (roles funcionales)](#e9-roles-funcionales): `dev/e9_roles.py`, que los roles aíslan el contenido aunque una skill lo cite.
 
 ## Hito H2 (épica E4)
@@ -440,3 +441,17 @@ rol no contiene lo del otro (para que no haya falsos positivos) y que las funcio
 La primera ejecución crea todo lo que falta (organización, roles, usuarios y los siete ficheros); las siguientes no crean
 nada y repiten las comprobaciones. Con una mutación (el documento de facturación visible también para `recepcion`) el paso del rol `recepcion` falla y nombra la
 ruta, el título y el extracto que se ven.
+
+## Mediciones de H4
+
+Dos scripts de `dev/` miden la pila de desarrollo real (`deploy/scripts/dev-up.sh --fake-upstream`, por defecto en
+`*.localhost:28080`; si usas otros puertos, cambia las constantes `APP`, `PROXY` y `MCP`). Los resultados y su
+método están en `knowledge/01-producto/fases/fase-1-h4-mediciones.md`. Son de una máquina de desarrollo: se repiten
+en el servidor real (tramo 2).
+
+| Script | Qué mide | Duración |
+| :--- | :--- | :--- |
+| `dev/measure_h4.py salida.json [n]` | Kill switch global → rechazo en el proxy y en el MCP, y petición al proxy → trama del WebSocket (con AI-IP y en bypass). Activa y levanta el kill switch `n` veces (30 por defecto) | ~1 min |
+| `dev/measure_frozen_redis.py salida.json` | Redis **congelado** (`podman pause` del contenedor `h4-int_redis_1`, constante `REDIS`): línea base, al congelar, a los 4 min 30 s (dentro de la ventana de 5 min), a los 5 min 30 s y tras reanudar, con el proxy en bypass y con AI-IP, el MCP y el login. Lo reanuda siempre, también si falla | ~6 min |
+
+Los textos de prueba no llevan dígitos seguidos: las reglas de AI-IP los toman por teléfonos y los sustituyen.
