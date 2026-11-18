@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Punto de entrada de los scripts del plugin `baas` (Python 3.10+, solo biblioteca estándar).
 
-Uso: python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" <set-key|init|status|run-script> ...
+Uso: python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" <set-key|init|status|desktop-config|run-script> ...
 """
 
 import os

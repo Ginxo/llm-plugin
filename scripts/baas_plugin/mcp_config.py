@@ -32,14 +32,19 @@ class RegisterResult:
     detail: str | None = None
 
 
-def install_headers_helper(paths: BaasPaths) -> Path:
+def install_helper(paths: BaasPaths, source: Path) -> Path:
+    """Copia un *helper* autónomo a `~/baas-ai-ip/bin/` (ruta estable entre versiones del plugin)."""
     ensure_private_dir(paths.root)
     ensure_private_dir(paths.bin_dir)
-    target = paths.bin_dir / HELPER_NAME
-    shutil.copyfile(_HELPER_SOURCE, target)
+    target = paths.bin_dir / source.name
+    shutil.copyfile(source, target)
     if os.name == "posix":
         target.chmod(0o700)
     return target
+
+
+def install_headers_helper(paths: BaasPaths) -> Path:
+    return install_helper(paths, _HELPER_SOURCE)
 
 
 def helper_command(helper: Path, python: str | None = None) -> str:

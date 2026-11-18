@@ -18,6 +18,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("BAAS_HOME", raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
     return fake_home
 
 
