@@ -11,6 +11,18 @@ distribuyen con el plugin.
 - [Mediciones de H4](#mediciones-de-h4): `dev/measure_h4.py` y `dev/measure_frozen_redis.py`.
 - [E9 (roles funcionales)](#e9-roles-funcionales): `dev/e9_roles.py`, que los roles aíslan el contenido aunque una skill lo cite.
 
+## En la CI
+
+`e2e_h4.py` (los cinco grupos) y `e9_roles.py` corren en GitHub Actions con el workflow `e2e` del repositorio
+`deploy`: levanta la pila con el proveedor falso, descarga `main` de cada repositorio (o la rama que se pida con
+`plugin_ref`, `webapp_ref`, `proxy_ref` o `mcp_ref`) y sube un resumen y el diagnóstico. Se lanza a mano, de
+momento (`gh workflow run e2e.yml -R baas-ai-ip/deploy`). Cómo funciona, qué necesita y cómo repetirlo en local:
+[`deploy/docs/e2e.md`](https://github.com/baas-ai-ip/deploy/blob/main/docs/e2e.md).
+
+Qué implica para estos scripts: se ejecutan con `--inspect docker` (en local, con podman) y con `--json` (el informe
+de pasos que lee el resumen del job); `e2e_h4.py` se ejecuta tal cual, sin cambios para la CI. Las medidas
+(`measure_*.py`) no corren en la CI: en un runner compartido los tiempos no son fiables.
+
 ## Hito H2 (épica E4)
 
 > **Estado**: en verde contra la pila de desarrollo (2026-11-17, `upstream/main` de `webapp`, `mcp-server`,
