@@ -124,10 +124,9 @@ def disk_problems(expected: dict[str, int], got: dict[str, Any], margin: float =
         allowed = 0 if key == "files" else margin * want
         if abs(value - want) > allowed:
             problems.append(f"{key}: la foto dice {value}, el volumen {want}")
-    if not problems or all(not p.startswith("files") for p in problems):
-        total = disk_total({c: got[c] for c in CATEGORIES if isinstance(got.get(c), int)})
-        if abs(total - disk_total(expected)) > margin * disk_total(expected):
-            problems.append(f"total: la foto dice {total}, el volumen {disk_total(expected)}")
+    total = disk_total({c: got[c] for c in CATEGORIES if isinstance(got.get(c), int)})
+    if abs(total - disk_total(expected)) > margin * disk_total(expected):
+        problems.append(f"total: la foto dice {total}, el volumen {disk_total(expected)}")
     return problems
 
 
