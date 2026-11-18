@@ -590,3 +590,16 @@ def test_unknown_knowledge_roles_are_reported_by_the_server(brain: Brain, store:
         )
     assert "fantasma" in publish.describe_tool_error(exc.value)
     assert store.files == {}
+
+
+def test_paginated_listings_are_followed_to_the_end(brain: Brain) -> None:
+    store = FakeStore(list_page=2)
+    client = DirectClient(store)
+    publish.run_publish(client, opts(brain, knowledge=[(brain.knowledge, "fiscal")]))
+    store.calls.clear()
+    again = publish.run_publish(client, opts(brain, knowledge=[(brain.knowledge, "fiscal")]))
+    pages = [a for n, a in store.calls if n == "baas_list_files"]
+    assert len(pages) > 2  # varias páginas (cursor) en el plan y otras tantas al verificar
+    assert any(a.get("cursor") for a in pages)
+    assert again.plan.counts["unchanged"] == len(again.plan.files)  # nada se reenvía: se vio todo lo publicado
+    assert again.written is False
