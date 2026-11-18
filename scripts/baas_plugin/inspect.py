@@ -635,7 +635,7 @@ def inspect_skill(
             f"LARGE_PACKAGE: el paquete pesa {pkg_bytes / 1048576:.0f} MiB (aviso desde 100 MiB; cada sync lo baja)."
         )
     for s in col.skipped:
-        warnings.append(f"No se sube {s['path']}: {_SKIP_TEXT.get(s['reason'], s['reason'])}.")
+        warnings.append(f"No se sube {s['path']}: {SKIP_TEXT.get(s['reason'], s['reason'])}.")
     if sensitive_files:
         warnings.append(
             "Hay ficheros que suelen contener credenciales ("
@@ -713,7 +713,7 @@ def inspect_skill(
     }
 
 
-_SKIP_TEXT = {
+SKIP_TEXT = {
     "symlink_outside": "es un enlace simbólico que apunta fuera del árbol (nunca se sube nada de fuera)",
     "symlink_broken": "es un enlace simbólico roto",
     "special": "no es un fichero regular",
