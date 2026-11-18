@@ -19,7 +19,10 @@ que el hito H4 añade (contrato §4, §5.2, §6 y §8; plan, tareas W2 a W5, P2,
   organizaciones (`user.reactivated`) y no las `user.disabled` (sin organización).
 - **MCP** (`/org/<slug>/mcp`): `initialize` y `baas_write_document`; una organización eliminada pasa a
   `.quarantine/<slug>-<fecha>`.
-- `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, claves de Redis y MCP).
+- **Las dos instancias de Redis** (H4-02): la persistente (AOF) y la efímera (`redis-ephemeral`, sin ficheros). El proxy
+  escribe en la efímera lo que lleva valores originales: la traza de cada turno (que la webapp consume en el acto) y
+  la copia caliente del vault. Cada instancia guarda lo que tendría en memoria y en los ficheros de `/data`.
+- `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, Redis, discos y MCP).
 
 `faults` inyecta los fallos que la prueba tiene que detectar (`FAULTS`).
 
@@ -121,6 +124,12 @@ FAULTS = {
     "vault-kept": "el vault conserva las entradas de la organización eliminada",
     "redis-kept": "Redis conserva las claves de la organización eliminada",
     "ephemeral-keys-kept": "la efímera conserva las claves de las conversaciones de la organización eliminada",
+    # los originales y el disco de Redis (H4-02)
+    "originals-in-aof": "el proxy escribe las trazas y la copia caliente del vault en la instancia persistente (AOF)",
+    "traces-in-aof": "el proxy publica las trazas en la persistente (el vault caliente va bien a la efímera)",
+    "ephemeral-persists": "la instancia efímera tiene appendonly yes y escribe ficheros en /data",
+    "scanner-blind": "el escáner de disco no lee los ficheros binarios de la persistente (la base reescrita del AOF)",
+    "no-ephemeral": "la pila no tiene redis-ephemeral (antigua): los originales siguen llegando al AOF",
     "no-quarantine": "el directorio del MCP no pasa a cuarentena",
     "audit-missing": "la eliminación no deja rastro en la auditoría",
     "delete-removes-users": "al eliminar una organización se elimina también a sus usuarios",
@@ -146,6 +155,50 @@ FAULTS = {
     "audit-orgadmin-sees-disabled": "el ORG_ADMIN de la organización ve las filas user.disabled de sus miembros",
     "audit-orgadmin-blind": "el ORG_ADMIN no ve ninguna fila de la auditoría de su organización",
 }
+
+
+class FakeRedis:
+    """Una instancia de Redis simulada: sus parámetros, lo que hay en memoria y los ficheros de `/data`.
+
+    Con AOF cada escritura se anota en el fichero vivo (`incr`) y `rewrite` lo sustituye por una base con lo que hay en
+    memoria, como `BGREWRITEAOF`: lo borrado desaparece de los ficheros y lo que sigue vivo se queda.
+    """
+
+    def __init__(self, appendonly: bool) -> None:
+        self.settings = {"appendonly": "yes" if appendonly else "no", "save": "", "dir": "/data"}
+        self.live: dict[str, str] = {}
+        self.incr = ""
+        self.base: str | None = "" if appendonly else None
+
+    @property
+    def persists(self) -> bool:
+        return self.settings["appendonly"] == "yes"
+
+    def set(self, key: str, value: str) -> None:
+        self.live[key] = value
+        if self.persists:
+            self.incr += f"SET {key} {value}\r\n"
+
+    def delete(self, key: str) -> None:
+        if self.live.pop(key, None) is not None and self.persists:
+            self.incr += f"DEL {key}\r\n"
+
+    def rewrite(self) -> None:
+        if self.persists:
+            self.base = "".join(f"{key}\x00{value}\x00" for key, value in self.live.items())
+            self.incr = ""
+
+    def files(self) -> list[str]:
+        if not self.persists:
+            return []
+        names = ["appendonly.aof.1.incr.aof", "appendonly.aof.manifest"] + (
+            ["appendonly.aof.1.base.rdb"] if self.base is not None else []
+        )
+        return sorted(f"/data/appendonlydir/{name}" for name in names)
+
+    def text(self, *, binary: bool = True) -> str:
+        """Lo que hay en los ficheros; `binary=False` deja fuera la base (el preámbulo RDB)."""
+        return (self.base or "" if binary else "") + self.incr
 
 
 # --- modelo -----------------------------------------------------------------------------------------
@@ -263,12 +316,14 @@ class StackState:
             META_ORG: Org(META_ORG, "BaaS-AI-IP (meta)"),
             "demo": Org("demo", "Demo Clínica"),
             "observacion": Org("observacion", "Demo Observación", ai_ip=True, anonymizer=False),
+            "privada": Org("privada", "Demo Privacidad", ai_ip=True, anonymizer=True),
         }
         users = [
             User("admin@baas.test", {META_ORG: "ORG_ADMIN"}, platform_admin=True),
             User("orgadmin@demo.test", {"demo": "ORG_ADMIN"}),
             User("analista@demo.test", {"demo": "USER"}),
             User("observador@observacion.test", {"observacion": "USER"}),
+            User("analista@privada.test", {"privada": "USER"}),
         ]
         self.users = {u.email: u for u in users}
         self.users_by_id = {u.id: u for u in users}
@@ -284,15 +339,24 @@ class StackState:
         self.subscribers: list[Subscriber] = []
         self.audit: list[dict[str, Any]] = []
         self.redis_keys: set[str] = set()  # instancia persistente: política y membresías
-        self.ephemeral_keys: set[str] = (
-            set()
-        )  # instancia efímera (H4-02): la copia caliente del vault de cada conversación
+        self.redis = {PERSISTENT: FakeRedis(True), EPHEMERAL: FakeRedis("ephemeral-persists" in faults)}
         for user in users:
             for slug in user.memberships:
                 self.redis_keys.add(f"baas:member:{user.id}:{slug}")
         self.redis_keys |= {f"baas:policy:org:{slug}" for slug in self.orgs}
         self.mcp_dirs: dict[str, dict[str, str]] = {}
         self.quarantine: list[str] = []
+
+    @property
+    def ephemeral_keys(self) -> set[str]:
+        """Las claves de conversación de la instancia efímera (la copia caliente del vault)."""
+        return {k for k in self.redis[EPHEMERAL].live if k.startswith("baas:conv:")}
+
+    def originals_target(self, *, trace: bool = False) -> FakeRedis:
+        """Dónde escribe el proxy lo que lleva valores originales (la copia caliente del vault y, con `trace`, la traza
+        del turno): la efímera, salvo que falte o se escriba mal."""
+        leak = {"originals-in-aof", "no-ephemeral"} | ({"traces-in-aof"} if trace else set())
+        return self.redis[PERSISTENT if leak & self.faults else EPHEMERAL]
 
     # --- auditoría ---------------------------------------------------------------------------------
     def record(self, action: str, actor: User | None, *, org: str | None = None, target_type: str | None = None,
@@ -669,9 +733,11 @@ class StackState:
                 self.redis_keys = {
                     k for k in self.redis_keys if not (k == f"baas:policy:org:{slug}" or k.endswith(f":{slug}"))
                 }
-            if "ephemeral-keys-kept" not in self.faults:
-                gone = tuple(f"baas:conv:{c.id}:" for c in conversations)
-                self.ephemeral_keys = {k for k in self.ephemeral_keys if not k.startswith(gone)}
+            for name, instance in self.redis.items():
+                if name == EPHEMERAL and "ephemeral-keys-kept" in self.faults:
+                    continue
+                for conv in conversations:
+                    instance.delete(f"baas:conv:{conv.id}:vault")
             if "no-quarantine" not in self.faults and slug in self.mcp_dirs:
                 self.quarantine.append(f"{slug}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
                 del self.mcp_dirs[slug]
@@ -738,13 +804,13 @@ class StackState:
             mode = "bypass" if not conv.now_ai_ip else "anonymize" if conv.now_anonymizer else "observe"
             if mode == "observe" and "observe-anonymizes" in self.faults:
                 mode = "anonymize"
-            if mode == "anonymize":
-                self.ephemeral_keys.add(f"baas:conv:{conv.id}:vault")  # la copia caliente del vault (H4-02)
         request_counts: dict[str, int] = {}
         sent = raw
         if mode == "anonymize":
             with self.lock:
                 sent = encode(anonymize(payload, conv.vault, request_counts))
+                hot = json.dumps(conv.vault.tokens, ensure_ascii=False)  # la copia caliente del vault (H4-02)
+                self.originals_target().set(f"baas:conv:{conv.id}:vault", hot)
         elif mode == "observe" and "observe-rewrites" in self.faults:
             sent = encode({**payload, "baas_e2e": True})
         status, ctype, body = self._forward(upstream, sent)
@@ -796,6 +862,11 @@ class StackState:
                 "original": original, "request_sent": sent_text, "response_received": f"Eco: {sent_text}",
             }  # fmt: skip
             conv.turns.append(turn)
+            event = {"event_id": uuid.uuid4().hex, "conversation_id": conv.id, "request_original": original,
+                     "request_sent": sent_text, "response_returned": f"Eco: {original}"}  # fmt: skip
+            trace = self.originals_target(trace=True)  # XADD baas:traces y, en el acto, XACK + XDEL de la webapp
+            trace.set(f"baas:traces:{event['event_id']}", json.dumps(event, ensure_ascii=False))
+            trace.delete(f"baas:traces:{event['event_id']}")
             started_protected = conv.ai_ip and conv.anonymizer
             if not started_protected and conv.protected_from_turn is None and turn["ai_ip"] and turn["anonymizer"]:
                 conv.protected_from_turn = turn["turn_index"]
@@ -901,19 +972,43 @@ class FakeInspector:
             return sorted(c.id for c in self.state.convs.values() if c.org == slug)
 
     def redis_services(self) -> list[str]:
-        return [PERSISTENT, EPHEMERAL]
+        return [PERSISTENT] if "no-ephemeral" in self.state.faults else [PERSISTENT, EPHEMERAL]
 
     def redis_keys(self, slug: str, conversation_ids: Sequence[str] = ()) -> list[str]:
         with self.state.lock:
             keys = sorted(k for k in self.state.redis_keys if k == f"baas:policy:org:{slug}" or k.endswith(f":{slug}"))
             found = [f"[{PERSISTENT}] {k}" for k in keys]
-            for conv in conversation_ids:
-                found += [
-                    f"[{EPHEMERAL}] {k}"
-                    for k in sorted(self.state.ephemeral_keys)
-                    if k.startswith(f"baas:conv:{conv}:")
-                ]
+            if EPHEMERAL in self.redis_services():
+                for conv in conversation_ids:
+                    held = sorted(k for k in self.state.ephemeral_keys if k.startswith(f"baas:conv:{conv}:"))
+                    found += [f"[{EPHEMERAL}] {k}" for k in held]
             return found
+
+    def redis_setting(self, service: str, name: str) -> str:
+        with self.state.lock:
+            return self.state.redis[service].settings[name]
+
+    def disk_files(self, service: str) -> list[str]:
+        with self.state.lock:
+            return self.state.redis[service].files()
+
+    def force_aof_rewrite(self, service: str) -> None:
+        with self.state.lock:
+            self.state.redis[service].rewrite()
+
+    def disk_contains(self, service: str, needles: Sequence[str]) -> list[str]:
+        with self.state.lock:
+            blind = "scanner-blind" in self.state.faults and service == PERSISTENT
+            text = self.state.redis[service].text(binary=not blind)
+            return [needle for needle in needles if needle in text]
+
+    def redis_set_temp(self, service: str, key: str, value: str, ttl: int) -> None:
+        with self.state.lock:
+            self.state.redis[service].set(key, value)
+
+    def redis_delete(self, service: str, key: str) -> None:
+        with self.state.lock:
+            self.state.redis[service].delete(key)
 
     def mcp_org_dirs(self) -> list[str]:
         with self.state.lock:

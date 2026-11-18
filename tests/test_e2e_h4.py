@@ -91,6 +91,15 @@ class PureUtilitiesTest(unittest.TestCase):
         self.assertIn("unresolved", " ".join(e2e_h4.observation_problems({**WARNING, "unresolved_response_tokens": 1})))
         self.assertTrue(e2e_h4.observation_problems(None))
 
+    def test_disk_needles_are_the_values_and_the_run_string(self) -> None:
+        needles = e2e_h4.disk_needles("abc")
+        self.assertEqual(needles[:3], [DNI, EMAIL, IBAN])
+        self.assertIn(IBAN.replace(" ", ""), needles, "el IBAN también sin espacios")
+        self.assertIn("caso-abc", needles)
+        self.assertEqual(e2e_h4.run_needles("abc"), ["caso-abc"], "lo único que es de ESTA ejecución")
+        self.assertNotIn("caso-abc", e2e_h4.disk_needles("abd"))
+        self.assertTrue(all(n and "\n" not in n for n in needles))
+
     def test_case_names_and_slug(self) -> None:
         nonce = e2e_h4.h3.new_nonce()
         self.assertEqual(e2e_h4.new_slug(nonce), f"e2e-{nonce}")
@@ -295,7 +304,8 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(ns.fake_url, "http://127.0.0.1:48090")
         self.assertEqual((ns.org, ns.email), ("observacion", "observador@observacion.test"))
         self.assertEqual((ns.admin_email, ns.orgadmin_email), ("admin@baas.test", "orgadmin@demo.test"))
-        self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar", "huerfanos"])
+        self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar", "originales", "huerfanos"])
+        self.assertEqual((ns.anon_org, ns.anon_email), ("privada", "analista@privada.test"))
         self.assertEqual(ns.apis, ["messages", "chat", "responses"])
         self.assertEqual((ns.inspect, ns.compose_project, ns.mcp_data_dir), ("auto", "h4-plugin", "/data"))
         self.assertIsNone(ns.proxy_url)
@@ -857,6 +867,64 @@ class RedisInspectorTest(unittest.TestCase):
         self.assertEqual(engine.calls(), [])
 
 
+class FlakyInspector(fake_h4_stack.FakeInspector):
+    """La pila simulada con un método que falla `times` veces (y después funciona)."""
+
+    def __init__(self, state: fake_h4_stack.StackState, *, fail: str | None = None, times: int = 1) -> None:
+        super().__init__(state)
+        self.attempts = 0
+        if fail:
+            real = getattr(self, fail)
+
+            def flaky(*args: object, **kwargs: object) -> object:
+                self.attempts += 1
+                if self.attempts <= times:
+                    raise e2e_h4.StepError(f"{fail} falló a propósito")
+                return real(*args, **kwargs)
+
+            setattr(self, fail, flaky)
+
+
+class ScannerControlTest(unittest.TestCase):
+    """El control positivo del escáner borra su clave y reescribe el AOF aunque algo falle por el camino."""
+
+    def run_control(self, fail: str | None = None, times: int = 1) -> tuple[str | None, str, fake_h4_stack.StackState]:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            inspector = FlakyInspector(stack.state, fail=fail, times=times)
+            args = e2e_h4.parse_args(["--trace-timeout", "0.3"])
+            e2e = e2e_h4.E2EH4(args, inspector, nonce="abcdefghij")
+            try:
+                return e2e.scanner_control(), "", stack.state
+            except e2e_h4.StepError as exc:
+                return None, str(exc), stack.state
+
+    def test_passes_and_leaves_no_trace(self) -> None:
+        detail, error, state = self.run_control()
+        self.assertEqual(error, "")
+        self.assertIn("e2e-control-abcdefghij", detail or "")
+        persistent = state.redis[fake_h4_stack.PERSISTENT]
+        self.assertEqual([k for k in persistent.live if k.startswith("baas:e2e:")], [])
+        self.assertNotIn("e2e-control-abcdefghij", persistent.text())
+
+    def test_a_failure_in_the_first_rewrite_still_deletes_the_key_and_rewrites_again(self) -> None:
+        _, error, state = self.run_control(fail="force_aof_rewrite", times=1)
+        self.assertIn("force_aof_rewrite falló a propósito", error)
+        persistent = state.redis[fake_h4_stack.PERSISTENT]
+        self.assertEqual([k for k in persistent.live if k.startswith("baas:e2e:")], [])
+        self.assertNotIn("e2e-control-abcdefghij", persistent.text(), "la limpieza reescribió el AOF")
+
+    def test_a_failure_to_clean_up_is_reported_with_the_key_that_remains(self) -> None:
+        _, error, _ = self.run_control(fail="redis_delete", times=5)
+        self.assertIn("no se pudo limpiar", error)
+        self.assertIn("baas:e2e:escaner-abcdefghij", error)
+        self.assertIn("caduca sola", error)
+
+    def test_a_failed_write_is_reported_and_cleanup_still_runs(self) -> None:
+        _, error, state = self.run_control(fail="redis_set_temp", times=5)
+        self.assertIn("redis_set_temp falló a propósito", error)
+        self.assertEqual([k for k in state.redis[fake_h4_stack.PERSISTENT].live if k.startswith("baas:e2e:")], [])
+
+
 class MissingInspectorTest(unittest.TestCase):
     def test_every_query_fails_saying_how_to_continue(self) -> None:
         missing = e2e_h4.MissingInspector("no hay motor")
@@ -916,7 +984,7 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 6)
         once = ["0.", "1.", "2.", "2b.", "3.", "4.", "6.", "7.1", "7.2", "7.3", "8.1 ", "8.2", "8.3", "8.4", "8.5"]
         once += ["8.6", "8.7", "8.8", "8.9", "8.10", "8.11", "8.12", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5"]
-        once += ["9.6", "9.7", "9.8"]
+        once += ["9.6", "9.7", "9.8", "10.1", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7"]
         once += ["11.1 ", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7", "11.8", "11.9", "11.10", "11.11", "11.12 "]
         once += ["11.12b", "11.13", "11.14"]
         for prefix in once:
@@ -927,7 +995,7 @@ class FullRunTest(unittest.TestCase):
             "A empieza en observación, sube en el turno 2 y no baja al apagar el anonimizador",
         )
         self.assertFalse(initial, "el interruptor debe quedar apagado, como al empezar")
-        self.assertEqual(leftovers, ["baas-ai-ip", "demo", "observacion"], "la organización de la prueba se eliminó")
+        self.assertEqual(leftovers, ["baas-ai-ip", "demo", "observacion", "privada"], "la de la prueba se eliminó")
         self.assertIn("RESULTADO: todo OK", out)
 
     def test_everything_passes_with_body_as_text(self) -> None:
@@ -981,6 +1049,46 @@ class FullRunTest(unittest.TestCase):
         # B, X, A y G (las de O2) y F quedan desactivados; C (O3, false) sigue ACTIVE y E sigue INVITED
         self.assertEqual(statuses, {"DISABLED", "ACTIVE", "INVITED"})
         self.assertEqual(sum(not k.revoked for k in keys), 1, "solo la clave de C sigue vigente")
+
+    def test_originals_group_sends_every_mode_and_api_and_leaves_nothing_behind(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "originales")
+            persistent = stack.state.redis[fake_h4_stack.PERSISTENT]
+            ephemeral = stack.state.redis[fake_h4_stack.EPHEMERAL]
+            temporary = [k for k in persistent.live if k.startswith("baas:e2e:")]
+            on_disk = persistent.text() + ephemeral.text()
+            sent = [(c.org, c.api) for c in stack.state.convs.values() if "-orig-" in c.model]
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(sorted(steps)[0][:4], "0. w")
+        self.assertEqual(len([n for n in steps if n.startswith("10.")]), 7)
+        self.assertEqual(len(sent), 18, "3 modos × 3 APIs × con y sin streaming")
+        self.assertEqual({org for org, _ in sent}, {"demo", "observacion", "privada"})
+        self.assertEqual(temporary, [], "la clave del control positivo se borró")
+        self.assertNotIn("e2e-control-", on_disk, "y su valor ya no está en ningún fichero")
+        self.assertNotIn(DNI, on_disk)
+
+    def test_originals_group_respects_apis_and_needs_the_inspector(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "originales", "--apis", "chat")
+            sent = [c.model for c in stack.state.convs.values() if "-orig-" in c.model]
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(len(sent), 6)
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "originales", inspector=None)
+        self.assertEqual(code, 0, out)
+        self.assertFalse([n for n in steps if n.startswith("10.")], "sin inspector no se registra ningún paso 10.x")
+        self.assertIn("originales", out.split("RESULTADO")[0], "y se dice por qué")
+
+    def test_missing_engine_fails_the_originals_group_with_the_reason(self) -> None:
+        missing = e2e_h4.MissingInspector("no hay motor")
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "originales", inspector=missing)
+        self.assertEqual(code, 1, out)
+        first = next(s for n, s in steps.items() if n.startswith("10.1"))
+        self.assertEqual(first["status"], "FALLO")
+        self.assertIn("--inspect none", first["detail"])
+        self.assertEqual({s["status"] for n, s in steps.items() if n.startswith("10.") and not n.startswith("10.1")},
+                         {"SALTADO"})  # fmt: skip
 
     def test_org_deletion_looks_in_both_redis_instances(self) -> None:
         with fake_h4_stack.FakeH4Stack() as stack:
@@ -1070,6 +1178,11 @@ class FaultsTest(unittest.TestCase):
         "vault-kept": {"9.8": ("el vault conserva",)},
         "redis-kept": {"9.8": ("Redis conserva claves", "[redis] baas:policy:org:")},
         "ephemeral-keys-kept": {"9.8": ("Redis conserva claves", "[redis-ephemeral] baas:conv:")},
+        "originals-in-aof": {"10.4": ("«redis»", "caso-", "AOF"), "10.6": ("«redis»", "12345678Z", "reescribir")},
+        "traces-in-aof": {"10.4": ("«redis»", "caso-", "AOF")},
+        "ephemeral-persists": {"10.7": ("«redis-ephemeral»", "appendonly", "fichero", "caso-")},
+        "scanner-blind": {"10.5": ("control positivo", "tras reescribir", "no vería")},
+        "no-ephemeral": {"10.1": ("sin redis-ephemeral", "los originales siguen llegando al AOF")},
         "no-quarantine": {"9.8": (".quarantine", "no hay ninguna entrada")},
         "audit-missing": {"9.7": ("org.deleted",)},
         "delete-removes-users": {"9.5": ("handshake",)},
@@ -1117,9 +1230,27 @@ class FaultsTest(unittest.TestCase):
                         for fragment in fragments:
                             self.assertIn(fragment, step["detail"], f"{fault}: {name}")
 
+    def test_a_blind_scanner_makes_the_dependent_check_skip_and_still_cleans_up(self) -> None:
+        with fake_h4_stack.FakeH4Stack(faults={"scanner-blind"}) as stack:
+            code, steps, out = run_e2e(stack, "--trace-timeout", "0.5", "--only", "originales")
+            temporary = [k for k in stack.state.redis[fake_h4_stack.PERSISTENT].live if k.startswith("baas:e2e:")]
+        self.assertEqual(code, 1, out)
+        by_prefix = {n.split(" ")[0]: s["status"] for n, s in steps.items() if n.startswith("10.")}
+        self.assertEqual(by_prefix["10.4"], "OK", "con el AOF vivo sin reescribir el escáner sí ve")
+        self.assertEqual(by_prefix["10.5"], "FALLO")
+        self.assertEqual(by_prefix["10.6"], "SALTADO", "sin control positivo no se da por buena la comprobación")
+        self.assertEqual(temporary, [], "aunque el paso falle, la clave temporal se borra")
+
     def test_faults_do_not_break_unrelated_steps(self) -> None:
         # ws-silent solo afecta al WebSocket; observe-clean a 6 y 8.10; audit-missing solo a 9.7
-        cases = (("ws-silent", {"7.3"}), ("observe-clean", {"6.", "8.10"}), ("audit-missing", {"9.7"}))
+        cases = (
+            ("ws-silent", {"7.3"}),
+            ("observe-clean", {"6.", "8.10"}),
+            ("audit-missing", {"9.7"}),
+            ("ephemeral-keys-kept", {"9.8"}),
+            ("ephemeral-persists", {"10.7"}),
+            ("traces-in-aof", {"10.4"}),  # la traza ya no está en memoria: solo el AOF vivo delata la fuga
+        )
         for fault, failing in cases:
             steps = self.run_fault(fault)
             failed = {n for n, s in steps.items() if s["status"] == "FALLO"}
