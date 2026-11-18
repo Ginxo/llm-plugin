@@ -46,6 +46,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -74,6 +75,7 @@ from fake_h3_stack import (
 )
 
 META_ORG = "baas-ai-ip"
+PERSISTENT, EPHEMERAL = "redis", "redis-ephemeral"  # los servicios de Redis (contrato §1, H4-02)
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 BLOCKED_MESSAGE = "Acceso bloqueado por BaaS-AI-IP: la organización está bloqueada por la plataforma"
 DENIED_MESSAGE = "Acceso bloqueado por BaaS-AI-IP: la organización no existe o no eres miembro"
@@ -118,6 +120,7 @@ FAULTS = {
     "block-not-applied": "el proxy ignora el bloqueo de la organización",
     "vault-kept": "el vault conserva las entradas de la organización eliminada",
     "redis-kept": "Redis conserva las claves de la organización eliminada",
+    "ephemeral-keys-kept": "la efímera conserva las claves de las conversaciones de la organización eliminada",
     "no-quarantine": "el directorio del MCP no pasa a cuarentena",
     "audit-missing": "la eliminación no deja rastro en la auditoría",
     "delete-removes-users": "al eliminar una organización se elimina también a sus usuarios",
@@ -280,7 +283,10 @@ class StackState:
         self.response_ids: dict[str, str] = {}
         self.subscribers: list[Subscriber] = []
         self.audit: list[dict[str, Any]] = []
-        self.redis_keys: set[str] = set()
+        self.redis_keys: set[str] = set()  # instancia persistente: política y membresías
+        self.ephemeral_keys: set[str] = (
+            set()
+        )  # instancia efímera (H4-02): la copia caliente del vault de cada conversación
         for user in users:
             for slug in user.memberships:
                 self.redis_keys.add(f"baas:member:{user.id}:{slug}")
@@ -663,6 +669,9 @@ class StackState:
                 self.redis_keys = {
                     k for k in self.redis_keys if not (k == f"baas:policy:org:{slug}" or k.endswith(f":{slug}"))
                 }
+            if "ephemeral-keys-kept" not in self.faults:
+                gone = tuple(f"baas:conv:{c.id}:" for c in conversations)
+                self.ephemeral_keys = {k for k in self.ephemeral_keys if not k.startswith(gone)}
             if "no-quarantine" not in self.faults and slug in self.mcp_dirs:
                 self.quarantine.append(f"{slug}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
                 del self.mcp_dirs[slug]
@@ -729,6 +738,8 @@ class StackState:
             mode = "bypass" if not conv.now_ai_ip else "anonymize" if conv.now_anonymizer else "observe"
             if mode == "observe" and "observe-anonymizes" in self.faults:
                 mode = "anonymize"
+            if mode == "anonymize":
+                self.ephemeral_keys.add(f"baas:conv:{conv.id}:vault")  # la copia caliente del vault (H4-02)
         request_counts: dict[str, int] = {}
         sent = raw
         if mode == "anonymize":
@@ -885,9 +896,24 @@ class FakeInspector:
     def vault_rows(self, slug: str) -> int:
         return self.state.vault_rows(slug)
 
-    def redis_keys(self, slug: str) -> list[str]:
+    def conversation_ids(self, slug: str) -> list[str]:
         with self.state.lock:
-            return sorted(k for k in self.state.redis_keys if k == f"baas:policy:org:{slug}" or k.endswith(f":{slug}"))
+            return sorted(c.id for c in self.state.convs.values() if c.org == slug)
+
+    def redis_services(self) -> list[str]:
+        return [PERSISTENT, EPHEMERAL]
+
+    def redis_keys(self, slug: str, conversation_ids: Sequence[str] = ()) -> list[str]:
+        with self.state.lock:
+            keys = sorted(k for k in self.state.redis_keys if k == f"baas:policy:org:{slug}" or k.endswith(f":{slug}"))
+            found = [f"[{PERSISTENT}] {k}" for k in keys]
+            for conv in conversation_ids:
+                found += [
+                    f"[{EPHEMERAL}] {k}"
+                    for k in sorted(self.state.ephemeral_keys)
+                    if k.startswith(f"baas:conv:{conv}:")
+                ]
+            return found
 
     def mcp_org_dirs(self) -> list[str]:
         with self.state.lock:

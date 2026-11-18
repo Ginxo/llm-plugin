@@ -822,6 +822,9 @@ class E2EH4:
         self.conversations: dict[str, dict[str, Conv]] = {"A": {}, "B": {}, "C": {}}
         self.slug = new_slug(self.nonce)
         self.member_binding: dict[str, Any] = {}  # handshake de orgadmin_email en la organización que se elimina
+        self.org_conversations: list[
+            str
+        ] = []  # las conversaciones de esa organización según el vault (antes de eliminarla)
         prefix = f"huerf-{self.nonce}"  # grupo «huérfanos» (11)
         self.orph_slugs = {key: f"{prefix}-{key}" for key in ORPHAN_ORGS}
         self.orph = {label: Person(label, f"{prefix}-{label}@{ORPHAN_DOMAIN}", f"Huerfano {label.upper()} {self.nonce}")
@@ -1491,12 +1494,22 @@ class E2EH4:
         )
 
     def vault_before(self) -> str:
-        """Antes de eliminar, el vault tiene entradas de la organización (si no, «vacío» después no probaría nada)."""
+        """Antes de eliminar, el vault tiene entradas de la organización (si no, «vacío» después no probaría nada) y
+        se anotan sus conversaciones: las claves de la instancia efímera se buscan por conversación (H4-02)."""
         insp, slug = self.inspector, self.slug
         assert insp is not None  # el paso solo se registra con inspector
         problems = self.poll(lambda: [] if insp.vault_rows(slug) > 0 else ["el vault no tiene entradas"], 5)
         check(not problems, f"antes de eliminar, el vault de «{slug}» debería tener entradas: {problems}")
-        return f"el vault tiene {insp.vault_rows(slug)} fila(s) de «{slug}»"
+        self.org_conversations = insp.conversation_ids(slug)
+        check(
+            self.org_conversations, f"el vault tiene filas de «{slug}» pero ninguna conversación: ¿cambió el esquema?"
+        )
+        rows, convs = insp.vault_rows(slug), len(self.org_conversations)
+        detail = f"el vault tiene {rows} fila(s) de «{slug}» en {convs} conversación(es)"
+        if EPHEMERAL in insp.redis_services():
+            held = [k for k in insp.redis_keys(slug, self.org_conversations) if k.startswith(f"[{EPHEMERAL}]")]
+            return f"{detail}; {EPHEMERAL} guarda {len(held)} clave(s) de ellas"
+        return f"{detail}; la pila no tiene {EPHEMERAL}"
 
     def delete_rules(self) -> str:
         a, slug, problems = self.args, self.slug, []
@@ -1659,14 +1672,19 @@ class E2EH4:
             lambda: self.inside_problems(insp, self.slug)
         )  # el proxy y el MCP lo hacen al recibir org.deleted
         check(not problems, "\n".join(problems))
-        return "vault vacío, Redis sin sus claves y el directorio del MCP en cuarentena (.quarantine/)"
+        services = insp.redis_services()
+        redis = " y ".join(f"«{s}»" for s in services)
+        note = "" if EPHEMERAL in services else f" (la pila no tiene {EPHEMERAL}: solo se miró «{PERSISTENT}»)"
+        return f"vault vacío, sin claves en Redis ({redis}) y el directorio del MCP en cuarentena (.quarantine/){note}"
 
     def inside_problems(self, insp: Inspector, slug: str) -> list[str]:
         problems = []
         rows = insp.vault_rows(slug)
         if rows:
             problems.append(f"el vault conserva {rows} fila(s) de la organización")
-        keys = insp.redis_keys(slug)
+        if not self.org_conversations:
+            problems.append("no se anotaron las conversaciones de la organización antes de eliminarla (¿falló 9.1b?)")
+        keys = insp.redis_keys(slug, self.org_conversations)
         if keys:
             problems.append(f"Redis conserva claves de la organización: {', '.join(keys[:5])}")
         return problems + self.quarantine_problems(insp, slug)

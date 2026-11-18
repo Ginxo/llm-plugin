@@ -982,6 +982,18 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(statuses, {"DISABLED", "ACTIVE", "INVITED"})
         self.assertEqual(sum(not k.revoked for k in keys), 1, "solo la clave de C sigue vigente")
 
+    def test_org_deletion_looks_in_both_redis_instances(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "eliminar")
+            leftovers = sorted(stack.state.ephemeral_keys)
+        self.assert_all_ok(code, steps, out)
+        before = next(s for n, s in steps.items() if n.startswith("9.1b"))
+        self.assertRegex(before["detail"], r"1 conversaci.n")
+        self.assertIn("redis-ephemeral", before["detail"], "antes de eliminar, la efímera guarda su copia caliente")
+        after = next(s for n, s in steps.items() if n.startswith("9.8"))
+        self.assertIn("redis-ephemeral", after["detail"])
+        self.assertEqual(leftovers, [], "no queda ninguna clave de la organización eliminada en la efímera")
+
     def test_inspect_none_skips_container_steps(self) -> None:
         with fake_h4_stack.FakeH4Stack() as stack:
             code, steps, out = run_e2e(stack, "--only", "eliminar", inspector=None)
@@ -1056,7 +1068,8 @@ class FaultsTest(unittest.TestCase):
         "mcp-still-serves": {"9.5": ("el MCP sigue sirviendo",)},
         "block-not-applied": {"9.3": ("baas_access_blocked",)},
         "vault-kept": {"9.8": ("el vault conserva",)},
-        "redis-kept": {"9.8": ("Redis conserva claves",)},
+        "redis-kept": {"9.8": ("Redis conserva claves", "[redis] baas:policy:org:")},
+        "ephemeral-keys-kept": {"9.8": ("Redis conserva claves", "[redis-ephemeral] baas:conv:")},
         "no-quarantine": {"9.8": (".quarantine", "no hay ninguna entrada")},
         "audit-missing": {"9.7": ("org.deleted",)},
         "delete-removes-users": {"9.5": ("handshake",)},
