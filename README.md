@@ -93,6 +93,22 @@ La pestaña Code de Claude Desktop **no aplica el proxy del proyecto**: con cuen
 
    `desktop-config` instala `~/baas-ai-ip/bin/baas_desktop_credentials.py` e imprime (sin secretos) los valores para Developer → Configure Third-Party Inference: `inferenceProvider: gateway`, `inferenceGatewayBaseUrl` = proxy de la organización, `inferenceGatewayAuthScheme: x-api-key` y `inferenceCredentialHelper` = el *helper*, que devuelve `{"token": <API key de Anthropic>, "headers": {"X-Baas-Api-Key": <API key de BaaS>}}`. Con Desktop en ese modo, `/baas-status` debe decir «Proxy activo en esta sesión: sí» y la guardia deja pasar los prompts.
 
+## Publicar y exportar skills (administradores)
+
+Una skill es un paquete (`SKILL.md`, scripts, plantillas y contexto). Los **ORG_ADMIN** y **PLATFORM_ADMIN** la suben al MCP de la organización y el equipo la recibe con los roles que decidan; `export` hace la operación inversa.
+
+- **`/baas-publish [ruta]`**: entrevista guiada (qué ruta subir, qué scripts son dependencia, de qué otras skills depende, de dónde sale el conocimiento y qué roles la verán), plan con *dry-run* y publicación en **un único lote atómico** con verificación por hash. Se detiene ante `AUTHORIZATION_DENIED` o `KILL_SWITCH_ACTIVE`.
+- **`/baas-export <skill> <directorio>`**: baja el paquete a una carpeta, verificando el `sha256` de cada fichero y restaurando el bit de ejecución.
+- Debajo, tres órdenes que también valen para un *script* o una CI:
+
+  ```bash
+  python3 "<ruta del plugin>/scripts/baas.py" inspect <dir> --scripts <scripts> --knowledge <conocimiento>   # informe, solo lectura
+  python3 "<ruta del plugin>/scripts/baas.py" publish <dir> --roles '*' --include-scripts <scripts> --dry-run   # ensayo; con --yes publica
+  python3 "<ruta del plugin>/scripts/baas.py" export <skill> <directorio>
+  ```
+
+Sin límites de tamaño ni de extensión (solo avisos), nunca se sube nada de fuera del árbol indicado y el original no se modifica. Detalle, opciones y límites en [docs/publicar-skills.md](docs/publicar-skills.md).
+
 ## Solución de problemas
 
 | Síntoma | Causa y solución |

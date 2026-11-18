@@ -142,7 +142,8 @@ def test_knowledge_is_uploaded_with_prefix_and_acl(brain: Brain, store: FakeStor
         == (brain.knowledge / "perfil-fiscal-y-regimen.md").read_bytes()
     )
     assert "knowledge/fiscal/templates/factura-pro.typ" in store.files
-    assert yaml.safe_load(store.files["knowledge/fiscal/_acl.yaml"].decode()) == {"roles": ["facturacion"]}
+    assert yaml.safe_load(store.files["knowledge/fiscal/templates/_acl.yaml"].decode()) == {"roles": ["facturacion"]}
+    assert "knowledge/fiscal/_acl.yaml" not in store.files  # un fichero suelto no cambia los roles de su carpeta
     assert result.verified is True
     manifest = yaml.safe_load(store.files[f"{SKILL_PATH}/baas.yaml"].decode())
     assert "knowledge/fiscal/templates/factura-pro.typ" in manifest["depends_on"]["knowledge"]
@@ -496,3 +497,45 @@ def test_json_summary_has_everything_the_skill_needs(brain: Brain, store: FakeSt
     assert data["summary"]["files"] == len(data["files"])
     assert "warnings" in data
     assert "omitted" in data
+
+
+def test_single_markdown_gets_roles_in_its_uploaded_header_only(brain: Brain, store: FakeStore) -> None:
+    doc = brain.knowledge / "nota.md"
+    doc.write_text("# Nota sin cabecera\n")
+    original = doc.read_bytes()
+    result = publish.run_publish(
+        DirectClient(store), opts(brain, knowledge=[(doc, "fiscal")], knowledge_roles=["facturacion", "revisor"])
+    )
+    sent = store.files["knowledge/fiscal/nota.md"].decode()
+    assert sent.startswith("---\nroles: [facturacion, revisor]\n---\n# Nota sin cabecera")
+    assert doc.read_bytes() == original
+    assert "knowledge/fiscal/_acl.yaml" not in store.files
+    assert any(f.note and "cabecera" in f.note for f in result.plan.files)
+
+
+def test_single_markdown_with_roles_keeps_them_and_warns(brain: Brain, store: FakeStore) -> None:
+    perfil = brain.knowledge / "perfil-fiscal-y-regimen.md"
+    result = publish.run_publish(
+        DirectClient(store), opts(brain, knowledge=[(perfil, "fiscal")], knowledge_roles=["revisor"], dry_run=True)
+    )
+    assert any("ya declara roles" in w for w in result.plan.warnings)
+    sent = next(f for f in result.plan.files if f.path.endswith("perfil-fiscal-y-regimen.md"))
+    assert sent.data == perfil.read_bytes()
+
+
+def test_single_non_markdown_cannot_carry_roles(brain: Brain, store: FakeStore) -> None:
+    result = publish.run_publish(
+        DirectClient(store),
+        opts(brain, knowledge=[(brain.knowledge / "ledger-facturas.json", "fiscal")], knowledge_roles=["revisor"]),
+    )
+    assert any("solo un .md puede llevar roles" in w for w in result.plan.warnings)
+    assert "knowledge/fiscal/ledger-facturas.json" in store.files
+    assert not any(p.endswith("_acl.yaml") for p in store.files)
+
+
+def test_directory_mapping_warns_that_acl_covers_the_whole_directory(brain: Brain, store: FakeStore) -> None:
+    result = publish.run_publish(
+        DirectClient(store),
+        opts(brain, knowledge=[(brain.knowledge / "templates", "fiscal/templates")], knowledge_roles=["revisor"]),
+    )
+    assert any("_acl.yaml" in w and "todo ese directorio" in w for w in result.plan.warnings)

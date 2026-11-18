@@ -172,3 +172,18 @@ def parse_roles(value: str | None) -> list[str] | None:
     if "*" in roles and roles != ["*"]:
         raise ValueError("El rol `*` (cualquier miembro de la organización) debe ir solo.")
     return roles
+
+
+def with_roles(text: str, roles: list[str]) -> tuple[str, str]:
+    """Añade `roles` a la cabecera de un `.md` de conocimiento. `(texto, "added" | "kept")`.
+
+    Si la cabecera ya declara `roles`, no se toca. Sin cabecera, se crea una solo con `roles`.
+    """
+    line = miniyaml.dumps({"roles": roles}).strip()
+    nl = "\r\n" if text.startswith("---\r\n") else "\n"
+    header, _ = split_frontmatter(text)
+    if header is None:
+        return f"---{nl}{line}{nl}---{nl}{text}", "added"
+    if any(m.group(1) == "roles" for raw in header.split("\n") if (m := _TOP_KEY.match(raw))):
+        return text, "kept"
+    return f"---{nl}{line}{nl}" + text[3 + len(nl) :], "added"

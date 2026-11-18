@@ -74,6 +74,7 @@ class PlanFile:
     origin: str
     area: str  # skill | scripts | knowledge | manifest | acl
     rewritten: bool = False
+    note: str | None = None
 
 
 @dataclass
@@ -277,10 +278,13 @@ def _gather(
         prefix = normalize_prefix(raw_prefix)
         scan = scan_tree(path, excludes=opts.excludes, default_excludes=opts.default_excludes)
         base = f"knowledge/{prefix}/" if prefix else "knowledge/"
+        single = Path(path).is_file()
         for lf in scan.files:
-            if lf.rel == "_acl.yaml" and opts.knowledge_roles is not None:
+            if lf.rel == "_acl.yaml" and opts.knowledge_roles is not None and not single:
                 continue  # se genera con --knowledge-roles
             add(base + lf.rel, lf, "knowledge", f"{base}{lf.rel}", base + lf.rel)
+            if base + lf.rel in gathered:
+                gathered[base + lf.rel]["single_file"] = single
         for s in scan.skipped:
             warnings.append(f"No se sube {path}/{s.rel}: {skill_inspect.SKIP_TEXT.get(s.reason, s.reason)}.")
     return gathered, omitted, warnings, local_manifest
@@ -373,13 +377,34 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
     contents[manifest_path] = skillmeta.dump_manifest(manifest).encode("utf-8")
     gathered[manifest_path] = {"lf": None, "area": "manifest", "origin": "(generado)", "pkg": None}
 
-    # --- _acl.yaml del conocimiento ----------------------------------------------------------------------
+    # --- roles del conocimiento ---------------------------------------------------------------------------
     prefixes = sorted({normalize_prefix(p) for _, p in opts.knowledge})
+    notes_by_path: dict[str, str] = {}
     if opts.knowledge_roles is not None:
-        for prefix in prefixes:
+        for prefix in sorted({normalize_prefix(pre) for p, pre in opts.knowledge if not Path(p).is_file()}):
             acl = f"knowledge/{prefix}/_acl.yaml" if prefix else "knowledge/_acl.yaml"
             contents[acl] = skillmeta.miniyaml.dumps({"roles": opts.knowledge_roles}).encode("utf-8")
             gathered[acl] = {"lf": None, "area": "acl", "origin": "(generado: --knowledge-roles)", "pkg": None}
+            warnings.append(f"Se escribe {acl}: fija los roles por defecto de todo ese directorio del almacén.")
+        for path, g in sorted(gathered.items()):
+            if g["area"] != "knowledge" or not g.get("single_file"):
+                continue
+            if not path.endswith(".md"):
+                warnings.append(
+                    f"{path}: solo un .md puede llevar roles en su cabecera; sube su carpeta con --knowledge "
+                    "DIR:PREFIJO para fijarlos con un _acl.yaml."
+                )
+                continue
+            try:
+                text = contents[path].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            new_text, state = skillmeta.with_roles(text, opts.knowledge_roles)
+            if state == "kept":
+                warnings.append(f"{path} ya declara roles en su cabecera: --knowledge-roles no los cambia.")
+            else:
+                contents[path] = new_text.encode("utf-8")
+                notes_by_path[path] = "roles añadidos a la cabecera"
 
     # --- lo que ya hay publicado ---------------------------------------------------------------------------
     remote_knowledge: dict[str, str] = {}
@@ -396,7 +421,17 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
         guard = previous if previous is not None else None if g["area"] == "acl" else "none"
         files.append(
             PlanFile(
-                path, data, digest, len(data), status, previous, guard, g["origin"], g["area"], path in rewritten_paths
+                path,
+                data,
+                digest,
+                len(data),
+                status,
+                previous,
+                guard,
+                g["origin"],
+                g["area"],
+                path in rewritten_paths,
+                notes_by_path.get(path),
             )
         )
 
@@ -599,7 +634,8 @@ def render_plan(result: PublishResult) -> str:
     sendable = plan.to_send
     for f in sendable[:MAX_LISTED]:
         mark = "+" if f.status == "new" else "~"
-        out.append(f"  {mark} {f.path}  ({_size(f.size)}{', reescrito' if f.rewritten else ''})")
+        extra = (", reescrito" if f.rewritten else "") + (f", {f.note}" if f.note else "")
+        out.append(f"  {mark} {f.path}  ({_size(f.size)}{extra})")
     if len(sendable) > MAX_LISTED:
         out.append(f"  … y {len(sendable) - MAX_LISTED} más")
     if not sendable:
@@ -644,6 +680,7 @@ def result_to_json(result: PublishResult) -> dict[str, Any]:
                 "area": f.area,
                 "origin": f.origin,
                 "rewritten": f.rewritten,
+                "note": f.note,
             }
             for f in plan.files
         ],
@@ -756,7 +793,7 @@ def add_publish_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore
     p.add_argument(
         "--knowledge-roles",
         metavar="R1,R2",
-        help="Roles del conocimiento subido (escribe un _acl.yaml en cada PREFIJO)",
+        help="Roles del conocimiento subido: _acl.yaml en cada carpeta, o la cabecera de un .md suelto",
     )
     p.add_argument("--depends-on-skills", metavar="S1,S2", help="Skills de las que depende, además de las detectadas")
     p.add_argument(

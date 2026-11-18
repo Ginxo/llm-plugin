@@ -130,3 +130,20 @@ def test_wildcard_role_must_be_alone() -> None:
 def test_parse_manifest_rejects_non_mappings() -> None:
     with pytest.raises(skillmeta.miniyaml.YamlError):
         skillmeta.parse_manifest("- a\n- b\n")
+
+
+def test_with_roles_adds_them_to_a_header_without_touching_the_rest() -> None:
+    text = "---\ntitle: Perfil\nstatus: active\n---\n# Cuerpo\n"
+    new, state = skillmeta.with_roles(text, ["a", "b"])
+    assert state == "added"
+    assert new == "---\nroles: [a, b]\ntitle: Perfil\nstatus: active\n---\n# Cuerpo\n"
+    assert skillmeta.parse_frontmatter(new).data == {"roles": ["a", "b"], "title": "Perfil", "status": "active"}
+
+
+def test_with_roles_creates_a_header_and_respects_existing_roles() -> None:
+    new, state = skillmeta.with_roles("# Solo cuerpo\n", ["a"])
+    assert (new, state) == ("---\nroles: [a]\n---\n# Solo cuerpo\n", "added")
+    same, state = skillmeta.with_roles("---\nroles: [x]\n---\ncuerpo\n", ["a"])
+    assert (same, state) == ("---\nroles: [x]\n---\ncuerpo\n", "kept")
+    crlf, _ = skillmeta.with_roles("---\r\ntitle: t\r\n---\r\ncuerpo\r\n", ["a"])
+    assert crlf.startswith("---\r\nroles: [a]\r\ntitle: t")
