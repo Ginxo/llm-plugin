@@ -551,3 +551,17 @@ def test_publishing_through_a_symlink_uses_the_given_name(brain: Brain, store: F
 def test_name_mismatch_with_the_frontmatter_is_warned(brain: Brain, store: FakeStore) -> None:
     result = publish.run_publish(DirectClient(store), opts(brain, name="facturas", dry_run=True))
     assert any("facturacion" in w and "facturas" in w for w in result.plan.warnings)
+
+
+def test_dependencies_are_published_first_and_the_warning_goes_away(brain: Brain, store: FakeStore) -> None:
+    client = DirectClient(store)
+    first = publish.run_publish(client, opts(brain, dry_run=True))
+    assert "DEPENDENCY_MISSING" in {w["code"] for w in first.server["warnings"]}
+    for dep in ("gestor", "md-to-doc"):
+        publish.run_publish(client, PublishOptions(skill_dir=brain.skill.parent / dep, roles=["facturacion"]))
+    second = publish.run_publish(client, opts(brain, dry_run=True))
+    assert "DEPENDENCY_MISSING" not in {w["code"] for w in second.server["warnings"]}
+    publish.run_publish(client, opts(brain))
+    package = store._tool_baas_get_skill_package({"skill": "facturacion"})
+    assert [d["name"] for d in package["depends_on"]["skills"]] == ["gestor", "md-to-doc"]
+    assert all(d["accessible"] for d in package["depends_on"]["skills"])
