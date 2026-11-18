@@ -232,13 +232,23 @@ class OrphanUtilitiesTest(unittest.TestCase):
         self.assertEqual(self.audit_problems(self.row(target_label=self.A.name)), [])
 
     def test_reactivated_audit_problems(self) -> None:
-        row = {"actor": {"email": self.ADMIN}, "metadata": {"previous_status": "DISABLED", "org_slug": "o2"}}
-        self.assertEqual(e2e_h4.reactivated_audit_problems(row, org_slug="o2", actor_email=self.ADMIN), [])
-        wrong = {"actor": {"email": "x@baas.test"}, "metadata": {"previous_status": "ACTIVE", "org_slug": "o9"}}
-        text = " ".join(e2e_h4.reactivated_audit_problems(wrong, org_slug="o2", actor_email=self.ADMIN))
-        for fragment in ("actor", "previous_status", "org_slug"):
+        row = {"actor": {"email": self.ADMIN}, "org_slug": "o2", "metadata": {"org_slug": "o2", "new_status": "ACTIVE"}}
+        kwargs = {"org_slug": "o2", "actor_email": self.ADMIN, "new_status": "ACTIVE"}
+        self.assertEqual(e2e_h4.reactivated_audit_problems(row, **kwargs), [])
+        invited = {**row, "metadata": {"org_slug": "o2", "new_status": "INVITED"}}
+        self.assertEqual(e2e_h4.reactivated_audit_problems(invited, **{**kwargs, "new_status": "INVITED"}), [])
+        self.assertIn("new_status", " ".join(e2e_h4.reactivated_audit_problems(invited, **kwargs)))
+        wrong = {"actor": {"email": "x@baas.test"}, "org_slug": "o9", "metadata": {"org_slug": "o9", "new_status": "X"}}
+        text = " ".join(e2e_h4.reactivated_audit_problems(wrong, **kwargs))
+        for fragment in ("actor", "org_slug = 'o9'", "metadata.org_slug", "metadata.new_status"):
             self.assertIn(fragment, text)
-        self.assertTrue(e2e_h4.reactivated_audit_problems(None, org_slug="o2", actor_email=self.ADMIN))
+        # sin organización (org_id nulo): su ORG_ADMIN no la vería
+        no_org = {**row, "org_slug": None}
+        self.assertIn("org_slug = None", " ".join(e2e_h4.reactivated_audit_problems(no_org, **kwargs)))
+        # el contrato ya no tiene previous_status
+        old = {**row, "metadata": {"org_slug": "o2", "new_status": "ACTIVE", "previous_status": "DISABLED"}}
+        self.assertIn("previous_status", " ".join(e2e_h4.reactivated_audit_problems(old, **kwargs)))
+        self.assertTrue(e2e_h4.reactivated_audit_problems(None, **kwargs))
 
     def test_login_waits_when_rate_limited(self) -> None:
         e2e = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), nonce="abcdefghij")
@@ -565,8 +575,8 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 6)
         once = ["0.", "1.", "2.", "2b.", "3.", "4.", "6.", "7.1", "7.2", "7.3", "8.1 ", "8.2", "8.3", "8.4", "8.5"]
         once += ["8.6", "8.7", "8.8", "8.9", "8.10", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5", "9.6", "9.7", "9.8"]
-        once += ["10.1 ", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7", "10.8", "10.9", "10.10", "10.11", "10.12"]
-        once += ["10.13", "10.14"]
+        once += ["10.1 ", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7", "10.8", "10.9", "10.10", "10.11", "10.12 "]
+        once += ["10.12b", "10.13", "10.14"]
         for prefix in once:
             self.assertEqual(len([n for n in steps if n.startswith(prefix)]), 1, prefix)
         self.assertFalse(initial, "el interruptor debe quedar apagado, como al empezar")
@@ -617,7 +627,7 @@ class FullRunTest(unittest.TestCase):
             statuses = {u.status for u in stack.state.users.values() if u.email.startswith("huerf-")}
             keys = [k for u in stack.state.users.values() if u.email.startswith("huerf-") for k in u.keys]
         self.assert_all_ok(code, steps, out)
-        self.assertEqual(len([n for n in steps if n.startswith("10.")]), 14)
+        self.assertEqual(len([n for n in steps if n.startswith("10.")]), 15)
         self.assertFalse([n for n in steps if n.startswith(("5.", "8.", "9."))])
         self.assertEqual(leftovers, ["baas-ai-ip", "demo", "observacion"], "las cuatro organizaciones se eliminaron")
         self.assertEqual(len(users), 7)
@@ -714,8 +724,11 @@ class FaultsTest(unittest.TestCase):
         "orphans-audit-email": {"10.8": ("no debe llevar el email ni el nombre",)},
         "disabled-can-login": {"10.6": ("inicia sesión con la contraseña correcta",)},
         "reactivate-orgadmin": {"10.11": ("USER_DISABLED",)},
-        "reactivate-no-audit": {"10.12": ("user.reactivated",)},
-        "reactivate-restores-keys": {"10.12": ("clave de antes", "revocada")},
+        "reactivate-no-audit": {"10.12 ": ("user.reactivated",)},
+        "reactivate-restores-keys": {"10.12 ": ("clave de antes", "revocada")},
+        "reactivate-audit-no-org": {"10.12 ": ("user.reactivated: org_slug = None",)},
+        "audit-orgadmin-sees-disabled": {"10.12b": ("X ve 1 fila(s) user.disabled", "no debe ver ninguna")},
+        "audit-orgadmin-blind": {"10.12b": ("X ve 0 fila(s) user.reactivated",)},
     }
 
     ORPHAN_PREFIXES = ("preview-", "orphans-", "reactivate-", "disabled-")  # solo los pasos 10 los comprueban

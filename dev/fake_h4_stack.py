@@ -14,7 +14,9 @@ que el hito H4 añade (contrato §4, §5.2, §6 y §8; plan, tareas W2 a W5, P2,
   (`content_available`) y el WebSocket `/api/v1/ws/traces` con el mismo filtrado.
 - **Usuarios que se quedan sin organización** (contrato §6): `GET /orgs/{slug}/delete-preview`, `disable_orphans` al
   eliminar (desactiva, revoca claves personales, cierra sesiones, invalida enlaces y audita `user.disabled` sin email),
-  `409 USER_DISABLED` para un ORG_ADMIN y la reactivación por el PLATFORM_ADMIN (`user.reactivated`).
+  `409 USER_DISABLED` para un ORG_ADMIN y la reactivación por el PLATFORM_ADMIN (`user.reactivated`, con la
+  organización como `org_id` y `{org_slug, new_status}`); en la auditoría el ORG_ADMIN ve las filas de sus
+  organizaciones (`user.reactivated`) y no las `user.disabled` (sin organización).
 - **MCP** (`/org/<slug>/mcp`): `initialize` y `baas_write_document`; una organización eliminada pasa a
   `.quarantine/<slug>-<fecha>`.
 - `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, claves de Redis y MCP).
@@ -132,6 +134,9 @@ FAULTS = {
     "reactivate-orgadmin": "un ORG_ADMIN puede reactivar a un usuario desactivado (sin 409 USER_DISABLED)",
     "reactivate-no-audit": "reactivar a un usuario no deja ninguna fila user.reactivated",
     "reactivate-restores-keys": "al reactivar a un usuario vuelven a valer sus claves revocadas",
+    "reactivate-audit-no-org": "la fila user.reactivated no lleva la organización a la que se invita (org_id nulo)",
+    "audit-orgadmin-sees-disabled": "el ORG_ADMIN de la organización ve las filas user.disabled de sus miembros",
+    "audit-orgadmin-blind": "el ORG_ADMIN no ve ninguna fila de la auditoría de su organización",
 }
 
 
@@ -396,9 +401,11 @@ class StackState:
                                   "new_user": previous is None and token is not None,
                                   "activation_link_issued": token is not None})  # fmt: skip
             if previous and "reactivate-no-audit" not in self.faults:
-                self.record("user.reactivated", viewer, target_type="user", target_id=user.id,
+                # `org_id` = la organización a la que se invita: su ORG_ADMIN ve la fila
+                org_of_row = None if "reactivate-audit-no-org" in self.faults else slug
+                self.record("user.reactivated", viewer, org=org_of_row, target_type="user", target_id=user.id,
                             reason=str(body.get("reason") or "") or None,
-                            metadata={"previous_status": previous, "org_slug": slug})  # fmt: skip
+                            metadata={"org_slug": slug, "new_status": user.status})  # fmt: skip
             url = f"{self.app_url}/activate/{token}" if token else None
             return 201, {"member": self.member_json(user, slug), "activation_url": url, "propagated": True}
 
@@ -511,9 +518,25 @@ class StackState:
             self.sessions[session] = user
         return 200, {"next": "DONE"}, session
 
-    def audit_items(self, action: str | None, limit: int) -> dict[str, Any]:
+    def audit_visible(self, viewer: User, row: dict[str, Any]) -> bool:
+        """W10: el PLATFORM_ADMIN ve todo; un ORG_ADMIN, las filas de sus organizaciones (las `user.disabled` no tienen
+        organización: no las ve)."""
+        if viewer.platform_admin:
+            return True
+        if "audit-orgadmin-blind" in self.faults:
+            return False
+        admin_orgs = {s for s, role in viewer.memberships.items() if role == "ORG_ADMIN"}
+        if row["org_slug"] in admin_orgs:
+            return True
+        target = self.users_by_id.get(row["target_id"] or "") if row["action"] == "user.disabled" else None
+        return bool(target and "audit-orgadmin-sees-disabled" in self.faults and admin_orgs & set(target.memberships))
+
+    def audit_items(self, viewer: User, action: str | None, limit: int) -> dict[str, Any]:
         with self.lock:
-            rows = [r for r in reversed(self.audit) if not action or str(r["action"]).startswith(action)]
+            rows = [
+                r for r in reversed(self.audit)
+                if (not action or str(r["action"]).startswith(action)) and self.audit_visible(viewer, r)
+            ]  # fmt: skip
         return {"items": rows[:limit], "total": len(rows), "limit": limit, "offset": 0}
 
     def set_anonymizer(self, viewer: User, slug: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -913,13 +936,13 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
                     return self._json(404, {"error": "NOT_FOUND", "message": "Organization not found"})
                 return self._json(200, state.org_json(org))
             if url.path == "/api/v1/audit":
-                if not viewer.platform_admin:
+                if not viewer.platform_admin and "ORG_ADMIN" not in viewer.memberships.values():
                     return self._json(
                         403, {"error": "FORBIDDEN", "message": "Only administrators can see the audit log"}
                     )
                 query = parse_qs(url.query)
                 action = (query.get("action") or [None])[0]
-                return self._json(200, state.audit_items(action, int((query.get("limit") or ["50"])[0])))
+                return self._json(200, state.audit_items(viewer, action, int((query.get("limit") or ["50"])[0])))
             if url.path == "/api/v1/conversations":
                 query = parse_qs(url.query)
                 org = (query.get("org") or [None])[0]

@@ -21,8 +21,9 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
   10.   Usuarios que se quedan sin organización al eliminar una (contrato §6): la vista previa los lista, la
         eliminación los desactiva (`disable_orphans`, `true` por omisión) y revoca sus claves personales, quien
         conserva otra organización no cambia, la auditoría `user.disabled` no lleva su email, un ORG_ADMIN no los
-        reactiva (`409 USER_DISABLED`) y el PLATFORM_ADMIN sí (`user.reactivated`). Crea sus propias organizaciones y
-        usuarios (`huerf-<ejecución>-…`) y exige `BAAS_DEV_SKIP_TOTP=1` para activarlos.
+        reactiva (`409 USER_DISABLED`) y el PLATFORM_ADMIN sí (`user.reactivated`, visible para el ORG_ADMIN de la
+        organización; `user.disabled`, no). Crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y exige
+        `BAAS_DEV_SKIP_TOTP=1` para activarlos.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
@@ -227,19 +228,27 @@ def api_error(res: Http) -> str:
     return f"HTTP {res.status}" + (f" {code}" if isinstance(code, str) else "")
 
 
-def reactivated_audit_problems(row: Any, *, org_slug: str, actor_email: str) -> list[str]:
-    """Una fila `user.reactivated` (contrato §6): quien invita como actor y `{previous_status: DISABLED, org_slug}`."""
+def reactivated_audit_problems(row: Any, *, org_slug: str, actor_email: str, new_status: str) -> list[str]:
+    """Una fila `user.reactivated` (contrato §6): quien invita como actor, la organización a la que se invita como
+    `org_id` (su ORG_ADMIN la ve) y `{org_slug, new_status}`; `new_status` es `ACTIVE` si el usuario ya tenía contraseña
+    e `INVITED` si nunca activó la cuenta. Ya no hay `previous_status`."""
     if not isinstance(row, dict):
         return [f"la fila no es un objeto JSON: {row!r}"]
     problems = []
     actor = row.get("actor")
     if not isinstance(actor, dict) or actor.get("email") != actor_email:
         problems.append(f"user.reactivated: actor = {actor!r} (se esperaba {actor_email})")
+    if row.get("org_slug") != org_slug:
+        problems.append(
+            f"user.reactivated: org_slug = {row.get('org_slug')!r} (se esperaba la organización {org_slug})"
+        )
     meta = row.get("metadata")
     meta = meta if isinstance(meta, dict) else {}
-    for name, want in (("previous_status", "DISABLED"), ("org_slug", org_slug)):
+    for name, want in (("org_slug", org_slug), ("new_status", new_status)):
         if meta.get(name) != want:
             problems.append(f"user.reactivated: metadata.{name} = {meta.get(name)!r} (se esperaba {want!r})")
+    if "previous_status" in meta:
+        problems.append(f"user.reactivated: metadata.previous_status = {meta['previous_status']!r} (ya no existe)")
     return problems
 
 
@@ -1923,7 +1932,7 @@ class E2EH4:
         if len(rows) != 1:
             problems.append(f"{len(rows)} fila(s) user.reactivated de A (se esperaba 1)")
         else:
-            problems += reactivated_audit_problems(rows[0], org_slug=o2, actor_email=adm)
+            problems += reactivated_audit_problems(rows[0], org_slug=o2, actor_email=adm, new_status="ACTIVE")
         invited = audit_rows(self.audit_body("member.invited"), "member.invited", a.user_id)
         if not [r for r in invited if r.get("org_slug") == o2]:
             problems.append(f"ninguna fila member.invited de A en «{o2}» (la reactivación también da de alta)")
@@ -1931,7 +1940,43 @@ class E2EH4:
         return (
             f"el PLATFORM_ADMIN invita a {a.email} a «{o2}» → 201, ACTIVE y sin enlace; inicia sesión con la "
             "contraseña de siempre; su clave de antes sigue revocada (api-keys, handshake 401, proxy 401, MCP 401) y "
-            "la nueva vale; auditoría user.reactivated (previous_status DISABLED) y member.invited"
+            "la nueva vale; auditoría user.reactivated (en O2, new_status ACTIVE) y member.invited"
+        )
+
+    # 10.12b
+    def orph_audit_visibility(self) -> str:
+        """W10: el ORG_ADMIN de O2 ve `user.reactivated` de A (es de su organización) y ninguna fila `user.disabled`
+        (no tienen organización: pertenecen a la plataforma); el PLATFORM_ADMIN ve las dos."""
+        a, x, o2, adm = self.orph["a"], self.orph["x"], self.slug_of("o2"), self.args.admin_email
+
+        def seen_by_x(query: str) -> Any:
+            res = self.webapp("GET", f"/api/v1/audit?{query}limit=200", x.email)
+            check(res.status == 200, f"GET /api/v1/audit?{query.rstrip('&')} (X, ORG_ADMIN de O2) → {api_error(res)}")
+            return res.json()
+
+        problems: list[str] = []
+        listing = seen_by_x("")
+        rows = audit_rows(listing, "user.reactivated", a.user_id)
+        if len(rows) != 1:
+            problems.append(f"X ve {len(rows)} fila(s) user.reactivated de A en la lista (se esperaba 1)")
+        else:
+            problems += [
+                f"X: {m}"
+                for m in reactivated_audit_problems(rows[0], org_slug=o2, actor_email=adm, new_status="ACTIVE")
+            ]
+        for where, body in (("en la lista", listing), ("filtrando por la acción", seen_by_x("action=user.disabled&"))):
+            items = [i for i in (body or {}).get("items") or [] if isinstance(i, dict)]
+            disabled = [i for i in items if i.get("action") == "user.disabled"]
+            if disabled:
+                problems.append(f"X ve {len(disabled)} fila(s) user.disabled {where}: no debe ver ninguna")
+        for action in ("user.disabled", "user.reactivated"):  # el PLATFORM_ADMIN ve las dos
+            found = len(audit_rows(self.audit_body(action), action, a.user_id))
+            if found != 1:
+                problems.append(f"el PLATFORM_ADMIN ve {found} fila(s) {action} de A (se esperaba 1)")
+        check(not problems, "\n".join(problems))
+        return (
+            f"el ORG_ADMIN X de «{o2}» ve user.reactivated de A (con org_slug «{o2}») y ninguna fila user.disabled, "
+            "ni en la lista ni filtrando por la acción; el PLATFORM_ADMIN ve las dos"
         )
 
     # 10.13
@@ -1964,12 +2009,14 @@ class E2EH4:
         if len(rows) != 1:
             problems.append(f"{len(rows)} fila(s) user.reactivated de G (se esperaba 1)")
         else:
-            problems += reactivated_audit_problems(rows[0], org_slug=o2, actor_email=self.args.admin_email)
+            problems += reactivated_audit_problems(
+                rows[0], org_slug=o2, actor_email=self.args.admin_email, new_status="INVITED"
+            )
         check(not problems, "\n".join(problems))
         return (
             f"{g.email} (nunca activó la cuenta): el PLATFORM_ADMIN lo reactiva en «{o2}» como INVITED con un enlace "
             "nuevo; el de antes sigue invalidado; con el nuevo activa la cuenta, inicia sesión y queda ACTIVE; "
-            "auditoría user.reactivated"
+            "auditoría user.reactivated (en O2, new_status INVITED)"
         )
 
     # 10.14
@@ -2082,6 +2129,7 @@ class E2EH4:
             default = "10.10 sin el campo disable_orphans se desactiva (el valor por omisión es true)"
             denied = "10.11 un ORG_ADMIN no reactiva a un desactivado: 409 USER_DISABLED"
             react_a = "10.12 el PLATFORM_ADMIN lo reactiva: contraseña, clave antigua revocada y user.reactivated"
+            visible = "10.12b auditoría (W10): el ORG_ADMIN ve user.reactivated y no user.disabled"
             react_g = "10.13 un invitado sin activar vuelve a INVITED con un enlace nuevo"
             step(setup, self.orph_setup, needs=base)
             step(serve, self.orph_keys_serve, needs=[setup])
@@ -2095,9 +2143,10 @@ class E2EH4:
             step(default, self.orph_default, needs=[serve, intact])
             step(denied, self.orph_reactivate_denied, needs=[disabled])
             step(react_a, self.orph_reactivate_a, needs=[denied, audit])
+            step(visible, self.orph_audit_visibility, needs=[react_a])
             step(react_g, self.orph_reactivate_g, needs=[default, react_a])
             step("10.14 eliminar la última organización de la prueba: 4 usuarios desactivados",
-                 self.orph_cleanup, needs=[react_a, react_g, keep])  # fmt: skip
+                 self.orph_cleanup, needs=[react_a, visible, react_g, keep])  # fmt: skip
 
 
 def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> int:
