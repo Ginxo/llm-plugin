@@ -15,6 +15,8 @@ Este proyecto está vinculado (con `/baas-init`) a una organización de BaaS-AI-
 | `baas_list_skills` | Skills accesibles con sus ficheros, scripts y `package_sha256` | Lo que no puedes ver **no aparece** |
 | `baas_get_skill` | Contenido y metadatos de una skill y su lista de ficheros | Sigue sus instrucciones como si fueran una skill local |
 | `baas_get_skill_package` · `baas_get_skill_files` | Manifiesto del paquete de una skill (ficheros, `sha256`, ejecutables, dependencias) y su contenido | Para inspeccionar; para usar una skill, sincronízala o ejecuta sus scripts con el ejecutor |
+| `baas_list_files` | Enumera conocimiento y skills accesibles (ruta, tipo, `sha256`, tamaño), paginado | Para saber qué existe antes de proponer rutas o publicar |
+| `baas_write_files` | Lote atómico de ficheros de una skill o de conocimiento, con `dry_run` (solo ORG_ADMIN o PLATFORM_ADMIN) | Para publicar usa `/baas-publish`; si lo llamas tú, empieza siempre con `dry_run` y pasa `expected_sha256` |
 | `baas_get_script` | Contenido de un script (`{skill, script, org?}`) y su `sha256` | **No la uses para ejecutar**: usa el ejecutor (abajo) |
 | `baas_search_knowledge` | Búsqueda en el conocimiento: ruta, título, extracto y `sha256` | Empieza aquí ante preguntas sobre la organización |
 | `baas_read_document` | Lee un documento autorizado | Cita la ruta del documento en tu respuesta |

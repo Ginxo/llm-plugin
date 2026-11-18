@@ -8,6 +8,7 @@ Este repositorio es a la vez el **marketplace** `baas-ai-ip` y el **plugin** `ba
 - **`/baas-status`**: usuario, organización del proyecto, roles, kill switch (global, bloqueo, pausa), AI-IP y si el proxy y el MCP funcionan en esta sesión.
 - **Skill `baas-brain`**: enseña al agente a usar las tools `baas_*` (skills, scripts y conocimiento de la organización) y a **detenerse** ante `AUTHORIZATION_DENIED` o `KILL_SWITCH_ACTIVE`.
 - **`/baas-sync`**: copia en tu equipo las skills de la organización que tus roles autorizan, con sus scripts, plantillas y ficheros de contexto, como un plugin de Claude Code que se invoca **`/<organización>:<skill>`**. También se sincroniza solo, en segundo plano, al iniciar y al cerrar la sesión. Quitar un rol, retirar una skill o activar el kill switch la elimina del equipo en la siguiente sincronización ([Skills de la organización](#skills-de-la-organización-sincronización)).
+- **`/baas-publish` y `/baas-export`** (administradores): una skill guía la subida de una skill local (con sus scripts, dependencias y conocimiento) al MCP en un lote atómico, y la bajada inversa ([Publicar y exportar skills](#publicar-y-exportar-skills-administradores)).
 - **Ejecutor de scripts**: respaldo bajo demanda para una skill no sincronizada: descarga su paquete completo, comprueba el SHA-256 de cada fichero, ejecuta el script desde un directorio temporal privado y lo borra siempre.
 
 ## Requisitos
