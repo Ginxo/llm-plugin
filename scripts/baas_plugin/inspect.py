@@ -42,15 +42,42 @@ _ABS_HOME = re.compile(
 _STDLIB = getattr(sys, "stdlib_module_names", frozenset())
 
 
+KEEP_TEXT_BYTES = 1024 * 1024  # el texto de un fichero mayor no se guarda: se vuelve a leer al analizarlo
+
+
+def _decode(data: bytes, truncated: bool) -> str | None:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        if not truncated:
+            return None
+        try:  # el corte pudo caer a mitad de un carácter
+            text = data[:-4].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None if "\x00" in text else text
+
+
 @dataclass
 class Item:
     area: str  # skill | scripts | knowledge
     rel: str  # relativa a la raíz de su área
     disp: str  # ruta para el informe (la que tendría en el paquete, o `knowledge/…`)
     file: LocalFile
-    text: str | None = None
+    is_text: bool = False
     head: bytes = b""
     truncated: bool = False
+    _text: str | None = field(default=None, repr=False)
+
+    @property
+    def text(self) -> str | None:
+        """Texto del fichero (hasta 16 MiB) o `None` si no es texto. Los ficheros grandes se releen sin guardarse."""
+        if not self.is_text:
+            return None
+        if self._text is not None:
+            return self._text
+        with self.file.path.open("rb") as fh:
+            return _decode(fh.read(MAX_SCAN_BYTES), self.truncated)
 
     @property
     def ext(self) -> str:
@@ -71,14 +98,9 @@ def _load(item: Item) -> None:
     item.truncated = len(data) > MAX_SCAN_BYTES
     data = data[:MAX_SCAN_BYTES]
     item.head = data[:4096]
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        try:  # el corte pudo caer a mitad de un carácter
-            text = data[:-4].decode("utf-8") if item.truncated else None
-        except UnicodeDecodeError:
-            text = None
-    item.text = None if text is None or "\x00" in text else text
+    text = _decode(data, item.truncated)
+    item.is_text = text is not None
+    item._text = text if text is not None and len(data) <= KEEP_TEXT_BYTES else None
 
 
 @dataclass
@@ -294,11 +316,12 @@ def inspect_skill(
         reason = sensitive.sensitive_file_reason(posixpath.basename(it.rel))
         if reason:
             sensitive_files.append({"file": it.disp, "reason": reason})
-        if it.text is not None:
-            for m in sensitive.scan_text(it.text):
+        text = it.text
+        if text is not None:
+            for m in sensitive.scan_text(text):
                 sensitive_items.append({"kind": m.kind, "file": it.disp, "line": m.line, "sample": m.sample})
-            for m in _ABS_HOME.finditer(it.text):
-                line = it.text.count("\n", 0, m.start()) + 1
+            for m in _ABS_HOME.finditer(text):
+                line = text.count("\n", 0, m.start()) + 1
                 nonportable.append(
                     {
                         "kind": "absolute_path",
@@ -333,7 +356,6 @@ def inspect_skill(
             if it.head.startswith(b"#!")
             else None
         )
-        text = it.text
         if text is None:
             continue
         if it.ext == ".py":
@@ -676,7 +698,7 @@ def inspect_skill(
             "area": i.area,
             "path": i.disp,
             "size": i.file.size,
-            "text": i.text is not None,
+            "text": i.is_text,
             "ext": i.ext,
             "exec": i.file.exec_bit,
             "hidden": i.file.hidden,

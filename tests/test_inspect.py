@@ -482,3 +482,13 @@ def test_name_is_the_one_given_even_through_a_symlink(brain: Brain, tmp_path: Pa
     os.symlink(brain.skill, link)
     rep = skill_inspect.inspect_skill(link)
     assert rep["skill"]["name"] == "enlace-a-facturacion"
+
+
+def test_big_text_files_are_still_analysed_without_being_kept_in_memory(brain: Brain) -> None:
+    big = brain.skill / "references" / "grande.txt"
+    big.write_text("relleno\n" * 200_000 + f"DNI {NIF}\n")  # ~1,6 MiB: por encima de lo que se guarda
+    rep = skill_inspect.inspect_skill(brain.skill)
+    assert any(i["file"] == "references/grande.txt" and i["kind"] == "nif" for i in rep["sensitive"]["items"])
+    entry = next(f for f in rep["files"] if f["path"] == "references/grande.txt")
+    assert entry["text"] is True
+    assert entry["size"] > 1024 * 1024
