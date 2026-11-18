@@ -480,6 +480,7 @@ class Inspector(Protocol):
     def redis_services(self) -> list[str]: ...
     def redis_keys(self, slug: str, conversation_ids: Sequence[str] = ()) -> list[str]: ...
     def redis_setting(self, service: str, name: str) -> str: ...
+    def redis_residue(self, service: str) -> dict[str, int]: ...
     def disk_files(self, service: str) -> list[str]: ...
     def force_aof_rewrite(self, service: str) -> None: ...
     def disk_contains(self, service: str, needles: Sequence[str]) -> list[str]: ...
@@ -648,6 +649,23 @@ class ContainerInspector:
             raise StepError(f"CONFIG GET {name} en «{svc}» no devolvió el parámetro: {lines[0][:100]!r}")
         return lines[1] if len(lines) > 1 else ""
 
+    def redis_residue(self, service: str) -> dict[str, int]:
+        """Lo que una pila anterior a A′ (H4-02) dejó en la instancia y lleva valores originales: cuántas claves
+        `baas:conv:*:vault` y `baas:conv:*:events` hay (con SCAN, que no bloquea Redis) y cuántas entradas tiene el
+        stream `baas:traces`. Solo devuelve lo que no es cero."""
+        svc = self._service(service)
+        residue: dict[str, int] = {}
+        for pattern in ("baas:conv:*:vault", "baas:conv:*:events"):
+            found = len(self._lines(self._redis_cli(svc, "--scan", "--pattern", pattern)))
+            if found:
+                residue[pattern] = found
+        length = self._redis_cli(svc, "XLEN", "baas:traces").strip()
+        if not length.isdigit():  # redis-cli escribe los errores en la salida estándar y sale con 0
+            raise StepError(f"XLEN baas:traces en «{svc}»: {length[:100]!r}")
+        if int(length):
+            residue["baas:traces"] = int(length)
+        return residue
+
     def disk_files(self, service: str) -> list[str]:
         """Los ficheros (todo lo que no es un directorio) de `/data` del contenedor."""
         svc = self._service(service)
@@ -743,7 +761,7 @@ class MissingInspector:
     def _fail(self, *_: Any, **__: Any) -> Any:
         raise StepError(f"{self.why}. Usa --inspect podman|docker (y --compose-project) o --inspect none para omitirlo")
 
-    vault_rows = conversation_ids = redis_services = redis_keys = redis_setting = disk_files = _fail
+    vault_rows = conversation_ids = redis_services = redis_keys = redis_setting = redis_residue = disk_files = _fail
     force_aof_rewrite = disk_contains = redis_set_temp = redis_delete = mcp_org_dirs = mcp_quarantine = _fail
 
 

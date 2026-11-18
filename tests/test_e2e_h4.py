@@ -729,6 +729,41 @@ class RedisInspectorTest(unittest.TestCase):
             engine.inspector().redis_setting("redis", "inventado")
         self.assertIn("inventado", str(ctx.exception))
 
+    # --- residuo de una pila anterior a A′ ---
+    def test_redis_residue_counts_old_originals_in_the_persistent_instance(self) -> None:
+        engine = FakeEngine(
+            self.root,
+            keys={
+                "redis": [
+                    f"baas:conv:{UUID_A}:vault", f"baas:conv:{UUID_B}:vault", f"baas:conv:{UUID_A}:events",
+                    f"baas:conv:{UUID_A}:state", f"baas:conv:{UUID_A}:turns", "baas:policy:global",
+                ]
+            },
+            xlen={"redis": {"baas:traces": 4}},
+        )  # fmt: skip
+        residue = engine.inspector().redis_residue("redis")
+        self.assertEqual(residue, {"baas:conv:*:vault": 2, "baas:conv:*:events": 1, "baas:traces": 4})
+        runs = [c[-3:] for c in engine.calls("redis")]
+        self.assertIn(["--scan", "--pattern", "baas:conv:*:vault"], runs, "con SCAN, nunca con KEYS")
+        self.assertIn(["--scan", "--pattern", "baas:conv:*:events"], runs)
+        self.assertEqual(engine.calls("redis")[-1][-2:], ["XLEN", "baas:traces"])
+        self.assertFalse([c for c in engine.calls("redis") if "KEYS" in c], "KEYS bloquearía Redis")
+        for run in engine.calls("redis"):
+            self.assertIn('REDISCLI_AUTH="$BAAS_REDIS_PASSWORD"', run[4])
+
+    def test_redis_residue_of_a_clean_instance_is_empty(self) -> None:
+        engine = FakeEngine(self.root, keys={"redis": [f"baas:conv:{UUID_A}:state", "baas:policy:global"]})
+        self.assertEqual(engine.inspector().redis_residue("redis"), {})
+        self.assertEqual(engine.inspector().redis_residue("redis-ephemeral"), {}, "vale para cualquier instancia")
+
+    def test_redis_residue_with_a_trace_stream_of_another_type_is_a_step_error(self) -> None:
+        wrong = "WRONGTYPE Operation against a key holding the wrong kind of value"
+        engine = FakeEngine(self.root, xlen={"redis": {"baas:traces": wrong}})
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector().redis_residue("redis")
+        self.assertIn("baas:traces", str(ctx.exception))
+        self.assertIn("WRONGTYPE", str(ctx.exception))
+
     # --- ficheros de /data ---
     def test_disk_files_lists_every_file_below_data(self) -> None:
         engine = FakeEngine(self.root)
@@ -951,7 +986,7 @@ class MissingInspectorTest(unittest.TestCase):
         calls = {
             "vault_rows": ("acme",), "conversation_ids": ("acme",), "redis_services": (),
             "redis_keys": ("acme", []), "redis_setting": ("redis", "appendonly"), "disk_files": ("redis",),
-            "force_aof_rewrite": ("redis",), "disk_contains": ("redis", ["x"]),
+            "force_aof_rewrite": ("redis",), "disk_contains": ("redis", ["x"]), "redis_residue": ("redis",),
             "redis_set_temp": ("redis", "baas:e2e:x", "v", 60), "redis_delete": ("redis", "baas:e2e:x"),
             "mcp_org_dirs": (), "mcp_quarantine": (),
         }  # fmt: skip

@@ -12,6 +12,7 @@ Estado (`FAKE_ENGINE_STATE`):
 - `data_dirs`: servicio → directorio local que hace de `/data`.
 - `config`: servicio → {parámetro: valor} de `CONFIG GET`.
 - `keys`: servicio → claves que ve `redis-cli --scan`.
+- `xlen`: servicio → {clave: longitud o texto de error} de `XLEN` (una clave que no está da 0).
 - `rewrite_replies`: servicio → respuestas sucesivas de `BGREWRITEAOF` (por defecto, «started»).
 - `info_polls`: servicio → `aof_rewrite_in_progress` de cada `INFO persistence` sucesivo (después, 0).
 - `bgrewrite_status`: servicio → `aof_last_bgrewrite_status` (por defecto, `ok`).
@@ -47,6 +48,9 @@ def _redis_cli(state: dict[str, Any], service: str, args: list[str]) -> tuple[in
         busy = polls.pop(0) if polls else 0
         status = state.get("bgrewrite_status", {}).get(service, "ok")
         return 0, f"aof_rewrite_in_progress:{busy}\r\naof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:{status}\r\n"
+    if args[:1] == ["XLEN"]:
+        length = state.get("xlen", {}).get(service, {}).get(args[1], 0)  # un error sale con rc 0, como en redis-cli
+        return 0, f"{length}\n"
     if args[:1] == ["SET"]:
         state.setdefault("set", {}).setdefault(service, {})[args[1]] = args[2]
         return 0, "OK\n"
