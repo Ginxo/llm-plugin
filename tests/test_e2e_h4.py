@@ -437,8 +437,6 @@ if argv[0] == "ps":
     print("cid-" + [a for a in argv if a.startswith("label=com.docker.compose.service=")][0].split("=")[-1])
 elif argv[:2] == ["exec", "cid-postgres"]:
     print("7")
-elif argv[:2] == ["exec", "cid-redis"]:
-    print("baas:policy:org:acme" if "baas:policy:org:acme" in argv else "baas:member:u1:acme")
 elif argv[:2] == ["exec", "cid-mcp-server"]:
     if argv[-1].endswith(".quarantine"):
         print("acme-20261117T200000Z")
@@ -466,14 +464,6 @@ elif argv[:2] == ["exec", "cid-mcp-server"]:
         self.assertEqual(run[6:9], ["baas_vault", "-Atc", run[8]])
         for table in ("vault_entries", "vault_counters", "conversation_state"):
             self.assertIn(f"FROM {table} WHERE org_slug = 'acme'", run[8])
-
-    def test_redis_keys_use_the_container_password_not_ours(self) -> None:
-        self.assertEqual(self.inspector.redis_keys("acme"), ["baas:policy:org:acme", "baas:member:u1:acme"])
-        run = [c for c in self.calls() if c[:2] == ["exec", "cid-redis"]]
-        self.assertEqual(len(run), 2)
-        self.assertIn('REDISCLI_AUTH="$BAAS_REDIS_PASSWORD"', " ".join(run[0]))
-        self.assertEqual(run[0][-3:], ["--scan", "--pattern", "baas:policy:org:acme"])
-        self.assertEqual(run[1][-1], "baas:member:*:acme")
 
     def test_mcp_directories(self) -> None:
         self.assertEqual(self.inspector.mcp_org_dirs(), ["demo", "otra"])
@@ -535,6 +525,352 @@ elif argv[:2] == ["exec", "cid-mcp-server"]:
         ):
             project_exists = True
             self.assertEqual(e2e_h4.build_inspector(ns).args[0], "docker")  # type: ignore[union-attr]
+
+
+# --- inspector de Redis: las dos instancias y el disco (H4-02) ------------------------------------------
+
+
+UUID_A = "0b1d5f64-7f0e-4c43-9a43-5a3a0f7c1a11"
+UUID_B = "9c2e7b30-1d44-4f6e-8b2a-6d1f3c9e0a22"
+RDB_BASE = b"REDIS0011\xfa\x09redis-ver\x057.4.0\xfe\x00\xfb\x01\x00\x00\x05hello\x00" + b"\xff" * 8
+
+
+class FakeEngine:
+    """Un `podman`/`docker` falso (ver `tests/fake_engine.py`) con su estado y su registro de llamadas."""
+
+    def __init__(self, root: Path, **state: object) -> None:
+        self.root = root
+        self.state_path = root / "engine-state.json"
+        self.data = {name: root / f"data-{name}" for name in ("redis", "redis-ephemeral")}
+        for path in self.data.values():
+            path.mkdir()
+        base = {
+            "containers": ["postgres", "redis", "redis-ephemeral", "mcp-server"],
+            "data_dirs": {name: str(path) for name, path in self.data.items()},
+            "config": {
+                "redis": {"appendonly": "yes", "save": "", "dir": "/data"},
+                "redis-ephemeral": {"appendonly": "no", "save": "", "dir": "/data"},
+            },
+            "keys": {},
+        }
+        self.state_path.write_text(json.dumps({**base, **state}))
+        self.path = root / "engine"
+        helper = Path(__file__).resolve().parent / "fake_engine.py"
+        self.path.write_text(f'#!/bin/sh\nFAKE_ENGINE_STATE={self.state_path} exec {sys.executable} {helper} "$@"\n')
+        self.path.chmod(self.path.stat().st_mode | stat.S_IXUSR)
+
+    def state(self) -> dict:
+        return json.loads(self.state_path.read_text())
+
+    def calls(self, container: str | None = None) -> list[list[str]]:
+        calls = self.state().get("calls", [])
+        return [c for c in calls if container is None or c[:2] == ["exec", f"cid-{container}"]]
+
+    def inspector(self, **options: float) -> e2e_h4.ContainerInspector:
+        inspector = e2e_h4.ContainerInspector(str(self.path), "h4-plugin")
+        for name, value in options.items():
+            setattr(inspector, name, value)
+        return inspector
+
+
+class NeedlePatternTest(unittest.TestCase):
+    def test_matches_the_plain_text_and_every_mix_of_json_escapes(self) -> None:
+        pattern = e2e_h4.needle_pattern(EMAIL)
+        for written in (
+            EMAIL,
+            "ana.perez\\u0040privada.test",
+            "ana\\u002eperez@privada.test",
+            "ana.perez\\u0040privada\\u002Etest",
+        ):
+            self.assertRegex(f"xx{written}yy", pattern)
+        self.assertNotRegex("ana.perezXprivada.test", pattern, "el punto no es un comodín")
+        self.assertNotRegex("ana.perez@privada.tes", pattern)
+        escapes = (
+            ("señor", "se\\u00f1or"), ("x/y", "x\\/y"), ("<b>", "\\u003cb\\u003e"), ("😀", "\\ud83d\\ude00"),
+            ('dice "hola"', 'dice \\"hola\\"'), ("C:\\tmp", "C:\\\\tmp"), ("a\tb", "a\\tb"),
+        )  # fmt: skip
+        for needle, written in escapes:
+            self.assertRegex(written, e2e_h4.needle_pattern(needle), needle)
+            self.assertRegex(needle, e2e_h4.needle_pattern(needle), needle)
+
+    def test_special_characters_are_literal(self) -> None:
+        for needle in ("a.b", "a*b", "[a-z]+", "(x|y)", "$^", "a{2}", "\\"):
+            pattern = e2e_h4.needle_pattern(needle)
+            self.assertRegex(f"-{needle}-", pattern)
+        self.assertNotRegex("aab", e2e_h4.needle_pattern("a.b"))
+        self.assertNotRegex("aab", e2e_h4.needle_pattern("a*b"))
+        self.assertNotRegex("a", e2e_h4.needle_pattern("[a-z]+"))
+
+
+class RedisInspectorTest(unittest.TestCase):
+    """`ContainerInspector` frente a las dos instancias de Redis (la persistente y la efímera, H4-02)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    # --- qué instancias hay ---
+    def test_redis_services_lists_the_instances_that_exist(self) -> None:
+        engine = FakeEngine(self.root)
+        self.assertEqual(engine.inspector().redis_services(), ["redis", "redis-ephemeral"])
+
+    def test_redis_services_of_an_old_stack_has_only_the_persistent_one(self) -> None:
+        engine = FakeEngine(self.root, containers=["postgres", "redis"])
+        self.assertEqual(engine.inspector().redis_services(), ["redis"])
+
+    def test_redis_services_without_any_redis_is_a_step_error(self) -> None:
+        engine = FakeEngine(self.root, containers=["postgres"])
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector().redis_services()
+        self.assertIn("no hay contenedor «redis»", str(ctx.exception))
+
+    # --- claves de una organización ---
+    def test_redis_keys_look_in_both_instances_and_say_which(self) -> None:
+        engine = FakeEngine(self.root, keys={
+            "redis": ["baas:policy:org:acme", f"baas:member:{UUID_A}:acme", "baas:policy:org:otra"],
+            "redis-ephemeral": [f"baas:conv:{UUID_A}:vault", f"baas:conv:{UUID_B}:tombstone", "baas:conv:otra:vault"],
+        })  # fmt: skip
+        keys = engine.inspector().redis_keys("acme", [UUID_A, UUID_B])
+        self.assertEqual(keys, [
+            "[redis] baas:policy:org:acme",
+            f"[redis] baas:member:{UUID_A}:acme",
+            f"[redis-ephemeral] baas:conv:{UUID_A}:vault",
+            f"[redis-ephemeral] baas:conv:{UUID_B}:tombstone",
+        ])  # fmt: skip
+
+    def test_redis_keys_authenticate_with_the_password_of_each_container(self) -> None:
+        engine = FakeEngine(self.root)
+        engine.inspector().redis_keys("acme", [UUID_A])
+        for service in ("redis", "redis-ephemeral"):
+            runs = engine.calls(service)
+            self.assertTrue(runs, service)
+            for run in runs:
+                self.assertEqual(run[2:4], ["sh", "-c"], run)
+                self.assertIn('REDISCLI_AUTH="$BAAS_REDIS_PASSWORD"', run[4])
+        persistent = [c[-1] for c in engine.calls("redis")]
+        self.assertEqual(persistent, ["baas:policy:org:acme", "baas:member:*:acme"])
+        ephemeral = [c[-1] for c in engine.calls("redis-ephemeral")]
+        self.assertEqual(
+            ephemeral[-1], f"baas:conv:{UUID_A}:*", "las claves de conversación solo se buscan en la efímera"
+        )
+
+    def test_redis_keys_of_an_old_stack_only_look_in_the_persistent_one(self) -> None:
+        engine = FakeEngine(self.root, containers=["postgres", "redis"], keys={"redis": ["baas:policy:org:acme"]})
+        self.assertEqual(engine.inspector().redis_keys("acme", [UUID_A]), ["[redis] baas:policy:org:acme"])
+        self.assertFalse(engine.calls("redis-ephemeral"))
+
+    def test_unsafe_arguments_are_refused_before_any_command(self) -> None:
+        engine = FakeEngine(self.root)
+        inspector = engine.inspector()
+        with self.assertRaises(e2e_h4.StepError):
+            inspector.redis_keys("a b")
+        for bad in ("*", f"{UUID_A}:*", "no-es-un-uuid", UUID_A.upper(), ""):
+            with self.assertRaises(e2e_h4.StepError, msg=bad):
+                inspector.redis_keys("acme", [bad])
+        for slug in ("x'; DROP TABLE vault_entries; --", "A", "", "-a"):
+            with self.assertRaises(e2e_h4.StepError, msg=slug):
+                inspector.conversation_ids(slug)
+        for name in ("*", "Append", "a b", "", "x;y"):
+            with self.assertRaises(e2e_h4.StepError, msg=name):
+                inspector.redis_setting("redis", name)
+        for service in ("postgres", "redis;ls", "", "mcp-server"):
+            with self.assertRaises(e2e_h4.StepError, msg=service):
+                inspector.redis_setting(service, "appendonly")
+            with self.assertRaises(e2e_h4.StepError, msg=service):
+                inspector.disk_files(service)
+            with self.assertRaises(e2e_h4.StepError, msg=service):
+                inspector.disk_contains(service, ["x"])
+            with self.assertRaises(e2e_h4.StepError, msg=service):
+                inspector.force_aof_rewrite(service)
+        self.assertEqual(engine.calls(), [], "no se ejecutó ningún comando")
+
+    def test_conversation_ids_of_an_organization(self) -> None:
+        engine = FakeEngine(self.root, psql=f"{UUID_B}\n{UUID_A}\n")
+        self.assertEqual(engine.inspector().conversation_ids("acme"), [UUID_A, UUID_B])
+        run = engine.calls("postgres")[0]
+        self.assertEqual(run[2:8], ["psql", "-U", "postgres", "-d", "baas_vault", "-Atc"])
+        for table in ("conversation_state", "vault_entries"):
+            self.assertIn(f"FROM {table} WHERE org_slug = 'acme'", run[8])
+
+    def test_conversation_ids_refuses_what_is_not_a_uuid(self) -> None:
+        engine = FakeEngine(self.root, psql="ERROR: nope\n")
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector().conversation_ids("acme")
+        self.assertIn("identificador", str(ctx.exception))
+
+    # --- parámetros de cada instancia ---
+    def test_redis_setting_reads_config_get_of_each_instance(self) -> None:
+        engine = FakeEngine(self.root)
+        inspector = engine.inspector()
+        self.assertEqual(inspector.redis_setting("redis", "appendonly"), "yes")
+        self.assertEqual(inspector.redis_setting("redis-ephemeral", "appendonly"), "no")
+        self.assertEqual(inspector.redis_setting("redis-ephemeral", "save"), "", 'save "" es una cadena vacía')
+        run = engine.calls("redis-ephemeral")[-1]
+        self.assertEqual(run[-4:], ["--raw", "CONFIG", "GET", "save"])
+        self.assertIn('REDISCLI_AUTH="$BAAS_REDIS_PASSWORD"', run[4])
+
+    def test_redis_setting_unknown_parameter_is_a_step_error(self) -> None:
+        engine = FakeEngine(self.root)
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector().redis_setting("redis", "inventado")
+        self.assertIn("inventado", str(ctx.exception))
+
+    # --- ficheros de /data ---
+    def test_disk_files_lists_every_file_below_data(self) -> None:
+        engine = FakeEngine(self.root)
+        self.assertEqual(engine.inspector().disk_files("redis-ephemeral"), [])
+        aof = engine.data["redis"] / "appendonlydir"
+        aof.mkdir()
+        (aof / "appendonly.aof.1.base.rdb").write_bytes(RDB_BASE)
+        (aof / "appendonly.aof.manifest").write_text("file appendonly.aof.1.base.rdb seq 1 type b\n")
+        (engine.data["redis"] / "dump.rdb").write_bytes(RDB_BASE)
+        self.assertEqual(
+            engine.inspector().disk_files("redis"),
+            ["/data/appendonlydir/appendonly.aof.1.base.rdb", "/data/appendonlydir/appendonly.aof.manifest",
+             "/data/dump.rdb"],
+        )  # fmt: skip
+        self.assertEqual(engine.calls("redis")[-1][2:], ["find", "/data", "-mindepth", "1", "!", "-type", "d"])
+
+    # --- buscar centinelas en el disco ---
+    def write_files(self, engine: FakeEngine, service: str = "redis") -> None:
+        aof = engine.data[service] / "appendonlydir"
+        aof.mkdir()
+        resp = f"*3\r\n$4\r\nHSET\r\n$9\r\n{DNI}\r\n$22\r\n{EMAIL}\r\n".encode()
+        (aof / "appendonly.aof.1.incr.aof").write_bytes(resp)
+        (aof / "appendonly.aof.1.base.rdb").write_bytes(RDB_BASE + IBAN.encode() + b"\x00\x01" + b"caso-abc")
+
+    def test_disk_contains_finds_each_sentinel_in_any_file(self) -> None:
+        engine = FakeEngine(self.root)
+        self.write_files(engine)
+        needles = [DNI, EMAIL, IBAN, "caso-abc", "caso-otra", "no-esta"]
+        self.assertEqual(engine.inspector().disk_contains("redis", needles), [DNI, EMAIL, IBAN, "caso-abc"])
+        self.assertEqual(engine.inspector().disk_contains("redis-ephemeral", needles), [])
+
+    def test_disk_contains_finds_the_json_escaped_forms(self) -> None:
+        engine = FakeEngine(self.root)
+        events = engine.data["redis"] / "appendonly.aof"
+        events.write_text(
+            '{"a": "ana.perez\\u0040privada.test", "b": "se\\u00f1or", "c": "x\\/y", "d": "\\u003cb\\u003e",'
+            ' "e": "dice \\"hola\\"", "f": "C:\\\\tmp"}'
+        )
+        needles = [EMAIL, "señor", "x/y", "<b>", 'dice "hola"', "C:\\tmp", "no-esta"]
+        found = engine.inspector().disk_contains("redis", needles)
+        self.assertEqual(found, needles[:-1])
+
+    def test_disk_contains_treats_hostile_sentinels_as_plain_text(self) -> None:
+        engine = FakeEngine(self.root)
+        hostile = ["-v", "--help", "a'b\"c", "$(touch /tmp/x)", "`id`", "a;b", "*", ".", "[a-z]+", "\\"]
+        (engine.data["redis"] / "datos.aof").write_text("a'b\"c y $(touch /tmp/x) y `id` y a;b")
+        found = engine.inspector().disk_contains("redis", hostile)
+        self.assertEqual(found, ["a'b\"c", "$(touch /tmp/x)", "`id`", "a;b"])
+        run = engine.calls("redis")[-1]
+        self.assertEqual(run[2:4], ["sh", "-c"])
+        for needle in hostile:
+            self.assertNotIn(needle, run[4], "los centinelas viajan como argumentos, no dentro del script")
+        self.assertEqual(len(run[7:]), len(hostile), "un patrón por centinela")
+        self.assertEqual(run[6], "/data", "el primer argumento es el directorio")
+        self.assertIn(e2e_h4.needle_pattern(hostile[2]), run[7:], "cada centinela viaja como un argumento")
+
+    def test_disk_contains_without_needles_or_with_unusable_ones(self) -> None:
+        engine = FakeEngine(self.root)
+        self.assertEqual(engine.inspector().disk_contains("redis", []), [])
+        self.assertEqual(engine.calls(), [])
+        for bad in ("", "uno\ndos", "nul\x00"):
+            with self.assertRaises(e2e_h4.StepError, msg=repr(bad)):
+                engine.inspector().disk_contains("redis", [DNI, bad])
+        self.assertEqual(engine.calls(), [], "se rechazan antes de ejecutar nada")
+
+    def test_disk_contains_cannot_read_a_missing_directory(self) -> None:
+        engine = FakeEngine(self.root)
+        engine.data["redis"].rmdir()
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector().disk_contains("redis", [DNI])
+        self.assertIn("/data", str(ctx.exception))
+
+    # --- reescritura del AOF ---
+    def test_force_aof_rewrite_waits_for_the_rewrite_to_finish(self) -> None:
+        engine = FakeEngine(self.root, info_polls={"redis": [1, 1, 1]})
+        engine.inspector(poll_interval=0.01).force_aof_rewrite("redis")
+        sent = [c[-1] for c in engine.calls("redis")]
+        self.assertEqual(sent[0], "BGREWRITEAOF")
+        self.assertEqual(sent.count("BGREWRITEAOF"), 1)
+        self.assertGreaterEqual(sent.count("persistence"), 4, "pregunta hasta que aof_rewrite_in_progress es 0")
+        self.assertEqual(sent[-1], "persistence")
+        self.assertEqual(engine.calls("redis-ephemeral"), [], "solo toca la instancia que se le pide")
+
+    def test_force_aof_rewrite_retries_when_one_is_already_running(self) -> None:
+        busy = "ERR Background append only file rewriting already in progress"
+        engine = FakeEngine(self.root, rewrite_replies={"redis": [busy, busy]}, info_polls={"redis": [1, 0]})
+        engine.inspector(poll_interval=0.01).force_aof_rewrite("redis")
+        sent = [c[-1] for c in engine.calls("redis")]
+        self.assertEqual(sent.count("BGREWRITEAOF"), 3, "reintenta hasta que la suya empieza")
+
+    def test_force_aof_rewrite_accepts_a_scheduled_rewrite(self) -> None:
+        engine = FakeEngine(self.root, rewrite_replies={"redis": ["Background append only file rewriting scheduled"]})
+        engine.inspector(poll_interval=0.01).force_aof_rewrite("redis")
+
+    def test_force_aof_rewrite_times_out(self) -> None:
+        engine = FakeEngine(self.root, info_polls={"redis": [1] * 1000})
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector(poll_interval=0.01, rewrite_timeout=0.2).force_aof_rewrite("redis")
+        self.assertIn("no terminó", str(ctx.exception))
+
+    def test_force_aof_rewrite_reports_a_failed_rewrite(self) -> None:
+        engine = FakeEngine(self.root, bgrewrite_status={"redis": "err"})
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector(poll_interval=0.01).force_aof_rewrite("redis")
+        self.assertIn("aof_last_bgrewrite_status", str(ctx.exception))
+
+    def test_force_aof_rewrite_refused_by_redis(self) -> None:
+        engine = FakeEngine(self.root, rewrite_replies={"redis": ["ERR unknown command"]})
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            engine.inspector(poll_interval=0.01).force_aof_rewrite("redis")
+        self.assertIn("BGREWRITEAOF", str(ctx.exception))
+
+    # --- la clave temporal del control positivo ---
+    def test_a_temporary_key_is_written_and_deleted_with_arguments(self) -> None:
+        engine = FakeEngine(self.root)
+        inspector = engine.inspector()
+        inspector.redis_set_temp("redis", "baas:e2e:control-abc", "valor con espacios; $(id)", ttl=120)
+        self.assertEqual(engine.state()["set"]["redis"], {"baas:e2e:control-abc": "valor con espacios; $(id)"})
+        run = engine.calls("redis")[-1]
+        self.assertEqual(run[-5:], ["SET", "baas:e2e:control-abc", "valor con espacios; $(id)", "EX", "120"])
+        self.assertNotIn("$(id)", run[4])
+        inspector.redis_delete("redis", "baas:e2e:control-abc")
+        self.assertEqual(engine.state()["set"]["redis"], {})
+        self.assertEqual(engine.calls("redis")[-1][-2:], ["DEL", "baas:e2e:control-abc"])
+
+    def test_temporary_keys_are_restricted_to_the_e2e_prefix(self) -> None:
+        engine = FakeEngine(self.root)
+        inspector = engine.inspector()
+        for key in ("baas:policy:global", "baas:e2e:", "baas:e2e:A", "baas:e2e:a b", "x", "baas:e2e:*"):
+            with self.assertRaises(e2e_h4.StepError, msg=key):
+                inspector.redis_set_temp("redis", key, "v", ttl=60)
+            with self.assertRaises(e2e_h4.StepError, msg=key):
+                inspector.redis_delete("redis", key)
+        for value, ttl in (("", 60), ("v", 0), ("v", 100000), ("a\x00b", 60)):
+            with self.assertRaises(e2e_h4.StepError, msg=(value, ttl)):
+                inspector.redis_set_temp("redis", "baas:e2e:ok", value, ttl=ttl)
+        self.assertEqual(engine.calls(), [])
+
+
+class MissingInspectorTest(unittest.TestCase):
+    def test_every_query_fails_saying_how_to_continue(self) -> None:
+        missing = e2e_h4.MissingInspector("no hay motor")
+        calls = {
+            "vault_rows": ("acme",), "conversation_ids": ("acme",), "redis_services": (),
+            "redis_keys": ("acme", []), "redis_setting": ("redis", "appendonly"), "disk_files": ("redis",),
+            "force_aof_rewrite": ("redis",), "disk_contains": ("redis", ["x"]),
+            "redis_set_temp": ("redis", "baas:e2e:x", "v", 60), "redis_delete": ("redis", "baas:e2e:x"),
+            "mcp_org_dirs": (), "mcp_quarantine": (),
+        }  # fmt: skip
+        for name, args in calls.items():
+            with self.assertRaises(e2e_h4.StepError, msg=name) as ctx:
+                getattr(missing, name)(*args)
+            self.assertIn("--inspect none", str(ctx.exception), name)
 
 
 # --- recorrido completo contra la pila simulada ------------------------------------------------------
