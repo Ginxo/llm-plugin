@@ -80,11 +80,22 @@ class Skipped:
     target: str | None = None
 
 
+@dataclass(frozen=True)
+class LinkInfo:
+    """Un enlace simbólico encontrado: `followed` (apunta dentro del árbol) o `skipped` (fuera o roto)."""
+
+    rel: str
+    target: str
+    action: str
+    reason: str | None = None
+
+
 @dataclass
 class ScanResult:
     root: Path
     files: list[LocalFile] = field(default_factory=list)
     skipped: list[Skipped] = field(default_factory=list)
+    links: list[LinkInfo] = field(default_factory=list)
     ignored: int = 0
 
 
@@ -139,10 +150,13 @@ def scan_tree(root: Path, *, excludes: list[str] | tuple[str, ...] = (), default
             if is_link:
                 if not os.path.exists(entry.path):
                     result.skipped.append(Skipped(rel, "symlink_broken", os.readlink(entry.path)))
+                    result.links.append(LinkInfo(rel, os.readlink(entry.path), "skipped", "symlink_broken"))
                     continue
                 if not _inside(target_real, str(real_root)):
                     result.skipped.append(Skipped(rel, "symlink_outside", target_real))
+                    result.links.append(LinkInfo(rel, target_real, "skipped", "symlink_outside"))
                     continue
+                result.links.append(LinkInfo(rel, os.path.relpath(target_real, real_root), "followed"))
             if is_dir:
                 # el recorrido sigue la ruta lógica (`rel`), no la del destino del enlace
                 walk(Path(entry.path), rel + "/", via_link or is_link, ancestors)
