@@ -79,7 +79,7 @@ CASES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # --- expresiones regulares propuestas para T4.2 -----------------------------------------------------
 
 
-SKILL_NAME = r"([a-z0-9][a-z0-9_-]*)"
+SKILL_NAME = r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})"  # la del contrato de la Fase 4, §7 (y la de la webapp)
 
 
 def slash_re(org: str) -> re.Pattern[str]:
@@ -125,6 +125,9 @@ def regex_self_test() -> list[str]:
         (slash_re("ginxo"), "- ginxo:informe: descripción del listado de skills", []),
         (slash_re("ginxo"), "/ginxo:informe sin envoltorio", []),
         (slash_re("mi-org"), "<command-name>/mi-org:a-b_c</command-name>", ["a-b_c"]),
+        (slash_re("ginxo"), "<command-name>/ginxo:Informe.v2</command-name>", ["Informe.v2"]),
+        (slash_re("ginxo"), "<command-name>/ginxo:" + "a" * 129 + "</command-name>", []),
+        (slash_re("ginxo"), "<command-name>/ginxo:-informe</command-name>", []),
         (tool_re("ginxo"), '[tool_use: Skill] {"skill":"ginxo:informe"}', ["informe"]),
         (tool_re("ginxo"), '[tool_use: Skill] {"args":"x","skill":"ginxo:informe"}', ["informe"]),
         (tool_re("ginxo"), '[tool_use: Skill] {"skill":"/ginxo:informe","args":"y"}', ["informe"]),
@@ -134,6 +137,7 @@ def regex_self_test() -> list[str]:
         (tool_re("ginxo"), '[tool_use: Skill] {"args":"\\"skill\\":\\"ginxo:x\\"","skill":"otro:y"}', []),
         (tool_re("ginxo"), '[tool_use: Bash] {"command":"echo \\"skill\\":\\"ginxo:x\\""}', []),
         (tool_re("ginxo"), "[tool_result] Launching skill: ginxo:informe", []),
+        (tool_re("ginxo"), '[tool_use: Skill] {"skill":"ginxo:Informe.v2"}', ["Informe.v2"]),
     ]
     return [f"{rx.pattern!r} sobre {text!r}: {rx.findall(text)} ≠ {want}" for rx, text, want in cases
             if rx.findall(text) != want]  # fmt: skip
@@ -206,6 +210,20 @@ class Spike:
         self.base_url = f"http://proxy.localhost:{args.app_port}/org/{args.org}/anthropic"
 
     def run_claude(self, prompt: str, extra: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
+        plugin_flags = [f for d in self.plugins for f in ("--plugin-dir", str(d))]
+        # Dentro del espacio de nombres se es root (unshare -r): Claude Code rechaza ahí
+        # --dangerously-skip-permissions, así que solo se permite la herramienta Skill.
+        return self.isolated(
+            ["-p", "--output-format", "json", "--allowedTools", "Skill", *plugin_flags, *extra, prompt]
+        )
+
+    def claude_version(self) -> str:
+        """`claude --version` con el mismo aislamiento que los casos (HOME temporal, sin red)."""
+        return self.isolated(["--version"]).stdout.strip()
+
+    def isolated(self, claude_args: list[str]) -> subprocess.CompletedProcess[str]:
+        """`claude <claude_args>` con `env -i` (HOME y configuración temporales, credencial ficticia) y en `unshare`
+        sin red (solo el puerto de la pila por el puente)."""
         env = {
             "HOME": str(self.home),
             "CLAUDE_CONFIG_DIR": str(self.config),
@@ -222,10 +240,7 @@ class Spike:
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
         }
-        plugin_flags = [f for d in self.plugins for f in ("--plugin-dir", str(d))]
         claude = shutil.which("claude") or "claude"
-        # Dentro del espacio de nombres se es root (unshare -r): Claude Code rechaza ahí
-        # --dangerously-skip-permissions, así que solo se permite la herramienta Skill.
         script = (
             'mount --bind "$3" /etc/hosts || exit 97\n'
             "ip link set lo up\n"
@@ -235,8 +250,7 @@ class Spike:
         )
         cmd = [
             "unshare", "-rnm", "sh", "-c", script, str(BRIDGE), str(self.args.app_port), str(self.sock),
-            str(self.work / "hosts"), sys.executable, claude, "-p", "--output-format", "json",
-            "--allowedTools", "Skill", *plugin_flags, *extra, prompt,
+            str(self.work / "hosts"), sys.executable, claude, *claude_args,
         ]  # fmt: skip
         return subprocess.run(["env", "-i", *(f"{k}={v}" for k, v in env.items()), *cmd], cwd=self.proj,
                               capture_output=True, text=True, timeout=240, stdin=subprocess.DEVNULL)  # fmt: skip
@@ -260,8 +274,10 @@ class Spike:
             if self.args.webapp_container:
                 podman("pause", self.args.webapp_container)
                 paused = True
-            version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
-            return {"claude_version": version, "cases": [self.case(*c) for c in CASES if c[0] in self.args.only]}
+            return {
+                "claude_version": self.claude_version(),
+                "cases": [self.case(*c) for c in CASES if c[0] in self.args.only],
+            }
         finally:
             if paused:
                 podman("unpause", self.args.webapp_container)
