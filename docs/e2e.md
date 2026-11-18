@@ -302,9 +302,10 @@ webapp (`?q=<ejecución>`).
 | 7.2 | Lo mismo con **AI-IP apagado** (`demo`): el texto enviado es el original y el PLATFORM_ADMIN tampoco lo ve (el turno no tiene `verification`) |
 | 7.3 | **WebSocket** `/api/v1/ws/traces?org=observacion` (cliente mínimo con la biblioteca estándar, con la cookie y `Origin`) como PLATFORM_ADMIN y como dueño durante un turno nuevo: el PLATFORM_ADMIN recibe tramas de esa conversación y ninguna lleva valores, etiqueta, eco ni contenido en los turnos; se anota si el dueño sí recibió el contenido (control positivo) |
 | 8.1 | Permisos y validaciones del interruptor (`PUT /api/v1/orgs/observacion/anonymizer`): sin motivo y con un motivo de 2 caracteres → `422 REASON_REQUIRED`; `observador@observacion.test` (USER) → `403`; `orgadmin@demo.test` (ORG_ADMIN de otra) → `404`; en `demo` (AI-IP apagado) → `409 AI_IP_DISABLED`; ninguna de ellas cambia el valor |
-| 8.2–8.8 | **El interruptor en los dos sentidos**, por API (sin *streaming*; Responses con `previous_response_id`): la conversación **A** empieza con el anonimizador apagado → `admin@baas.test` lo **enciende** (con `propagated`) → **B**, nueva, sale tokenizada (solo `[[DNI_001]]`, `[[EMAIL_001]]` e `[[IBAN_001]]` hasta el proveedor y valores restaurados para el cliente) y **A**, con historial, **sigue en claro** → lo **apaga** → **B sigue tokenizada** y restaurada y **C**, nueva, sale en claro |
-| 8.9 | En la webapp: A y C con el anonimizador ✘ y `WARNING`; B con ✔ y `CLEAN` |
-| 8.10 | El interruptor vuelve a su valor inicial (apagado), también si algún paso falló |
+| 8.2–8.8 | **El interruptor en los dos sentidos**, por API (sin *streaming*; Responses con `previous_response_id`): la conversación **A** empieza con el anonimizador apagado → `admin@baas.test` lo **enciende** (con `propagated`) → **B**, nueva, sale tokenizada (solo `[[DNI_001]]`, `[[EMAIL_001]]` e `[[IBAN_001]]` hasta el proveedor y valores restaurados para el cliente) y **A**, con historial, **sube a anonimizada en su siguiente turno** (trinquete, H4-08: el proveedor ya no recibe ningún valor, tampoco los del historial) → lo **apaga** → **B sigue tokenizada** y restaurada, **C**, nueva, sale en claro y **A no baja** (8.9: con el historial completo sigue tokenizada) |
+| 8.10 | En la webapp: A con el anonimizador ✘ al empezar, `WARNING` (su turno 1) y `protected_from_turn` = 2; C con ✘ y `WARNING`, sin `protected_from_turn`; B con ✔ y `CLEAN` |
+| 8.11 | El PLATFORM_ADMIN ve **por turno** la conversación A (H4-08): el turno 1 (salió en claro) sin contenido ni valores (`content_available: false`) y los siguientes (salieron anonimizados) con `content_available: true`, solo con tokens, sin `request_original`, sin valores y sin poder revelarlos |
+| 8.12 | El interruptor vuelve a su valor inicial (apagado), también si algún paso falló |
 | 9.1 | Como PLATFORM_ADMIN: crear `e2e-<ejecución>`, invitar a `orgadmin@demo.test` como ORG_ADMIN, activar AI-IP; un turno con valores (el anonimizador está encendido por defecto) y un documento escrito por el MCP (`baas_write_document`), para que haya vault y directorio |
 | 9.1b | Con el motor de contenedores: el vault tiene filas de esa organización antes de eliminarla (si no, «vacío» después no probaría nada) |
 | 9.2 | Condiciones: sin bloquear → `409 ORG_NOT_BLOCKED`; su ORG_ADMIN → `403`; la organización meta (`baas-ai-ip`, sin bloquear) → `403 ORG_PROTECTED`; sin motivo → `422 REASON_REQUIRED`; la organización sigue existiendo |
@@ -384,9 +385,13 @@ motivo; `test_every_fault_is_detected` falla si se añade un fallo sin su caso.
 | Fallo (`--fault`) | Paso que falla |
 | :--- | :--- |
 | `observe-rewrites` (el proxy altera el cuerpo con el anonimizador apagado) · `observe-anonymizes` (sustituye igualmente) | 5 |
-| `observe-clean` (el turno en observación sale `CLEAN` sin coincidencias) | 6 y 8.9 |
-| `no-cause` (la webapp no dice con qué anonimizador empezó la conversación) | 6 y 8.9 |
-| `state-follows-switch` (una conversación abierta adopta el valor actual del interruptor, en los dos sentidos) | 8.5 y 8.7 |
+| `observe-clean` (el turno en observación sale `CLEAN` sin coincidencias) | 6 y 8.10 |
+| `no-cause` (la webapp no dice con qué anonimizador empezó la conversación) | 6 y 8.10 |
+| `state-follows-switch` (una conversación abierta adopta el valor actual del interruptor, en los dos sentidos) | 8.7 y 8.9 |
+| `no-ratchet` (una conversación abierta en claro no sube al encender el anonimizador: el comportamiento de antes de H4-08) | 8.5 |
+| `ratchet-lowers` (apagar el anonimizador baja una conversación que ya estaba anonimizada) | 8.9 |
+| `no-protected-from` (la webapp no informa de `protected_from_turn`) | 8.10 |
+| `admin-sees-pre-raise` (el PLATFORM_ADMIN ve el texto de los turnos que salieron en claro) · `admin-hides-raised` (no ve los que ya salieron anonimizados) | 8.11 |
 | `toggle-no-propagation` (el proxy no se entera del cambio) | 8.4 |
 | `admin-sees-content-api` (el PLATFORM_ADMIN recibe el texto en turnos, lista y WebSocket) · `admin-sees-bypass` (también con AI-IP apagado) | 7.1, 7.2 y 7.3 · 7.2 |
 | `admin-detail-leak` (el detalle trae texto) · `admin-reveal` (puede revelar) · `ws-leak` · `ws-silent` | 7.1 · 7.1 · 7.3 · 7.3 |
@@ -418,9 +423,9 @@ confirmarlos al integrar:
 
 - **Webapp**: `PUT /api/v1/orgs/{slug}/anonymizer` y `POST …/delete` responden como `PUT …/ai-ip` (`organization` y
   `propagated`; se acepta también la organización en la raíz); la organización (`GET /api/v1/orgs/{slug}`) y la
-  conversación (lista y detalle) traen `anonymizer_enabled` (se acepta también `anonymizer_enabled_at_start`); la
-  conversación y el turno traen `content_available`, falso para el PLATFORM_ADMIN en una organización ajena cuando AI-IP o
-  el anonimizador estaban apagados; `GET /api/v1/audit?action=org.deleted` lista la entrada con el slug y el motivo en
+  conversación (lista y detalle) traen `anonymizer_enabled` (se acepta también `anonymizer_enabled_at_start`) y, desde
+  H4-08, `protected_from_turn`; la conversación y el turno traen `content_available`, falso para el PLATFORM_ADMIN en una
+  organización ajena en los turnos que salieron con AI-IP o el anonimizador apagados (por turno desde H4-08); `GET /api/v1/audit?action=org.deleted` lista la entrada con el slug y el motivo en
   cualquier campo; `POST /api/v1/orgs/{slug}/members` con un usuario existente lo añade sin pasos más; el WebSocket
   `/api/v1/ws/traces?org=<slug>` envía primero `{"type": "hello"}` y después mensajes `turn.completed` con la
   conversación y el turno ya filtrados por espectador. Las comprobaciones de la eliminación siguen el orden de la

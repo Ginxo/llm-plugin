@@ -571,14 +571,25 @@ class FullRunTest(unittest.TestCase):
             code, steps, out = run_e2e(stack)
             initial = stack.state.orgs["observacion"].anonymizer
             leftovers = sorted(stack.state.orgs)
+            raised = {
+                c.api: (c.protected_from_turn, [(t["ai_ip"], t["anonymizer"]) for t in c.turns])
+                for c in stack.state.convs.values()
+                if c.model.startswith("e2e-h4-") and "-ia-" in c.model
+            }
         self.assert_all_ok(code, steps, out)
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 6)
         once = ["0.", "1.", "2.", "2b.", "3.", "4.", "6.", "7.1", "7.2", "7.3", "8.1 ", "8.2", "8.3", "8.4", "8.5"]
-        once += ["8.6", "8.7", "8.8", "8.9", "8.10", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5", "9.6", "9.7", "9.8"]
+        once += ["8.6", "8.7", "8.8", "8.9", "8.10", "8.11", "8.12", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5"]
+        once += ["9.6", "9.7", "9.8"]
         once += ["11.1 ", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7", "11.8", "11.9", "11.10", "11.11", "11.12 "]
         once += ["11.12b", "11.13", "11.14"]
         for prefix in once:
             self.assertEqual(len([n for n in steps if n.startswith(prefix)]), 1, prefix)
+        self.assertEqual(
+            raised,
+            {api: (2, [(True, False), (True, True), (True, True)]) for api in ("messages", "chat", "responses")},
+            "A empieza en observación, sube en el turno 2 y no baja al apagar el anonimizador",
+        )
         self.assertFalse(initial, "el interruptor debe quedar apagado, como al empezar")
         self.assertEqual(leftovers, ["baas-ai-ip", "demo", "observacion"], "la organización de la prueba se eliminó")
         self.assertIn("RESULTADO: todo OK", out)
@@ -676,9 +687,14 @@ class FaultsTest(unittest.TestCase):
         "observe-rewrites": {"5.": ("no es idéntico", "baas_e2e")},
         "observe-anonymizes": {"5.": ("no recibió en claro", "recibió tokens")},
         "observe-clean": {"6.": ("CLEAN",)},
-        "state-follows-switch": {"8.5": ("no recibió en claro",), "8.7": ("recibió en claro",)},
+        "state-follows-switch": {"8.7": ("recibió en claro",), "8.9": ("recibió en claro",)},
+        "no-ratchet": {"8.5": ("recibió en claro",)},
+        "ratchet-lowers": {"8.9": ("recibió en claro",)},
+        "no-protected-from": {"8.10": ("protected_from_turn",)},
+        "admin-sees-pre-raise": {"8.11": ("turno 1", "content_available")},
+        "admin-hides-raised": {"8.11": ("turno 2", "content_available")},
         "toggle-no-propagation": {"8.4": ("no recibió [[DNI_001]]",)},
-        "no-cause": {"6.": ("la causa no consta",), "8.9": ("anonymizer_enabled = None",)},
+        "no-cause": {"6.": ("la causa no consta",), "8.10": ("anonymizer_enabled = None",)},
         "admin-sees-content-api": {
             "7.1": ("content_available",),
             "7.2": ("content_available",),
@@ -753,8 +769,8 @@ class FaultsTest(unittest.TestCase):
                             self.assertIn(fragment, step["detail"], f"{fault}: {name}")
 
     def test_faults_do_not_break_unrelated_steps(self) -> None:
-        # ws-silent solo afecta al WebSocket; observe-clean a 6 y 8.9; audit-missing solo a 9.7
-        cases = (("ws-silent", {"7.3"}), ("observe-clean", {"6.", "8.9"}), ("audit-missing", {"9.7"}))
+        # ws-silent solo afecta al WebSocket; observe-clean a 6 y 8.10; audit-missing solo a 9.7
+        cases = (("ws-silent", {"7.3"}), ("observe-clean", {"6.", "8.10"}), ("audit-missing", {"9.7"}))
         for fault, failing in cases:
             steps = self.run_fault(fault)
             failed = {n for n, s in steps.items() if s["status"] == "FALLO"}
