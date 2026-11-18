@@ -572,3 +572,21 @@ def test_a_file_name_that_is_not_utf8_is_refused_before_calling_the_server(brain
     with pytest.raises(ConfigError, match="UTF-8"):
         publish.run_publish(DirectClient(store), opts(brain))
     assert writes(store) == []
+
+
+def test_knowledge_roles_can_be_the_wildcard(brain: Brain, store: FakeStore) -> None:
+    publish.run_publish(
+        DirectClient(store),
+        opts(brain, knowledge=[(brain.knowledge / "templates", "fiscal/templates")], knowledge_roles=["*"]),
+    )
+    assert yaml.safe_load(store.files["knowledge/fiscal/templates/_acl.yaml"].decode()) == {"roles": ["*"]}
+
+
+def test_unknown_knowledge_roles_are_reported_by_the_server(brain: Brain, store: FakeStore) -> None:
+    with pytest.raises(McpToolError) as exc:
+        publish.run_publish(
+            DirectClient(store),
+            opts(brain, knowledge=[(brain.knowledge / "templates", "fiscal/templates")], knowledge_roles=["fantasma"]),
+        )
+    assert "fantasma" in publish.describe_tool_error(exc.value)
+    assert store.files == {}

@@ -203,8 +203,13 @@ def run_export(client: Any, opts: ExportOptions) -> ExportResult:
     declared = pkg.get("package_sha256")
     ok: bool | None = None
     if declared:
-        full = {f"skills/{opts.skill}/{r}": h for r, h in hashes.items()}
-        ok = declared in (package_sha256(hashes), package_sha256(full))
+        # el contrato cuenta las rutas completas `skills/<skill>/…` y deja fuera los `_acl.yaml`: se prueban variantes
+        variants = []
+        for keep_acl in (False, True):
+            chosen = {r: h for r, h in hashes.items() if keep_acl or r.rsplit("/", 1)[-1] != "_acl.yaml"}
+            variants.append(package_sha256({f"skills/{opts.skill}/{r}": h for r, h in chosen.items()}))
+            variants.append(package_sha256(chosen))
+        ok = declared in variants
     return ExportResult(opts.skill, dest, exported, declared, ok, replaced)
 
 

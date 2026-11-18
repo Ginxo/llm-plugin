@@ -7,8 +7,8 @@ del contrato. No depende de `dev/fake_baas.py`. Dos formas de usarlo:
 - `DirectClient(store)`: sin red; tiene el mismo `call_tool` que `McpClient`.
 - `FakePublishServer(store)`: un servidor HTTP (Streamable HTTP mínimo) en un puerto efímero.
 
-`path_style` decide cómo devuelve `files[].path` el manifiesto del paquete: `relative` (relativa a la skill) o
-`store` (`skills/<skill>/…`). El contrato no lo fija, así que el cliente debe aguantar las dos.
+`path_style` decide cómo devuelve `files[].path` el manifiesto del paquete: `store` (`skills/<skill>/…`, lo que fija
+el contrato) o `relative` (relativa a la skill). El cliente debe aguantar las dos.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class FakeStore:
         org_roles: tuple[str, ...] = ("facturacion", "analista", "revisor"),
         admin: bool = True,
         user_roles: tuple[str, ...] = (),
-        path_style: str = "relative",
+        path_style: str = "store",
         large_file_bytes: int = 25 * MiB,
         large_package_bytes: int = 100 * MiB,
         list_page: int | None = None,
@@ -301,6 +301,19 @@ class FakeStore:
         nxt = str(start + limit) if start + limit < len(visible) else None
         return {"files": page, "next_cursor": nxt}
 
+    def _role_failures(self, path: str, roles: Any) -> list[dict[str, Any]]:
+        """`*` (solo) o roles existentes; vale igual en `baas.yaml`, `_acl.yaml` y cabeceras (contrato §7.4)."""
+        if roles is None or roles == ["*"]:
+            return []
+        if not isinstance(roles, list) or "*" in roles:
+            return [{"path": path, "field": "roles", "code": "roles.invalid", "message": f"Roles no válidos: {roles}"}]
+        unknown = sorted(set(roles) - self.org_roles)
+        if unknown:
+            return [
+                {"path": path, "field": "roles", "code": "roles.unknown", "message": f"Roles inexistentes: {unknown}"}
+            ]
+        return []
+
     def _tool_baas_write_files(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self.admin:
             raise McpToolError(
@@ -364,35 +377,18 @@ class FakeStore:
                         raise ValueError("version")
                 except Exception:
                     failures.append(
-                        {"path": path, "field": "baas.yaml", "code": "yaml.invalid", "message": "baas.yaml no válido"}
+                        {
+                            "path": path,
+                            "field": "baas.yaml",
+                            "code": "manifest.invalid",
+                            "message": "baas.yaml no válido",
+                        }
                     )
                     continue
-                roles = manifest.get("roles")
-                if (
-                    roles is not None
-                    and roles != ["*"]
-                    and (not isinstance(roles, list) or set(roles) - self.org_roles or "*" in roles)
-                ):
-                    failures.append(
-                        {
-                            "path": path,
-                            "field": "roles",
-                            "code": "roles.unknown",
-                            "message": f"Roles inexistentes: {roles}",
-                        }
-                    )
+                failures.extend(self._role_failures(path, manifest.get("roles")))
             if path.endswith("/_acl.yaml"):
                 acl = yaml.safe_load(data.decode()) or {}
-                bad_roles = set(acl.get("roles") or []) - self.org_roles
-                if bad_roles:
-                    failures.append(
-                        {
-                            "path": path,
-                            "field": "roles",
-                            "code": "roles.unknown",
-                            "message": f"Roles inexistentes: {sorted(bad_roles)}",
-                        }
-                    )
+                failures.extend(self._role_failures(path, acl.get("roles")))
         if failures:
             raise McpToolError(
                 "INVALID_ARGUMENT",
