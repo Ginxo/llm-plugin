@@ -86,13 +86,13 @@ class Collected:
     skipped: list[dict[str, Any]] = field(default_factory=list)
     symlinks: list[dict[str, Any]] = field(default_factory=list)
     ignored: int = 0
-    knowledge_roots: list[Path] = field(default_factory=list)
+    knowledge_roots: list[tuple[Path, str | None]] = field(default_factory=list)
 
 
 def _collect(
     skill: Path,
     scripts: list[Path],
-    knowledge: list[Path],
+    knowledge: list[tuple[Path, str | None]],
     excludes: list[str],
     default_excludes: bool,
 ) -> Collected:
@@ -128,9 +128,9 @@ def _collect(
     add("skill", skill, "")
     for s in scripts:
         add("scripts", s, "scripts/")
-    for k in knowledge:
-        add("knowledge", k, "knowledge/")
-        out.knowledge_roots.append(Path(k).resolve())
+    for k, kprefix in knowledge:
+        add("knowledge", k, "knowledge/" if not kprefix else f"knowledge/{kprefix}/")
+        out.knowledge_roots.append((Path(k).resolve(), kprefix))
     for item in out.items:
         _load(item)
     return out
@@ -140,13 +140,22 @@ def _stdlib(top: str) -> bool:
     return top in _STDLIB or top == "__future__"
 
 
-def _locate_knowledge(ref: str, roots: list[Path]) -> bool:
+def _locate_knowledge(ref: str, roots: list[tuple[Path, str | None]]) -> bool:
     """¿Existe `knowledge/<x>` en alguna de las carpetas de conocimiento indicadas?"""
     parts = [p for p in ref.split("/") if p][1:]  # sin el `knowledge/` inicial
     if not parts or any(c in ref for c in "<>{}*%"):
         return False
-    for root in roots:
-        if (root.joinpath(*parts)).exists():
+    for root, prefix in roots:
+        if prefix is not None:  # se sabe bajo qué prefijo se publicará
+            pre = [p for p in prefix.split("/") if p]
+            if parts[: len(pre)] == pre:
+                rest = parts[len(pre) :]
+                if (root.joinpath(*rest) if rest else root).exists() and (rest or root.is_dir()):
+                    return True
+                if root.is_file() and rest == [root.name]:
+                    return True
+            continue
+        if root.joinpath(*parts).exists():
             return True
         for k in range(1, len(parts)):  # la carpeta indicada ya es `knowledge/<parts[:k]>`
             if tuple(root.parts[-k:]) == tuple(parts[:k]) and root.joinpath(*parts[k:]).exists():
@@ -154,25 +163,38 @@ def _locate_knowledge(ref: str, roots: list[Path]) -> bool:
     return False
 
 
+def _norm_knowledge(items: Any) -> list[tuple[Path, str | None]]:
+    """`Path` o `(Path, prefijo)` → `(Path, prefijo | None)`."""
+    out: list[tuple[Path, str | None]] = []
+    for item in items:
+        if isinstance(item, tuple):
+            out.append((Path(item[0]), item[1]))
+        else:
+            out.append((Path(item), None))
+    return out
+
+
 def inspect_skill(
     skill_dir: str | Path,
     *,
     scripts: list[Path] | tuple[Path, ...] = (),
-    knowledge: list[Path] | tuple[Path, ...] = (),
+    knowledge: list[Any] | tuple[Any, ...] = (),
     excludes: list[str] | tuple[str, ...] = (),
     default_excludes: bool = True,
 ) -> dict[str, Any]:
+    """`knowledge`: carpetas de conocimiento, o `(carpeta, prefijo)` si ya se sabe bajo qué prefijo se publicarán."""
     skill = Path(skill_dir).resolve()
+    kn = _norm_knowledge(knowledge)
     if not (skill / "SKILL.md").is_file():
         raise ConfigError(
             f"«{skill_dir}» no es una skill: no contiene SKILL.md.",
             hint="Indica la carpeta de la skill; los scripts y el conocimiento van en --scripts y --knowledge.",
         )
-    for label, paths in (("--scripts", scripts), ("--knowledge", knowledge)):
+    for label, paths in (("--scripts", scripts), ("--knowledge", [k for k, _ in kn])):
         for p in paths:
             if not Path(p).exists():
                 raise ConfigError(f"{label}: «{p}» no existe.")
-    col = _collect(skill, [Path(p) for p in scripts], [Path(p) for p in knowledge], list(excludes), default_excludes)
+    col = _collect(skill, [Path(p) for p in scripts], kn, list(excludes), default_excludes)
     items = col.items
     by_disp: dict[str, list[Item]] = {}
     for it in items:

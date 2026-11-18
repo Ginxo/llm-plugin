@@ -308,7 +308,7 @@ def build_plan(client: Any, opts: PublishOptions) -> Plan:
     rep = skill_inspect.inspect_skill(
         skill_dir,
         scripts=list(opts.scripts),
-        knowledge=[p for p, _ in opts.knowledge],
+        knowledge=[(p, normalize_prefix(pre)) for p, pre in opts.knowledge],
         excludes=opts.excludes,
         default_excludes=opts.default_excludes,
     )
@@ -606,8 +606,6 @@ def render_plan(result: PublishResult) -> str:
         out.append("  (nada)")
     for path in plan.delete:
         out.append(f"  - {path}  (se retira; la versión anterior se conserva)")
-    if plan.omitted:
-        out.append("No se suben: " + ", ".join(f"{o['path']} ({o['reason']})" for o in plan.omitted))
     warnings = list(plan.warnings)
     for w in result.server.get("warnings") or []:
         where_w = f" ({w['path']})" if w.get("path") else ""

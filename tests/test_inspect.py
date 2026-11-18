@@ -440,3 +440,12 @@ def test_cli_rejects_a_directory_without_skill_md(tmp_path: Path, capsys: pytest
 def test_inspect_does_not_read_beyond_the_tree(brain: Brain) -> None:
     rep = skill_inspect.inspect_skill(brain.skill, scripts=[brain.scripts], knowledge=[brain.knowledge])
     assert "no debe subirse" not in json.dumps(rep)
+
+
+def test_knowledge_with_a_known_prefix_is_shown_under_its_store_path(brain: Brain) -> None:
+    rep = skill_inspect.inspect_skill(brain.skill, scripts=[brain.scripts], knowledge=[(brain.knowledge, "fiscal")])
+    assert "knowledge/fiscal/ledger-facturas.json" in {f["path"] for f in rep["files"]}
+    targets = {k["target"]: k for k in rep["links"]["knowledge"]}
+    assert targets["knowledge/fiscal/ledger-facturas.json"]["exists_locally"] is True
+    assert targets["knowledge/fiscal/templates/factura-pro.typ"]["exists_locally"] is True
+    assert any(i["file"] == "knowledge/fiscal/perfil-fiscal-y-regimen.md" for i in rep["sensitive"]["items"])
