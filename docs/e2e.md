@@ -582,3 +582,19 @@ en el servidor real (tramo 2).
 | `dev/measure_frozen_redis.py salida.json` | Redis **congelado** (`podman pause` del contenedor `h4-int_redis_1`, constante `REDIS`): línea base, al congelar, a los 4 min 30 s (dentro de la ventana de 5 min), a los 5 min 30 s y tras reanudar, con el proxy en bypass y con AI-IP, el MCP y el login. Lo reanuda siempre, también si falla | ~6 min |
 
 Los textos de prueba no llevan dígitos seguidos: las reglas de AI-IP los toman por teléfonos y los sustituyen.
+
+### Transparencia del proxy y la instancia efímera de Redis (H4-02)
+
+Dos scripts más comprueban lo que nota un cliente de Claude Code (criterio rector de H4-02: el proxy debe ser lo más
+transparente posible). Usan las opciones de `e2e_h4.py` para las URLs y el proyecto (`--app-url`, `--compose-project`…),
+la semilla de desarrollo (`analista@privada.test` en `privada`, con AI-IP y anonimizador; `analista@demo.test` en `demo`,
+en bypass) y solo la biblioteca estándar. Resultados y método: `knowledge/01-producto/fases/fase-1-h4-mediciones.md` §2.5.
+
+| Script | Qué mide |
+| :--- | :--- |
+| `dev/measure_latency.py --n 300 --label X` | Latencia de extremo a extremo (Caddy → proxy → proveedor falso) con una conexión persistente: conversación nueva con AI-IP, conversación larga con historial (hasta 60 turnos) y bypass; p50, p95, p99 y máximo. Se ejecuta con la pila anterior y con la nueva, en calma, y se comparan (3 tandas cada una) |
+| `dev/measure_ephemeral_outage.py --mode stop\|pause\|none` | Peticiones continuas mientras se **para** (`stop`/`start`), **congela** (`pause`/`unpause`) o no se toca (`none`, el control) el contenedor `<proyecto>_redis-ephemeral_1`. Imprime antes, durante y después: p50, p95, máximo, peticiones de más de 100 ms y errores; la petición más lenta durante el fallo; y cuántas conversaciones de la prueba llegan a la webapp al recuperarse. Sale con 1 si hay errores o se pierden trazas. Si algo falla a mitad, deja la efímera arrancada |
+
+La mediana sube igual con y sin fallo (la conversación larga acumula historial): compara siempre con `--mode none`. En
+una ejecución, la primera petición tras el fallo puede tardar ~100 ms (el tiempo de espera de la copia caliente) y las
+siguientes, nada: la sonda de fondo del proxy y el disyuntor propio de la efímera hacen el resto.
