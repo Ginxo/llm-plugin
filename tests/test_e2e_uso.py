@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev"))
@@ -354,6 +355,21 @@ for needle, (out, err, rc) in replies.items():
         self.assertEqual(runs[1], ["unpause", "cid-mcp-server"])
         self.assertEqual(runs[2], ["logs", "--since", "2026-11-18T22:00:00Z", "cid-mcp-server"])
 
+    def test_starting_a_service_waits_longer_than_a_query(self) -> None:
+        """`podman start webapp-api` vuelve a ejecutar la migración y la semilla: 60 s no bastan."""
+        seen: list[float] = []
+        real = e2e_h4.subprocess.run
+
+        def spy(*args: object, **kwargs: object) -> object:
+            seen.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+            return real(*args, **kwargs)  # type: ignore[call-overload]
+
+        with mock.patch.object(e2e_h4.subprocess, "run", side_effect=spy):
+            self.inspector.service_control("webapp-api", "start")
+        self.assertEqual(seen[-1], e2e_h4.SERVICE_TIMEOUT)
+        self.assertGreaterEqual(e2e_h4.SERVICE_TIMEOUT, 180)
+        self.assertEqual(seen[0], 60, "las consultas siguen con 60 s")
+
     def test_mcp_files(self) -> None:
         self.reply(find=("f\t73\tskills/a/SKILL.md\nf\t49152\tindex.sqlite\nl\t9\tskills/b\n", "", 0))
         self.assertEqual(self.inspector.mcp_files("uso-abc-dk"), [("skills/a/SKILL.md", 73), ("index.sqlite", 49152)])
@@ -370,13 +386,93 @@ for needle, (out, err, rc) in replies.items():
                 getattr(missing, name)("x")
 
 
+class FollowUpTest(unittest.TestCase):
+    """El segundo turno de una conversación tal como lo envía Claude Code (12.2): el historial con la respuesta del
+    modelo tal cual (para que el proxy lo correlacione) y el bloque nuevo del usuario."""
+
+    def test_after_a_skill_tool_use_comes_its_tool_result(self) -> None:
+        first = [{"type": "text", "text": "usa la herramienta skill a:informes"}]
+        block = {"type": "tool_use", "id": "toolu_1", "name": "Skill", "input": {"skill": "a:informes"}}
+        body = json.dumps({"content": [block], "stop_reason": "tool_use"}).encode()
+        messages = e2e_uso.follow_up(first, body, e2e_uso.tool_result_for(body, "Launching skill: a:informes"))
+        self.assertEqual(messages[0], {"role": "user", "content": first})
+        self.assertEqual(messages[1], {"role": "assistant", "content": [block]}, "la respuesta, sin tocar")
+        self.assertEqual(
+            messages[2],
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                          "content": "Launching skill: a:informes"}]},
+        )  # fmt: skip
+
+    def test_after_a_text_reply_comes_a_new_question(self) -> None:
+        body = json.dumps({"content": [{"type": "text", "text": "Eco: hola"}]}).encode()
+        messages = e2e_uso.follow_up("hola", body, "segunda pregunta")
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
+        self.assertEqual(messages[2]["content"], "segunda pregunta")
+
+    def test_a_reply_without_content_or_tool_use_is_an_error(self) -> None:
+        with self.assertRaises(e2e_h4.StepError):
+            e2e_uso.follow_up("hola", b"no es json", "x")
+        with self.assertRaises(e2e_h4.StepError):
+            e2e_uso.tool_result_for(json.dumps({"content": [{"type": "text", "text": "x"}]}).encode(), "y")
+
+
+class SpikeRegexTest(unittest.TestCase):
+    """Las expresiones del spike T0 son las del contrato §7 (con las que cuenta la webapp)."""
+
+    def test_skill_name_is_the_contract_one(self) -> None:
+        import spike_f4_skill_invocation as spike
+
+        self.assertEqual(spike.SKILL_NAME, r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})")
+        self.assertEqual(spike.regex_self_test(), [])
+        text = "<command-name>/ginxo:Informe.v2</command-name>"
+        self.assertEqual(spike.slash_re("ginxo").findall(text), ["Informe.v2"])
+        self.assertEqual(spike.slash_re("ginxo").findall("<command-name>/ginxo:" + "a" * 129 + "</command-name>"), [])
+
+
+class RestartTest(unittest.TestCase):
+    """12.7: lo que se paró se vuelve a arrancar aunque algo falle, y se espera antes de eliminar la organización."""
+
+    class Inspector:
+        def __init__(self, fail: set[str]) -> None:
+            self.fail, self.calls = fail, []
+
+        def service_control(self, service: str, action: str) -> None:
+            self.calls.append((service, action))
+            if service in self.fail:
+                raise e2e_h4.StepError(f"{service} no arranca")
+
+    def group(self, fail: set[str]) -> tuple[e2e_uso.UsoGroup, list[str]]:
+        e2e = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), inspector=self.Inspector(fail))  # type: ignore[arg-type]
+        group = e2e_uso.UsoGroup(e2e)
+        waited: list[str] = []
+        group.wait_webapp = lambda: waited.append("webapp")  # type: ignore[method-assign]
+        group.wait_mcp = lambda org: waited.append("mcp")  # type: ignore[method-assign]
+        return group, waited
+
+    def test_each_service_is_started_even_if_the_other_fails(self) -> None:
+        group, waited = self.group({"mcp-server"})
+        org = e2e_uso.UsoOrg("uso-x-pr", ORG_ID, ZoneInfo("Europe/Madrid"))
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            group.restart(org, ["webapp-api", "mcp-server"], failed=False)
+        self.assertIn("mcp-server", str(ctx.exception))
+        calls = group.inspector().calls
+        self.assertEqual(calls, [("mcp-server", "start"), ("webapp-api", "start")])
+        self.assertEqual(waited, ["webapp", "mcp"], "espera a los dos antes de volver")
+
+    def test_a_failed_step_keeps_its_own_error(self) -> None:
+        group, waited = self.group({"webapp-api"})
+        org = e2e_uso.UsoOrg("uso-x-pr", ORG_ID, ZoneInfo("Europe/Madrid"))
+        group.restart(org, ["webapp-api"], failed=True)  # no lanza: el error del paso es el que cuenta
+        self.assertEqual(waited, ["webapp"])
+
+
 class GroupTest(unittest.TestCase):
     def test_uso_is_a_group_and_runs_alone(self) -> None:
         self.assertIn("uso", e2e_h4.GROUPS)
         self.assertEqual(e2e_h4.parse_args(["--only", "uso"]).only, ["uso"])
         ns = e2e_h4.parse_args([])
         self.assertIn("uso", ns.only)
-        self.assertEqual((ns.usage_timeout, ns.overhead_n), (90.0, 200))
+        self.assertEqual((ns.usage_timeout, ns.overhead_n, ns.usage_window), (90.0, 200, 5.0))
 
     def test_steps_are_registered_in_order(self) -> None:
         ns = e2e_h4.parse_args(["--only", "uso", "--inspect", "none"])

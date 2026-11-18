@@ -537,6 +537,8 @@ USAGE_STREAMS = {PERSISTENT: ("baas:usage",), EPHEMERAL: ("baas:traces",)}
 USAGE_KEYS = ("baas:usage",)  # EXISTS en cualquiera de las dos instancias
 CONTROLLED_SERVICES = ("webapp-api", "mcp-server")
 SERVICE_ACTIONS = ("stop", "start", "pause", "unpause")
+# `podman start webapp-api` vuelve a ejecutar la migración y la semilla (dependencias de compose ya terminadas)
+SERVICE_TIMEOUT = 180.0
 _TAG = re.compile(r"^[a-z0-9-]{1,26}$")
 _EVENT_ID = re.compile(r"^[0-9A-Z]{1,26}$")
 _ENTRY = re.compile(r"^[0-9]+-[0-9]+$")
@@ -585,9 +587,9 @@ class ContainerInspector:
         ids = out.split()
         return ids[0] if ids else None
 
-    def _run(self, argv: Sequence[str], *, check_rc: bool = True, merge: bool = False) -> str:
+    def _run(self, argv: Sequence[str], *, check_rc: bool = True, merge: bool = False, timeout: float = 60) -> str:
         try:
-            done = subprocess.run([self.engine, *argv], capture_output=True, text=True, timeout=60, check=False,
+            done = subprocess.run([self.engine, *argv], capture_output=True, text=True, timeout=timeout, check=False,
                                   errors="replace")  # fmt: skip
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise StepError(f"{self.engine} {' '.join(argv[:3])}: {type(exc).__name__}") from None
@@ -910,7 +912,7 @@ class ContainerInspector:
         cid = self.container(svc)
         if cid is None:
             raise StepError(f"no hay contenedor «{svc}» en el proyecto «{self.project}» ({self.engine})")
-        self._run([action, cid])
+        self._run([action, cid], timeout=SERVICE_TIMEOUT)
 
     def service_logs(self, service: str, since: str) -> str:
         """Los logs (salida y errores) del contenedor desde `since` (RFC 3339 UTC)."""
@@ -1015,6 +1017,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--usage-timeout", type=float, default=90,
                    help="Grupo uso: espera (s) del uso del MCP, de la foto y de un servicio reiniciado")  # fmt: skip
     p.add_argument("--overhead-n", type=int, default=200, help="Grupo uso (12.10): pares de peticiones medidos")
+    p.add_argument("--usage-window", type=float, default=5,
+                   help="Grupo uso: BAAS_USAGE_WINDOW_SECONDS del MCP (5 en desarrollo)")  # fmt: skip
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
     ns.app_url, ns.fake_url = ns.app_url.rstrip("/"), ns.fake_url.rstrip("/")

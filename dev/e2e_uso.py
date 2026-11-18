@@ -62,6 +62,9 @@ CONSUMER, MCP = "webapp-api", "mcp-server"
 REASON = "Prueba de punta a punta del grupo uso (F4)"
 OTHER_ADMIN = "orgadmin@privada.test"  # ORG_ADMIN de una organización distinta (12.6)
 OTHER_USER = "analista@privada.test"
+# 12.8: la retención se pone en el máximo (60 meses) y no por debajo de la vigente: la purga es global y así no borra
+# métricas de otras organizaciones de la pila que la retención normal (13 meses) conserva
+TEST_RETENTION = 60
 LATENCY_FACTOR, LATENCY_P50_MS, LATENCY_P95_MS = 1.5, 5.0, 10.0  # «sin degradarse»: margen relativo y absoluto
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _ENTRY_ID = re.compile(r"^[0-9]+-[0-9]+$")
@@ -261,6 +264,36 @@ def new_event_id() -> str:
     """Un ULID (26 caracteres de Crockford): 48 bits de milisegundos y 80 aleatorios."""
     value = (int(time.time() * 1000) << 80) | secrets.randbits(80)
     return "".join(CROCKFORD[(value >> (5 * i)) & 31] for i in reversed(range(26)))
+
+
+def follow_up(first: Any, response: bytes, next_content: Any) -> list[dict[str, Any]]:
+    """Mensajes del segundo turno de una conversación de Messages, como los envía Claude Code: el primero del
+    usuario, la respuesta del modelo **tal cual** (con su `tool_use`, para que el proxy correlacione el turno) y el
+    contenido nuevo del usuario (texto o `tool_result`)."""
+    try:
+        content = json.loads(response).get("content")
+    except (ValueError, AttributeError):
+        content = None
+    if not isinstance(content, list) or not content:
+        raise StepError(f"la respuesta del primer turno no trae «content»: {h3.snippet(response)}")
+    return [
+        {"role": "user", "content": first},
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": next_content},
+    ]
+
+
+def tool_result_for(response: bytes, text: str) -> list[dict[str, Any]]:
+    """El `tool_result` que contesta al `tool_use` de la respuesta (lo que Claude Code devuelve tras lanzar la
+    skill: «Launching skill: <org>:<skill>»)."""
+    try:
+        blocks = json.loads(response).get("content") or []
+    except (ValueError, AttributeError):
+        blocks = []
+    uses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+    if not uses:
+        raise StepError(f"la respuesta no trae ningún tool_use: {h3.snippet(response)}")
+    return [{"type": "tool_result", "tool_use_id": uses[0].get("id"), "content": text}]
 
 
 def counts_by_key(series: Any) -> dict[str, dict[str, int]]:
@@ -670,42 +703,81 @@ class UsoGroup:
         )
 
     # --- 12.2 invocaciones ---------------------------------------------------------------------------
+    def messages_turn(self, org: UsoOrg, model: str, messages: list[dict[str, Any]]) -> Http:
+        payload = {**h3.request_body("messages", model, "x"), "messages": messages}
+        _, res = self.e.send(org.bindings[self.user], self.user, "messages", payload)
+        check(res.status == 200, f"Messages en «{org.slug}» → HTTP {res.status}: {h3.snippet(res.body)}")
+        return res
+
+    def conversation_turns(self, org: UsoOrg) -> dict[str, int]:
+        """Modelo → número de turnos de las conversaciones de la organización (lo que ve su ORG_ADMIN)."""
+        res = self.e.webapp("GET", f"/api/v1/conversations?org={org.slug}&limit=200", self.org_admin)
+        check(res.status == 200, f"GET /api/v1/conversations?org={org.slug} → {describe(res)}")
+        items = [i for i in (res.json() or {}).get("items") or [] if isinstance(i, dict)]
+        return {str(i.get("model")): int(i.get("turn_count") or 0) for i in items}
+
     def invocations(self) -> str:
+        """12.2. Cada invocación es una conversación de **dos turnos**, como en Claude Code: el `request_original` de un
+        turno empieza por la respuesta anterior del modelo (contrato §7), así que el segundo turno repite el
+        `[tool_use: Skill] …` y trae el `[tool_result] Launching skill: …`, y el historial vuelve a llevar el
+        `<command-name>`. Un extractor que mirara también ahí contaría dos veces."""
+        other = f"cosa-{self.nonce}"  # skill de «demo» que no debe aparecer en «demo»
         with self.org("sk", {self.org_admin: "ORG_ADMIN", self.user: "USER"}) as org:
             slug = org.slug
-            counted = [
-                (
-                    f"Factura {self.nonce}.\n<command-message>{slug}:facturacion</command-message>\n"
-                    f"<command-name>/{slug}:facturacion</command-name>\n<command-args>importe 100</command-args>",
-                    False,
-                ),
-                (f"usa la herramienta skill {slug}:informes", True),
-            ]
+            # /<org>:facturacion: el envoltorio de Claude Code en un bloque y la petición del usuario en otro (el eco
+            # del proveedor falso repite solo el último bloque, como un modelo que no repite el comando)
+            command = (
+                f"<command-message>{slug}:facturacion</command-message>\n"
+                f"<command-name>/{slug}:facturacion</command-name>\n<command-args>importe 100</command-args>"
+            )
+            first = [{"type": "text", "text": command}, {"type": "text", "text": f"Prepara la factura {self.nonce}."}]
+            slash_model = f"uso-{self.nonce}-sk-comando"
+            reply = self.messages_turn(org, slash_model, [{"role": "user", "content": first}])
+            self.messages_turn(org, slash_model, follow_up(first, reply.body, f"Y el IVA {self.nonce}?"))
+            # la herramienta Skill: tool_use del modelo y, en el turno siguiente, su tool_result
+            ask = f"usa la herramienta skill {slug}:informes"
+            tool_model = f"uso-{self.nonce}-sk-herramienta"
+            reply = self.messages_turn(org, tool_model, [{"role": "user", "content": ask}])
+            check(b'"Skill"' in reply.body, f"el proveedor falso no respondió con la herramienta Skill: {ask}")
+            launched = tool_result_for(reply.body, f"Launching skill: {slug}:informes")
+            self.messages_turn(org, tool_model, follow_up(ask, reply.body, launched))
             ignored = [
                 f"<command-name>/otro:cosa</command-name> {self.nonce} 1",  # otro plugin
                 f"usa la herramienta skill otro:cosa {self.nonce}",
                 f"<command-name>/{slug}2:cosa</command-name> {self.nonce} 2",  # un slug que empieza igual
-                f"<command-name>/demo:cosa</command-name> {self.nonce} 3",  # otra organización
-                f"usa la herramienta skill demo:cosa {self.nonce}",
+                f"<command-name>/demo:{other}</command-name> {self.nonce} 3",  # otra organización
+                f"usa la herramienta skill demo:{other}",
                 f"- {slug}:listado: una skill del listado, sin invocarla ({self.nonce})",
                 f"/{slug}:suelta sin envoltorio ({self.nonce})",
             ]
-            texts = [*counted, *((t, False) for t in ignored)]
-            for i, (text, stream) in enumerate(texts):
-                _, res = self.send(org, self.user, "messages", text, stream=stream, model=f"uso-{self.nonce}-sk-{i}")
-                if "usa la herramienta skill" in text:
-                    check(b'"Skill"' in res.body, f"el proveedor falso no respondió con la herramienta Skill: {text}")
-            self.wait_requests(org, len(texts))  # todas las trazas consumidas
+            for i, text in enumerate(ignored):
+                self.send(org, self.user, "messages", text, model=f"uso-{self.nonce}-sk-{i}")
+            total = 4 + len(ignored)
+            self.wait_requests(org, total)  # todas las trazas consumidas, también los segundos turnos
+            problems = []
+            turns = self.conversation_turns(org)
+            for model in (slash_model, tool_model):
+                if turns.get(model) != 2:
+                    problems.append(
+                        f"el segundo turno no se correlacionó: la conversación {model} tiene {turns.get(model)!r} "
+                        "turno(s) (se esperaba 2; sin correlación el paso no prueba el doble recuento)"
+                    )
             by_skill = counts_by_key(self.content(org, "skill").get("series"))
             by_source = self.content(org, "source").get("totals") or {}
             want = {"facturacion": {"INVOKED": 1}, "informes": {"INVOKED": 1}}
-            problems = [] if by_skill == want else [f"group_by=skill: {by_skill} (se esperaba {want})"]
+            if by_skill != want:
+                problems.append(f"group_by=skill: {by_skill} (se esperaba {want}: una vez cada una)")
             if {s: by_source.get(s) for s in SOURCES} != {s: (2 if s == "INVOKED" else 0) for s in SOURCES}:
                 problems.append(f"group_by=source: {by_source} (se esperaba INVOKED 2 y lo demás 0)")
+            demo = counts_by_key(self.report_json("content", "demo", self.admin, {"group_by": "skill"}).get("series"))
+            if other in demo:
+                problems.append(f"«demo» cuenta {demo[other]} de «{other}», invocada desde «{slug}»")
             check(not problems, "\n".join(problems))
         return (
-            f"/{slug}:facturacion (<command-name>) e Skill {slug}:informes (tool_use del proveedor falso) → INVOKED 1 "
-            f"cada una; otro plugin, otra organización, «{slug}2:», el listado y el texto suelto ({len(ignored)}) → 0"
+            f"/{slug}:facturacion (<command-name>) e Skill {slug}:informes (tool_use del proveedor falso), cada una en "
+            "una conversación de dos turnos correlacionados (el segundo repite el comando en el historial o trae "
+            f"«[tool_use: Skill]» y «Launching skill:») → INVOKED 1 cada una ({total} peticiones); otro plugin, otra "
+            f"organización (y «demo» no gana «{other}»), «{slug}2:», el listado y el texto suelto ({len(ignored)}) → 0"
         )
 
     # --- 12.3 sincronización ------------------------------------------------------------------------
@@ -724,7 +796,8 @@ class UsoGroup:
                 files = self.call(client, "baas_get_skill_files", {"skill": skill})
                 check(files.get("files"), f"baas_get_skill_files de «{skill}» no devolvió ficheros")
             self.wait_sources(org, {"SYNCED": 1})
-            time.sleep(1.0)  # por si una ventana posterior trajera algo más: tendría que seguir igual
+            # una ventana del MCP más (alineada al reloj) y 1 s: si trajera algo más, tendría que seguir igual
+            time.sleep(self.a.usage_window + 1)
             data = self.wait_sources(org, {"SYNCED": 1}, timeout=0)
             by_skill = counts_by_key(self.content(org, "skill").get("series"))
             check(by_skill == {skill: {"SYNCED": 1}}, f"group_by=skill: {by_skill} (se esperaba {{{skill}: SYNCED 1}})")
@@ -913,7 +986,10 @@ class UsoGroup:
             seen = (self.totals(org_a, self.admin).get("requests"), self.totals(org_b, self.admin).get("requests"))
             if seen != (1, 2):
                 problems.append(f"el PLATFORM_ADMIN ve {seen} peticiones en las dos (se esperaba (1, 2))")
-            res = self.e.webapp("GET", f"/api/v1/platform/usage?{urlencode(dates)}", self.admin)
+            # /platform/usage interpreta las fechas en UTC (contrato §8.6), no en la zona de la organización
+            utc_today = datetime.now(timezone.utc).date()
+            utc_dates = {"from": (utc_today - timedelta(days=1)).isoformat(), "to": utc_today.isoformat()}
+            res = self.e.webapp("GET", f"/api/v1/platform/usage?{urlencode(utc_dates)}", self.admin)
             ranking = {
                 o.get("slug"): o.get("requests") for o in (res.json() or {}).get("orgs") or [] if isinstance(o, dict)
             }
@@ -972,7 +1048,34 @@ class UsoGroup:
             client.close()
         return values
 
+    def restart(self, org: UsoOrg, services: list[str], failed: bool) -> None:
+        """Vuelve a arrancar `services` (cada uno por su lado: si uno falla, se intenta el otro) y espera a que
+        respondan antes de que el contexto elimine la organización (la webapp, al arrancar, vuelve a ejecutar la
+        migración y la semilla). Si el paso ya falló, no tapa su error: solo lo avisa."""
+        insp = self.inspector()
+        errors = []
+        for service in reversed(services):
+            try:
+                insp.service_control(service, "start")
+            except Exception as exc:
+                errors.append(f"no se pudo arrancar {service}: {exc}")
+        waits = [(CONSUMER, self.wait_webapp), (MCP, lambda: self.wait_mcp(org))]
+        for service, wait in waits:
+            if service in services:
+                try:
+                    wait()
+                except Exception as exc:
+                    errors.append(f"{service} no vuelve: {exc}")
+        if errors and not failed:
+            raise StepError("\n".join(errors))
+        for error in errors:
+            print(f"          ({error})")
+
     def outage(self) -> str:
+        """12.7. «Se queda atrás» se lee en la base (`usage_source_status`) con el consumidor parado, porque la API
+        también lo está; lo que vale es la puesta al día exacta al volver (`data_until` y los recuentos sin
+        duplicados). La tolerancia de latencia (×1,5 y +5/+10 ms) detecta un bloqueo o una espera por un tiempo de
+        espera agotado, no una degradación fina (para eso, 12.10 y las pruebas de sobrecoste del proxy)."""
         insp = self.inspector()
         count = 30
         with self.org("pr", {self.org_admin: "ORG_ADMIN", self.user: "USER"}) as org:
@@ -984,9 +1087,10 @@ class UsoGroup:
             with self.mcp(org, self.org_admin) as client:  # el MCP ya tiene en caché la clave y la membresía
                 self.call(client, "baas_whoami", {})
             stopped: list[str] = []
+            failed = False
             try:
+                stopped.append(CONSUMER)  # antes de pararlo: si `stop` falla a medias, también se rearranca
                 insp.service_control(CONSUMER, "stop")
-                stopped.append(CONSUMER)
                 with self.mcp(org, self.org_admin) as client:
                     self.call(client, "baas_search_knowledge", {"query": f"parada {self.nonce}"})
                 self.capture(
@@ -997,14 +1101,16 @@ class UsoGroup:
                     bool,
                     "el uso del MCP no llegó a baas:usage con la webapp parada",
                 )
-                insp.service_control(MCP, "stop")
                 stopped.append(MCP)
+                insp.service_control(MCP, "stop")
                 during = self.latencies(org, "durante", count)
                 last = datetime.now(timezone.utc)
                 held = parse_instant(insp.source_status().get("TRAFFIC"))
+            except BaseException:
+                failed = True
+                raise
             finally:
-                for service in reversed(stopped):
-                    insp.service_control(service, "start")
+                self.restart(org, stopped, failed)
             self.wait_webapp()
             self.wait_mcp(org)
             problems = degradation(before, during)
@@ -1050,8 +1156,8 @@ class UsoGroup:
                 self.call(client, "baas_search_knowledge", {"query": f"retencion {self.nonce}"})
             self.wait_requests(org, 1)
             self.wait_sources(org, {"KNOWLEDGE_SEARCH": 1})
-            insp.insert_old_usage(org.org_id, self.user_id(self.user), months=3, tag=old)
-            insp.insert_old_usage(org.org_id, self.user_id(self.user), months=1, tag=recent)
+            insp.insert_old_usage(org.org_id, self.user_id(self.user), months=TEST_RETENTION + 1, tag=old)
+            insp.insert_old_usage(org.org_id, self.user_id(self.user), months=TEST_RETENTION - 1, tag=recent)
             for tag in (old, recent):
                 rows = insp.tagged_rows(tag)
                 check(rows == {"traffic": 1, "content": 1, "snapshots": 1}, f"filas insertadas ({tag}): {rows}")
@@ -1065,9 +1171,12 @@ class UsoGroup:
             gone = self.e.webapp("GET", f"/api/v1/conversations/{cid}", self.org_admin)
             check(gone.status == 404, f"la conversación borrada → HTTP {gone.status} (se esperaba 404)")
             res = self.e.webapp(
-                "PUT", "/api/v1/platform/settings/metrics-retention", self.admin, {"months": 2, "reason": REASON}
+                "PUT",
+                "/api/v1/platform/settings/metrics-retention",
+                self.admin,
+                {"months": TEST_RETENTION, "reason": REASON},
             )
-            check(res.status == 200, f"PUT …/metrics-retention {{months: 2}} → {describe(res)}")
+            check(res.status == 200, f"PUT …/metrics-retention {{months: {TEST_RETENTION}}} → {describe(res)}")
             try:
                 # purge_metrics se ejecuta al arrancar (y cada hora); `restart` no vale con podman-compose (las
                 # dependencias ya terminadas, migrate y seed, cuentan como «no arrancadas»): parar y arrancar
@@ -1078,23 +1187,21 @@ class UsoGroup:
                     lambda: (
                         []
                         if insp.tagged_rows(old) == {"traffic": 0, "content": 0, "snapshots": 0}
-                        else [f"filas de hace 3 meses: {insp.tagged_rows(old)}"]
+                        else [f"filas de hace {TEST_RETENTION + 1} meses: {insp.tagged_rows(old)}"]
                     ),
                     self.a.usage_timeout,
                     "la purga no borró las métricas más antiguas que la retención",
                 )
-            finally:
-                res = self.e.webapp(
-                    "PUT",
-                    "/api/v1/platform/settings/metrics-retention",
-                    self.admin,
-                    {"months": previous, "reason": REASON},
-                )
-                if res.status != 200:
-                    problems.append(f"no se pudo restaurar la retención a {previous}: {describe(res)}")
+            except Exception as exc:
+                restored = self.restore_retention(previous)
+                extra = f"\nademás, {restored}" if restored else ""
+                raise StepError(f"{exc}{extra}") from None
+            restored = self.restore_retention(previous)
+            if restored:
+                problems.append(restored)
             kept = insp.tagged_rows(recent)
             if kept != {"traffic": 1, "content": 1, "snapshots": 1}:
-                problems.append(f"la purga borró también las de hace 1 mes: {kept}")
+                problems.append(f"la purga borró también las de hace {TEST_RETENTION - 1} meses: {kept}")
             requests = self.totals(org).get("requests")
             if requests != 1:
                 problems.append(f"con la conversación borrada, requests = {requests!r} (se esperaba 1: sigue contando)")
@@ -1110,11 +1217,25 @@ class UsoGroup:
                 self.drop_org(org.slug)
         check(not problems, "\n".join(problems))
         return (
-            f"retención 2 meses y purga (al arrancar {CONSUMER}): las filas de hace 3 meses "
-            "(tráfico, contenido y foto) "
-            f"se borran y las de hace 1 mes no; la conversación borrada sigue contando (1 petición); eliminar "
+            f"retención {TEST_RETENTION} meses y purga (al arrancar {CONSUMER}): las filas de hace "
+            f"{TEST_RETENTION + 1} meses (tráfico, contenido y foto) se borran y las de hace {TEST_RETENTION - 1} no; "
+            "la conversación borrada sigue contando (1 petición); eliminar "
             f"«{org.slug}» deja 0 filas suyas ({before} antes); retención restaurada a {previous}"
         )
+
+    def restore_retention(self, months: int) -> str | None:
+        """Vuelve a poner la retención de métricas (esperando a la webapp si se está arrancando); `None` si se pudo."""
+        with contextlib.suppress(Exception):
+            self.wait_webapp()
+        try:
+            res = self.e.webapp(
+                "PUT", "/api/v1/platform/settings/metrics-retention", self.admin, {"months": months, "reason": REASON}
+            )
+        except Exception as exc:
+            return f"no se pudo restaurar la retención de métricas a {months}: {type(exc).__name__}: {exc}"
+        if res.status != 200:
+            return f"no se pudo restaurar la retención de métricas a {months}: {describe(res)}"
+        return None
 
     # --- 12.9 un evento repetido no cuenta dos veces --------------------------------------------------------
     def replay(self) -> str:
@@ -1215,7 +1336,9 @@ class UsoGroup:
             f"{n} pares intercalados (~2 KB, Messages, bypass): directo p50/p95 {got['direct_p50']:.2f}/"
             f"{got['direct_p95']:.2f} ms, por el proxy {got['proxy_p50']:.2f}/{got['proxy_p95']:.2f} ms → sobrecoste "
             f"p50 {got['p50']:.2f} ms y p95 {got['p95']:.2f} ms (umbral p95 < {OVERHEAD_P95_MS:g} ms, "
-            "fase-1-h4-mediciones: 1,4 / 2,6 ms)"
+            "fase-1-h4-mediciones). Control grueso: que no empeora respecto a la referencia lo dicen las pruebas "
+            "de sobrecoste en proceso del proxy (TestBypassOverheadP95, TestAIIPOverheadP95, TestObserveOverheadP95), "
+            "que no forman parte de este e2e"
         )
         check(got["p95"] < OVERHEAD_P95_MS, f"el sobrecoste empeora: {detail}")
         return detail
