@@ -6,8 +6,8 @@ distribuyen con el plugin.
 - [Hito H2 (épica E4)](#hito-h2-épica-e4): `dev/e2e_h2.py`, el plugin de punta a punta.
 - [Hito H3 (AI-IP)](#hito-h3-ai-ip): `dev/e2e_h3.py`, anonimización y rehidratación por el proxy.
 - [Hito H4 (observación y eliminación de organizaciones)](#hito-h4-observación-y-eliminación-de-organizaciones):
-  `dev/e2e_h4.py`, el anonimizador apagado, el interruptor, eliminar una organización y qué pasa con los usuarios
-  que se quedan sin ninguna.
+  `dev/e2e_h4.py`, el anonimizador apagado, el interruptor, eliminar una organización, la prueba canario de H4-02
+  (los originales no llegan al disco de Redis) y qué pasa con los usuarios que se quedan sin ninguna.
 - [Mediciones de H4](#mediciones-de-h4): `dev/measure_h4.py` y `dev/measure_frozen_redis.py`.
 - [E9 (roles funcionales)](#e9-roles-funcionales): `dev/e9_roles.py`, que los roles aíslan el contenido aunque una skill lo cite.
 
@@ -231,13 +231,15 @@ Pendiente de la integración (C2). Contra la pila simulada, la ejecución comple
 > ejecutado contra la pila real**: la webapp con el interruptor y la eliminación, el proxy con el modo observación, el
 > MCP con la cuarentena y `deploy` con el informe del monitor se desarrollan a la vez en otras ramas. El coordinador la
 > ejecuta entera sobre `h4-int` en la tarea C2 del plan del hito H4. Tarea L1 del plan; diseño §5.5 y §6.
+> El grupo `originales` (la prueba canario de H4-02: dos instancias de Redis) se añadió el 2026-11-18, también probado
+> solo contra la pila simulada y, para el inspector de Redis, contra contenedores `redis:7` desechables.
 >
 > La parte `huerfanos` (pasos 11.x, usuarios que se quedan sin organización al eliminar una) se escribió después, **solo
 > contra el contrato** (§6 de `knowledge/02-arquitectura/contratos-fase-1.md`: `delete-preview`, `disable_orphans`,
 > `user.disabled`, `USER_DISABLED`, `user.reactivated`) y contra la pila simulada: la webapp que lo implementa se
 > desarrolla a la vez. Los supuestos que conviene verificar al ejecutarla de verdad están en el apartado 5.
 
-`dev/e2e_h4.py` comprueba por **HTTP directo** (sin Claude Code) las dos novedades de H4 de punta a punta, con las
+`dev/e2e_h4.py` comprueba por **HTTP directo** (sin Claude Code) las novedades de H4 de punta a punta, con las
 claves deterministas del contrato §8 de `observador@observacion.test`, `admin@baas.test` (PLATFORM_ADMIN),
 `orgadmin@demo.test` y `analista@demo.test`. Sale con `0` si todo pasa, `1` si falla algún paso (dice cuál y por qué) y
 `2` si los argumentos no valen. No se distribuye con el plugin y solo usa la biblioteca estándar.
@@ -274,12 +276,14 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--admin-email` | `admin@baas.test` | PLATFORM_ADMIN que cambia el interruptor, crea, bloquea y elimina, y al que se le comprueba que no ve contenido |
 | `--orgadmin-email` | `orgadmin@demo.test` | ORG_ADMIN de otra organización: debe recibir `404` al cambiar el interruptor y es el primer miembro de la organización que se elimina |
 | `--bypass-org` · `--bypass-email` | `demo` · `analista@demo.test` | Organización con AI-IP apagado |
-| `--only` | `observacion,interruptor,eliminar,huerfanos` | Partes que se ejecutan (separadas por comas). `huerfanos` crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y los activa por la API: **necesita `BAAS_DEV_SKIP_TOTP=1`** |
+| `--anon-org` · `--anon-email` | `privada` · `analista@privada.test` | Organización con AI-IP y anonimizador **encendidos** (la de H3) y su usuario: el tercer modo del grupo `originales` |
+| `--only` | `observacion,interruptor,eliminar,originales,huerfanos` | Partes que se ejecutan (separadas por comas). `huerfanos` crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y los activa por la API: **necesita `BAAS_DEV_SKIP_TOTP=1`** |
 | `--apis` | `messages,chat,responses` | APIs que se prueban |
-| `--inspect` | `auto` | `podman`, `docker` o `auto` (el primero que vea el proyecto) para mirar el vault, Redis y la cuarentena del MCP; `none` omite esos pasos (9.1b y 9.8), que no se registran |
+| `--inspect` | `auto` | `podman`, `docker` o `auto` (el primero que vea el proyecto) para mirar el vault, las dos instancias de Redis (claves y disco) y la cuarentena del MCP; `none` omite esos pasos (9.1b, 9.8 y todo el grupo `originales`), que no se registran (con `--only originales` lo dice en una nota) |
 | `--compose-project` | `$COMPOSE_PROJECT_NAME` o `baas-dev` | Proyecto de compose de la pila |
 | `--mcp-data-dir` | `/data` | `BAAS_DATA_DIR` del contenedor del MCP |
 | `--trace-timeout` | `30` | Segundos de espera de cada traza o de lo que se propaga (bloqueo, eliminación, cuarentena) |
+| `--flush-wait` | `2` | Segundos que se espera antes de mirar el AOF vivo en 10.4 (con `appendfsync everysec` Redis puede retrasar hasta 2 s escribir lo que ya recibió) |
 | `--propagation-wait` | `1.5` | Segundos entre cambiar el anonimizador y el turno siguiente (`ai_ip.changed` llega al proxy por Pub/Sub) |
 | `--timeout` | `60` | Tiempo máximo de cada petición HTTP |
 | `--json <fichero>` | — | Informe en JSON (pasos, estado, duración, detalle, identificador de la ejecución) |
@@ -307,14 +311,44 @@ webapp (`?q=<ejecución>`).
 | 8.11 | El PLATFORM_ADMIN ve **por turno** la conversación A (H4-08): el turno 1 (salió en claro) sin contenido ni valores (`content_available: false`) y los siguientes (salieron anonimizados) con `content_available: true`, solo con tokens, sin `request_original`, sin valores y sin poder revelarlos |
 | 8.12 | El interruptor vuelve a su valor inicial (apagado), también si algún paso falló |
 | 9.1 | Como PLATFORM_ADMIN: crear `e2e-<ejecución>`, invitar a `orgadmin@demo.test` como ORG_ADMIN, activar AI-IP; un turno con valores (el anonimizador está encendido por defecto) y un documento escrito por el MCP (`baas_write_document`), para que haya vault y directorio |
-| 9.1b | Con el motor de contenedores: el vault tiene filas de esa organización antes de eliminarla (si no, «vacío» después no probaría nada) |
+| 9.1b | Con el motor de contenedores: el vault tiene filas de esa organización antes de eliminarla (si no, «vacío» después no probaría nada) y se anotan sus conversaciones (`conversation_state` y `vault_entries` de `baas_vault`); se dice cuántas claves de ellas guarda `redis-ephemeral` (la copia caliente del vault; **informativo**: con un solo turno el proxy puede no haberla creado) |
 | 9.2 | Condiciones: sin bloquear → `409 ORG_NOT_BLOCKED`; su ORG_ADMIN → `403`; la organización meta (`baas-ai-ip`, sin bloquear) → `403 ORG_PROTECTED`; sin motivo → `422 REASON_REQUIRED`; la organización sigue existiendo |
 | 9.3 | Bloquearla (`PUT …/block`): el proxy responde `403 baas_access_blocked` a su ORG_ADMIN; con otro slug de confirmación → `422 SLUG_MISMATCH` |
 | 9.4 | `POST /api/v1/orgs/e2e-<ejecución>/delete` `{"reason", "confirm_slug"}` → `200` con `propagated` |
 | 9.5 | Webapp: `404` (y `404` la segunda eliminación, sin conversaciones listadas); proxy: `403 baas_access_denied`; MCP: `404`; el *handshake* de su ORG_ADMIN sigue funcionando y ya no la lista (los usuarios no se eliminan) |
 | 9.6 | Crear otra vez el mismo slug → `409 SLUG_TAKEN`, el mismo error que un slug en uso |
 | 9.7 | `GET /api/v1/audit?action=org.deleted`: la entrada de la eliminación, con el slug y el motivo, sobrevive a la organización |
-| 9.8 | Con el motor de contenedores: el vault no tiene filas de la organización (`vault_entries`, `vault_counters` y `conversation_state` en `baas_vault`), Redis no tiene `baas:policy:org:<slug>` ni `baas:member:*:<slug>` y el directorio del MCP ya no está en `orgs/` sino en `.quarantine/<slug>-<fecha>` |
+| 9.8 | Con el motor de contenedores: el vault no tiene filas de la organización (`vault_entries`, `vault_counters` y `conversation_state` en `baas_vault`), **ninguna de las dos instancias de Redis** tiene `baas:policy:org:<slug>` ni `baas:member:*:<slug>`, `redis-ephemeral` no conserva ninguna `baas:conv:<id>:*` de las conversaciones anotadas en 9.1b (H4-02: `org.deleted` borra en cada instancia lo suyo) y el directorio del MCP ya no está en `orgs/` sino en `.quarantine/<slug>-<fecha>`. Si la pila no tiene `redis-ephemeral` (antigua), solo mira `redis` y lo dice en el detalle |
+
+**Grupo `originales` (H4-02, la prueba canario).** Lo que cierra H4-02 es que un valor centinela enviado por el proxy
+**no aparezca en ningún fichero de `/data` de ningún Redis**, ni siquiera tras forzar la reescritura del AOF. Se usa el
+mismo texto de siempre (`<etiqueta>. DNI 12345678Z, email ana.perez@privada.test, IBAN ES91 2100 0418 4502 0005 1332.`),
+cuya etiqueta lleva la cadena `caso-<ejecución>`, única de la ejecución. Todo el grupo necesita el motor de contenedores
+y se omite con `--inspect none`. No cambia el estado de la pila de forma persistente: lee ficheros con `grep` y
+`find` **dentro** de los contenedores (nada se copia al host), consulta `CONFIG GET`, pide `BGREWRITEAOF` a la
+persistente (una reescritura normal del AOF, como la que Redis hace solo al crecer) y solo escribe una clave `baas:e2e:escaner-<ejecución>` que
+borra, con caducidad de 300 s por si la limpieza fallara.
+
+| Paso | Comprobación |
+| :--- | :--- |
+| 10.0 | **Sin residuo de una pila anterior a A′** en la persistente: ninguna clave `baas:conv:*:vault` (copias calientes del vault, con valores originales) ni `baas:conv:*:events` (se buscan con `SCAN`, nunca con `KEYS`) y `baas:traces` ausente o con `XLEN` 0. Una pila que **venía de H4-08** conserva en `redis` esas copias (en una pila de integración, casi un millar), que 10.6 vería como una fuga. Si hay, **falla** con cuántas claves y de qué tipo y con la receta: «residuo de una pila anterior a A′ (H4-02): ejecuta `deploy/scripts/purge-redis-originals.sh` (y vuelve a lanzar la prueba)». Depende de 10.1 y **se ejecuta, junto con 10.1, antes que cualquier otro paso con tráfico** (justo después de 1): así lo que escriban en la persistente los grupos 5 a 9 si el proxy o la webapp siguen con una sola instancia no se confunde con residuo, y lo delatan 10.4 y 10.6 |
+| 10.1 | La pila tiene `redis` **y `redis-ephemeral`**. Si no (una pila anterior a H4-02), **falla** con «sin redis-ephemeral: los originales siguen llegando al AOF» y el resto del grupo queda `SALTADO` |
+| 10.2 | Un turno por **modo** (bypass en `demo` con `analista@demo.test`, observación en `observacion` con `observador@observacion.test`, AI-IP con anonimizador en `privada` con `analista@privada.test`), **API** (Messages, Chat Completions y Responses) y forma (con y sin *streaming*): 18 conversaciones, todas `200`. Se eligen estas tres organizaciones, que ya existen en la semilla, para no crear ni cambiar nada; la tercera pasa por el vault (la copia caliente con los valores) y las tres por las trazas |
+| 10.3 | La webapp **consume** las trazas: cada conversación aparece en la lista de su dueño (si no, las trazas podrían seguir en el stream y el resto no probaría lo que debe) |
+| 10.4 | **AOF vivo de la persistente, sin reescribir nada**: `caso-<ejecución>` no está en ningún fichero de `/data` de `redis`, y `redis` escribe en `/data`. Es la comprobación que delata el problema original: la traza se escribió y se borró (la webapp la consume en milisegundos), pero el texto sigue en el fichero hasta que se reescribe |
+| 10.5 | **Control positivo del escáner** (autocontenido): escribe `baas:e2e:escaner-<ejecución>` en la persistente con un valor propio, comprueba que el escáner lo **encuentra en el AOF vivo y después de forzar la reescritura** (en la base binaria del AOF, un preámbulo RDB), y **en un `finally`** borra la clave, vuelve a reescribir y comprueba que el valor ya no está. Si el escáner no ve el disco, «ningún original» no probaría nada: falla por eso |
+| 10.6 | **Tras `BGREWRITEAOF`** de la persistente (esperando a `aof_rewrite_in_progress:0`): ni los tres valores (el IBAN, también sin espacios) ni `caso-<ejecución>` en ningún fichero. Después de reescribir el AOF es lo que Redis tiene en memoria, así que esto delata lo que sigue vivo (la copia caliente del vault). Redis borra los ficheros viejos un instante después: se repite hasta `min(--trace-timeout, 5)` s |
+| 10.7 | **`redis-ephemeral`**: `appendonly no`, `save ""`, `dir /data`, **ningún fichero** en `/data` (sin volumen, `tmpfs`) y ningún centinela en ellos |
+
+Los centinelas se buscan **tal cual y con cualquier mezcla de los escapes de JSON habituales** carácter a carácter
+(`\"`, `\\`, `\/`, `\uXXXX` de Python, Go o PHP para todo lo que no sea alfanumérico ASCII), con `grep -rEa` dentro
+del contenedor y con los centinelas como **argumentos** (ni el script ni el *shell* del host los interpretan). Límites
+conocidos: solo mira `/data` (10.4 y 10.7 comprueban que `dir` es `/data`); un texto largo y repetitivo en el
+preámbulo RDB de la base del AOF puede ir comprimido con LZF y no encontrarse literalmente (la primera copia de cada
+centinela siempre va sin comprimir, y el control positivo prueba que la base se lee); **10.4 solo vale si 10.5 pasa**
+(un escáner ciego daría «no encontrado» en los dos), y por eso 10.6 y 10.7 dependen de 10.5. 10.4 y 10.6 dependen además de 10.0: con residuo no se pronuncian (quedan `SALTADO`), pero 10.5 y 10.7 sí se ejecutan.
+
+**Limpiar el residuo de una pila real.** Al actualizar una pila de H4-08 a A′, la persistente conserva las copias calientes del vault y las trazas pendientes que escribió el proxy antes: `deploy/scripts/purge-redis-originals.sh` las borra (con `--check` solo comprueba, sin borrar nada). Después, el AOF puede seguir teniendo esos originales hasta que se reescriba: el grupo reescribe el AOF en 10.5 y 10.6 y comprueba que ya no están. Si 10.0 vuelve a fallar tras purgar, algo sigue escribiendo originales en la persistente (¿falta `BAAS_REDIS_EPHEMERAL_URL` en el proxy o en la webapp?): lanza `--only originales` para ver qué paso lo delata.
 
 **Usuarios que se quedan sin organización** (parte `huerfanos`; contrato §6). Todo con nombres únicos de la ejecución
 (`huerf-<ejecución>-…`): organizaciones `…-o1` a `…-o4` y usuarios `…-a` a `…-g@huerf.test`, creados y activados por la API
@@ -345,8 +379,8 @@ como PLATFORM_ADMIN (`POST …/members` → enlace de activación → `POST /api
 
 Los pasos que dependen de uno fallido quedan `SALTADO` (y cuentan como fallo). El bloqueo, la eliminación y la
 cuarentena se esperan hasta `--trace-timeout` s porque llegan a proxy y MCP por Pub/Sub; igual la revocación de claves y
-la pérdida de la membresía en la parte `huerfanos`. Una ejecución completa envía unas 25 peticiones al proveedor, más
-siete de la parte `huerfanos` (`/_debug/requests` guarda las 50 últimas). Si una ejecución se corta entre 9.1 y 9.4,
+la pérdida de la membresía en la parte `huerfanos`. Una ejecución completa envía unas 45 peticiones al proveedor, más
+siete de la parte `huerfanos` (`/_debug/requests` guarda las 50 últimas; el grupo `originales` no lo lee). Si una ejecución se corta entre 9.1 y 9.4,
 queda una organización `e2e-<ejecución>` que se puede bloquear y eliminar a mano desde W3; si se corta la parte
 `huerfanos`, quedan organizaciones `huerf-<ejecución>-o1…o4` (se eliminan igual). Los inicios de sesión están limitados a
 20 por minuto y por IP: la parte `huerfanos` inicia sesión unas 15 veces y espera lo que diga `retry_after_seconds` si
@@ -358,8 +392,9 @@ recibe `429`.
 | :--- | :--- |
 | Utilidades puras (SSE, comprobaciones de contenido, cliente WebSocket, inspector) | **Ejecutado**: `tests/test_e2e_h4.py` (la CI) |
 | Recorrido completo contra `dev/fake_h4_stack.py` (webapp, proxy, MCP y proveedor simulados) | **Ejecutado**: todos los pasos en verde con el cuerpo del proveedor guardado como objeto y como texto, y dos ejecuciones seguidas |
-| Cada fallo inyectable de la pila simulada (52) detectado por el paso que le corresponde | **Ejecutado** (tabla de abajo) |
-| Contra la pila real de H4 (`h4-int`): proxy real con el modo observación y el estado por conversación, webapp real con el interruptor, la eliminación, la vista del PLATFORM_ADMIN y el WebSocket, MCP real con la cuarentena, vault y Redis reales | **No ejecutado.** Lo hace el coordinador en C2. Los pasos 5, 6, 7, 8 y 9 dependen de los cuatro componentes; el 11 (usuarios sin organización), de la webapp, el proxy y el MCP con la revocación de claves |
+| Cada fallo inyectable de la pila simulada (64) detectado por el paso que le corresponde | **Ejecutado** (tabla de abajo) |
+| El inspector de Redis (`CONFIG GET`, `find`, `BGREWRITEAOF` y su espera, la búsqueda con `grep`) | **Ejecutado** contra un motor falso que **corre de verdad el script de búsqueda** sobre un directorio temporal (`tests/fake_engine.py`) y, aparte, a mano contra dos contenedores `redis:7` desechables (uno con AOF y otro con `tmpfs` y sin AOF) con `podman`, sin tocar ninguna pila: el control positivo, la reescritura, la fuga detectada y la limpieza (2026-11-18) |
+| Contra la pila real de H4 (`h4-int`): proxy real con el modo observación y el estado por conversación, webapp real con el interruptor, la eliminación, la vista del PLATFORM_ADMIN y el WebSocket, MCP real con la cuarentena, vault y Redis reales, **el proxy y la webapp con `BAAS_REDIS_EPHEMERAL_URL`** (grupo `originales` y 9.8 con las dos instancias) y el 11 (usuarios sin organización: la webapp, el proxy y el MCP con la revocación de claves) | **Ejecutado el 2026-11-18** en `h4-int` con H4-08, A′ y los huérfanos juntos: `e2e_h4.py` completo (los cinco grupos) y `e9_roles.py` |
 | La interfaz web (W3, W7, W8, W11 en el navegador, en `es` y `en`) y «el PLATFORM_ADMIN no ve el contenido **por la UI**» | **Fuera de esta prueba.** La UI pinta lo que devuelve la API que se comprueba aquí (`content_available`); el recorrido en el navegador es de C2 |
 | Claude Code real y Codex real | Fuera de esta prueba (prueba manual del usuario, C2; `docs/codex.md`) |
 
@@ -402,6 +437,13 @@ motivo; `test_every_fault_is_detected` falla si se añade un fallo sin su caso.
 | `delete-twice-ok` · `proxy-still-serves` · `mcp-still-serves` · `delete-removes-users` | 9.5 |
 | `slug-reusable` · `audit-missing` | 9.6 · 9.7 |
 | `vault-kept` · `redis-kept` · `no-quarantine` | 9.8 |
+| `ephemeral-keys-kept` (eliminar la organización no borra la copia caliente de sus conversaciones en `redis-ephemeral`) | 9.8 |
+| `no-ephemeral` (la pila no tiene `redis-ephemeral`: una antigua, con los originales en el AOF) | 10.1 (el resto del grupo, `SALTADO`) |
+| `traces-in-aof` (el proxy publica las trazas en la persistente; el vault caliente va bien a la efímera) | 10.4 (solo el AOF vivo lo delata: la traza ya no está en memoria) |
+| `originals-in-aof` (las trazas **y** la copia caliente del vault van a la persistente) | 10.4 y 10.6 |
+| `scanner-blind` (el escáner no lee la base binaria del AOF) | 10.5; 10.6 y 10.7 quedan `SALTADO` |
+| `ephemeral-persists` (`redis-ephemeral` con `appendonly yes` y ficheros en `/data`) | 10.7 |
+| `residue-in-persistent` (la persistente conserva copias calientes del vault, claves de eventos y trazas de una pila anterior a A′) | 10.0 (10.4 y 10.6, `SALTADO`) |
 | `preview-lists-all` (lista a todos los miembros) · `preview-needs-block` (exige la organización bloqueada) | 11.3 |
 | `preview-open` (la pide un ORG_ADMIN o un USER) | 11.4 |
 | `orphans-kept` (no desactiva a nadie) · `orphans-other-org` (desactiva también a quien conserva otra organización) | 11.5 |
@@ -458,10 +500,18 @@ confirmarlos al integrar:
 - **MCP**: `…/org/<slug>/mcp` → `404` tras eliminar la organización; `baas_write_document` en un documento
   `knowledge/e2e/e2e-<ejecución>.md` con `roles: []` lo acepta un ORG_ADMIN; la cuarentena es `<datos>/.quarantine/<slug>-<fecha>`
   (`quarantine.py`) y el directorio de datos de su contenedor es `/data` (`--mcp-data-dir`).
+- **Pila (H4-02, dos instancias de Redis)**: hay un servicio `redis-ephemeral` (`redis:7`, sin AOF ni RDB y sin volumen: un
+  `tmpfs` en `/data`) además de `redis` (AOF, volumen en `/data`); **los dos tienen `BAAS_REDIS_PASSWORD` en su entorno**
+  (la prueba se autentica con la del propio contenedor), `sh`, `grep` (con `-r`, `-E`, `-a`, `-q`, `-s`) y `find`;
+  el proxy y la webapp llevan `BAAS_REDIS_EPHEMERAL_URL`; `baas_vault` tiene `conversation_state(conversation_id,
+  org_slug)` y `vault_entries(conversation_id, org_slug)`; la organización `privada` (AI-IP y anonimizador encendidos)
+  y `analista@privada.test` están en la semilla de desarrollo (los de H3); `deploy/scripts/purge-redis-originals.sh`
+  existe (lo cita 10.0). En una pila sin `redis-ephemeral` los pasos 9.1b y 9.8 miran solo `redis` y el grupo
+  `originales` falla en 10.1.
 - **Pila**: el contenedor de PostgreSQL se llama por su servicio (`com.docker.compose.service=postgres`) y admite
   `psql -U postgres` sin contraseña desde dentro; el de Redis tiene `BAAS_REDIS_PASSWORD` en su entorno; el del MCP lleva
-  `ls`. Con `--inspect none`, o sin `podman`/`docker` que vea el proyecto, los pasos 9.1b y 9.8 se omiten o fallan con
-  el motivo.
+  `ls`. Con `--inspect none`, o sin `podman`/`docker` que vea el proyecto, los pasos 9.1b y 9.8 y el grupo `originales`
+  se omiten o fallan con el motivo.
 
 ### 6. Resultado
 
@@ -532,3 +582,19 @@ en el servidor real (tramo 2).
 | `dev/measure_frozen_redis.py salida.json` | Redis **congelado** (`podman pause` del contenedor `h4-int_redis_1`, constante `REDIS`): línea base, al congelar, a los 4 min 30 s (dentro de la ventana de 5 min), a los 5 min 30 s y tras reanudar, con el proxy en bypass y con AI-IP, el MCP y el login. Lo reanuda siempre, también si falla | ~6 min |
 
 Los textos de prueba no llevan dígitos seguidos: las reglas de AI-IP los toman por teléfonos y los sustituyen.
+
+### Transparencia del proxy y la instancia efímera de Redis (H4-02)
+
+Dos scripts más comprueban lo que nota un cliente de Claude Code (criterio rector de H4-02: el proxy debe ser lo más
+transparente posible). Usan las opciones de `e2e_h4.py` para las URLs y el proyecto (`--app-url`, `--compose-project`…),
+la semilla de desarrollo (`analista@privada.test` en `privada`, con AI-IP y anonimizador; `analista@demo.test` en `demo`,
+en bypass) y solo la biblioteca estándar. Resultados y método: `knowledge/01-producto/fases/fase-1-h4-mediciones.md` §2.5.
+
+| Script | Qué mide |
+| :--- | :--- |
+| `dev/measure_latency.py --n 300 --label X` | Latencia de extremo a extremo (Caddy → proxy → proveedor falso) con una conexión persistente: conversación nueva con AI-IP, conversación larga con historial (hasta 60 turnos) y bypass; p50, p95, p99 y máximo. Se ejecuta con la pila anterior y con la nueva, en calma, y se comparan (3 tandas cada una) |
+| `dev/measure_ephemeral_outage.py --mode stop\|pause\|none` | Peticiones continuas mientras se **para** (`stop`/`start`), **congela** (`pause`/`unpause`) o no se toca (`none`, el control) el contenedor `<proyecto>_redis-ephemeral_1`. Imprime antes, durante y después: p50, p95, máximo, peticiones de más de 100 ms y errores; la petición más lenta durante el fallo; y cuántas conversaciones de la prueba llegan a la webapp al recuperarse. Sale con 1 si hay errores o se pierden trazas. Si algo falla a mitad, deja la efímera arrancada |
+
+La mediana sube igual con y sin fallo (la conversación larga acumula historial): compara siempre con `--mode none`. En
+una ejecución, la primera petición tras el fallo puede tardar ~100 ms (el tiempo de espera de la copia caliente) y las
+siguientes, nada: la sonda de fondo del proxy y el disyuntor propio de la efímera hacen el resto.

@@ -16,8 +16,12 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         apagado sigue en claro aunque se encienda, una nueva sale tokenizada; la tokenizada sigue tokenizada (y
         restaurada) aunque se apague, una nueva sale en claro. El interruptor vuelve a su valor inicial.
   9.    Eliminar una organización: crear, bloquear y eliminar con confirmación del slug; la webapp, el proxy y el MCP
-        dejan de servirla, el slug no se reutiliza, la auditoría lo recoge, el vault queda vacío, Redis sin sus
-        claves y el directorio del MCP en cuarentena.
+        dejan de servirla, el slug no se reutiliza, la auditoría lo recoge, el vault queda vacío, Redis (las dos
+        instancias) sin sus claves y el directorio del MCP en cuarentena.
+  10.   Los originales no llegan al disco de Redis (H4-02, la prueba canario): turnos con valores centinela en bypass,
+        observación y AI-IP con anonimizador, por las tres APIs; ni el AOF de la instancia persistente (antes y
+        después de forzar su reescritura) ni nada de `/data` de la efímera (sin AOF, sin RDB, sin ficheros) los
+        contiene. Un control positivo demuestra que el escáner ve el disco.
   11.   Usuarios que se quedan sin organización al eliminar una (contrato §6): la vista previa los lista, la
         eliminación los desactiva (`disable_orphans`, `true` por omisión) y revoca sus claves personales, quien
         conserva otra organización no cambia, la auditoría `user.disabled` no lleva su email, un ORG_ADMIN no los
@@ -29,9 +33,10 @@ Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream
 
     uv run python dev/e2e_h4.py --app-url http://app.localhost:8080 --fake-url http://127.0.0.1:18090
 
-Los pasos 9.6 (vault, Redis y cuarentena) miran dentro de los contenedores con `podman`/`docker exec`
-(`--inspect none` los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos no valen. No se
-distribuye con el plugin. `dev/fake_h4_stack.py` simula la pila para probar este script sin ella.
+Los pasos 9.1b y 9.8 (vault, Redis y cuarentena) y el grupo 10 miran dentro de los contenedores con
+`podman`/`docker exec` (`--inspect none` los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los
+argumentos no valen. No se distribuye con el plugin. `dev/fake_h4_stack.py` simula la pila para probar este script sin
+ella.
 """
 
 from __future__ import annotations
@@ -67,7 +72,8 @@ from baas_plugin.mcp_client import McpClient
 
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
-APIS, API_NAMES, GROUPS = h3.APIS, h3.API_NAMES, ("observacion", "interruptor", "eliminar", "huerfanos")
+APIS, API_NAMES = h3.APIS, h3.API_NAMES
+GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos")
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
@@ -107,6 +113,17 @@ def segments_text(value: Any) -> str:
 def needles_for(nonce: str) -> list[str]:
     """Lo que no puede aparecer en lo que ve un PLATFORM_ADMIN: los valores, el texto del prompt y el eco."""
     return [DNI, EMAIL, IBAN, f"caso-{nonce}", "Eco:"]
+
+
+def disk_needles(nonce: str) -> list[str]:
+    """Lo que no puede estar en el disco de Redis: los tres valores (el IBAN también sin espacios) y la cadena de la
+    ejecución, que lleva cada texto enviado."""
+    return [DNI, EMAIL, IBAN, IBAN.replace(" ", ""), *run_needles(nonce)]
+
+
+def run_needles(nonce: str) -> list[str]:
+    """Lo único que es de ESTA ejecución: ningún AOF de una ejecución anterior puede contenerlo."""
+    return [f"caso-{nonce}"]
 
 
 def content_leaks(raw: str | bytes, needles: Iterable[str]) -> list[str]:
@@ -452,15 +469,75 @@ def ws_url(app_url: str, path: str) -> str:
 
 # --- lo que hay dentro de los contenedores (vault, Redis y cuarentena del MCP) ------------------------------
 
+PERSISTENT, EPHEMERAL = "redis", "redis-ephemeral"  # servicios de Redis (contrato §1, hito H4, H4-02)
+REDIS_SERVICES = (PERSISTENT, EPHEMERAL)
+REDIS_DATA_DIR = "/data"
+
 
 class Inspector(Protocol):
     def vault_rows(self, slug: str) -> int: ...
-    def redis_keys(self, slug: str) -> list[str]: ...
+    def conversation_ids(self, slug: str) -> list[str]: ...
+    def redis_services(self) -> list[str]: ...
+    def redis_keys(self, slug: str, conversation_ids: Sequence[str] = ()) -> list[str]: ...
+    def redis_setting(self, service: str, name: str) -> str: ...
+    def redis_residue(self, service: str) -> dict[str, int]: ...
+    def disk_files(self, service: str) -> list[str]: ...
+    def force_aof_rewrite(self, service: str) -> None: ...
+    def disk_contains(self, service: str, needles: Sequence[str]) -> list[str]: ...
+    def redis_set_temp(self, service: str, key: str, value: str, ttl: int) -> None: ...
+    def redis_delete(self, service: str, key: str) -> None: ...
     def mcp_org_dirs(self) -> list[str]: ...
     def mcp_quarantine(self) -> list[str]: ...
 
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_SETTING = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+_E2E_KEY = re.compile(r"^baas:e2e:[a-z0-9-]{1,60}$")
+_REDIS_CLI = 'REDISCLI_AUTH="$BAAS_REDIS_PASSWORD" exec redis-cli "$@"'
+# Busca cada patrón (argumentos 2…) en todos los ficheros del directorio (argumento 1) y escribe el número de los que
+# aparecen. `-E`: el patrón es el que construye `needle_pattern` (el centinela, literal o con escapes de JSON); `-a`:
+# como texto aunque el fichero sea binario (el preámbulo RDB del AOF); `-e`: aunque empiece por «-»; `LC_ALL=C`: bytes,
+# no caracteres. Los centinelas llegan como argumentos: ni el script ni el intérprete del host los ven.
+_SCAN_SCRIPT = """LC_ALL=C; export LC_ALL
+dir=$1; shift; i=0
+for pattern in "$@"; do
+  i=$((i+1))
+  grep -rEqas -e "$pattern" -- "$dir"; rc=$?
+  if [ "$rc" -eq 0 ]; then echo "$i"; elif [ "$rc" -ne 1 ]; then echo "error:$i:$rc"; fi
+done
+"""
+_ERE_SPECIAL = frozenset("\\.[](){}*+?|^$")
+_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "/": "\\/", "\b": "\\b", "\f": "\\f", "\r": "\\r", "\t": "\\t"}
+MAX_NEEDLE = 200
+
+
+def _ere_literal(text: str) -> str:
+    return "".join(f"\\{c}" if c in _ERE_SPECIAL else c for c in text)
+
+
+def _hex_unit(unit: int) -> str:
+    digits = "".join(f"[{d}{d.upper()}]" if d.isalpha() else d for d in f"{unit:04x}")
+    return "\\\\u" + digits
+
+
+def needle_pattern(needle: str) -> str:
+    """Expresión regular (ERE) que reconoce el centinela tal cual y con cualquier mezcla de los escapes de JSON
+    habituales, carácter a carácter: `\\"`, `\\\\`, `\\/`, `\\t`… y `\\uXXXX` (de Python, Go o PHP) para todo lo que no
+    sea alfanumérico ASCII (un autor de JSON puede escapar solo la `@` o solo la `ñ`)."""
+    parts = []
+    for char in needle:
+        forms = [_ere_literal(char)]
+        if char in _SHORT_ESCAPES:
+            forms.append(_ere_literal(_SHORT_ESCAPES[char]))
+        if not (char.isascii() and char.isalnum()):
+            code = ord(char)
+            units = (
+                [code] if code < 0x10000 else [0xD800 + ((code - 0x10000) >> 10), 0xDC00 + ((code - 0x10000) & 0x3FF)]
+            )
+            forms.append("".join(_hex_unit(u) for u in units))
+        parts.append(forms[0] if len(forms) == 1 else f"({'|'.join(forms)})")
+    return "".join(parts)
 
 
 class ContainerInspector:
@@ -468,6 +545,8 @@ class ContainerInspector:
 
     def __init__(self, engine: str, project: str, mcp_data_dir: str = "/data") -> None:
         self.engine, self.project, self.mcp_data_dir = engine, project, mcp_data_dir.rstrip("/")
+        self.poll_interval = 0.2  # entre dos consultas mientras Redis reescribe el AOF
+        self.rewrite_timeout = 30.0  # lo más que se espera a una reescritura
 
     def container(self, service: str) -> str | None:
         out = self._run(["ps", "-aq", "--filter", f"label=com.docker.compose.project={self.project}",
@@ -492,11 +571,25 @@ class ContainerInspector:
             raise StepError(f"no hay contenedor «{service}» en el proyecto «{self.project}» ({self.engine})")
         return self._run(["exec", cid, *argv], check_rc=check_rc)
 
+    def _redis_cli(self, service: str, *args: str, check_rc: bool = True) -> str:
+        """`redis-cli` dentro del contenedor: se autentica con SU `$BAAS_REDIS_PASSWORD`; `args` son argumentos."""
+        return self._exec(service, "sh", "-c", _REDIS_CLI, "sh", *args, check_rc=check_rc)
+
     @staticmethod
     def _slug(slug: str) -> str:
         if not _SLUG.fullmatch(slug):
             raise StepError(f"slug no válido: {slug!r}")
         return slug
+
+    @staticmethod
+    def _service(service: str) -> str:
+        if service not in REDIS_SERVICES:
+            raise StepError(f"servicio de Redis no válido: {service!r} (se esperaba {' o '.join(REDIS_SERVICES)})")
+        return service
+
+    @staticmethod
+    def _lines(out: str) -> list[str]:
+        return [line.strip() for line in out.splitlines() if line.strip()]
 
     def vault_rows(self, slug: str) -> int:
         s = self._slug(slug)
@@ -507,24 +600,156 @@ class ContainerInspector:
             raise StepError(f"psql no devolvió un número: {out[:100]!r}")
         return int(out)
 
-    def redis_keys(self, slug: str) -> list[str]:
+    def conversation_ids(self, slug: str) -> list[str]:
+        """Las conversaciones que el vault conoce de la organización (identificadores del proxy)."""
         s = self._slug(slug)
+        sql = (
+            f"SELECT conversation_id FROM conversation_state WHERE org_slug = '{s}'"  # noqa: S608
+            f" UNION SELECT conversation_id FROM vault_entries WHERE org_slug = '{s}'"
+        )
+        ids = self._lines(self._exec("postgres", "psql", "-U", "postgres", "-d", "baas_vault", "-Atc", sql))
+        bad = [i for i in ids if not _UUID.fullmatch(i)]
+        if bad:
+            raise StepError(f"psql no devolvió un identificador de conversación: {bad[0][:100]!r}")
+        return sorted(ids)
+
+    def redis_services(self) -> list[str]:
+        """Las instancias de Redis de la pila: la persistente y, si existe, la efímera (una antigua no la tiene)."""
+        if self.container(PERSISTENT) is None:
+            raise StepError(f"no hay contenedor «{PERSISTENT}» en el proyecto «{self.project}» ({self.engine})")
+        return [PERSISTENT, *([EPHEMERAL] if self.container(EPHEMERAL) is not None else [])]
+
+    def redis_keys(self, slug: str, conversation_ids: Sequence[str] = ()) -> list[str]:
+        """Claves de la organización en cada instancia, como `[servicio] clave`: su política y sus membresías y, en la
+        efímera, las de sus conversaciones (`baas:conv:<id>:*`: la copia caliente del vault y la copia de la lápida)."""
+        s = self._slug(slug)
+        ids = list(conversation_ids)
+        for conv in ids:
+            if not _UUID.fullmatch(conv):
+                raise StepError(f"identificador de conversación no válido: {conv!r}")
         keys: list[str] = []
-        for pattern in (f"baas:policy:org:{s}", f"baas:member:*:{s}"):
-            out = self._exec(
-                "redis", "sh", "-c", 'REDISCLI_AUTH="$BAAS_REDIS_PASSWORD" exec redis-cli "$@"', "sh",
-                "--scan", "--pattern", pattern,
-            )  # fmt: skip
-            keys += [line.strip() for line in out.splitlines() if line.strip()]
+        for service in self.redis_services():
+            patterns = [f"baas:policy:org:{s}", f"baas:member:*:{s}"]
+            if service == EPHEMERAL:
+                patterns += [f"baas:conv:{conv}:*" for conv in ids]
+            for pattern in patterns:
+                keys += [
+                    f"[{service}] {key}"
+                    for key in self._lines(self._redis_cli(service, "--scan", "--pattern", pattern))
+                ]
         return keys
+
+    def redis_setting(self, service: str, name: str) -> str:
+        """`CONFIG GET <name>` de la instancia (`save ""` da una cadena vacía)."""
+        svc = self._service(service)
+        if not _SETTING.fullmatch(name):
+            raise StepError(f"parámetro de Redis no válido: {name!r}")
+        lines = self._redis_cli(svc, "--raw", "CONFIG", "GET", name).replace("\r", "").split("\n")
+        if lines[0] != name:
+            raise StepError(f"CONFIG GET {name} en «{svc}» no devolvió el parámetro: {lines[0][:100]!r}")
+        return lines[1] if len(lines) > 1 else ""
+
+    def redis_residue(self, service: str) -> dict[str, int]:
+        """Lo que una pila anterior a A′ (H4-02) dejó en la instancia y lleva valores originales: cuántas claves
+        `baas:conv:*:vault` y `baas:conv:*:events` hay (con SCAN, que no bloquea Redis) y cuántas entradas tiene el
+        stream `baas:traces`. Solo devuelve lo que no es cero."""
+        svc = self._service(service)
+        residue: dict[str, int] = {}
+        for pattern in ("baas:conv:*:vault", "baas:conv:*:events"):
+            found = len(self._lines(self._redis_cli(svc, "--scan", "--pattern", pattern)))
+            if found:
+                residue[pattern] = found
+        length = self._redis_cli(svc, "XLEN", "baas:traces").strip()
+        if not length.isdigit():  # redis-cli escribe los errores en la salida estándar y sale con 0
+            raise StepError(f"XLEN baas:traces en «{svc}»: {length[:100]!r}")
+        if int(length):
+            residue["baas:traces"] = int(length)
+        return residue
+
+    def disk_files(self, service: str) -> list[str]:
+        """Los ficheros (todo lo que no es un directorio) de `/data` del contenedor."""
+        svc = self._service(service)
+        out = self._exec(svc, "find", REDIS_DATA_DIR, "-mindepth", "1", "!", "-type", "d")
+        return sorted(self._lines(out))
+
+    def force_aof_rewrite(self, service: str) -> None:
+        """`BGREWRITEAOF` y espera a que Redis termine (`aof_rewrite_in_progress:0`). Solo para la persistente: en una
+        con `appendonly no` crearía ficheros. Si ya había una en marcha, espera a que acabe y pide la suya."""
+        svc = self._service(service)
+        deadline = time.monotonic() + self.rewrite_timeout
+
+        def late() -> StepError:
+            return StepError(f"la reescritura del AOF de «{svc}» no terminó en {self.rewrite_timeout:g} s")
+
+        while True:
+            reply = self._redis_cli(svc, "BGREWRITEAOF", check_rc=False).strip()
+            if "started" in reply or "scheduled" in reply:
+                break
+            if "already in progress" not in reply:
+                raise StepError(f"BGREWRITEAOF en «{svc}»: {reply[:200] or 'sin respuesta'}")
+            if time.monotonic() > deadline:
+                raise late()
+            time.sleep(self.poll_interval)
+        while True:
+            info = dict(
+                line.split(":", 1) for line in self._redis_cli(svc, "INFO", "persistence").splitlines() if ":" in line
+            )
+            busy = (
+                info.get("aof_rewrite_in_progress", "").strip() != "0"
+                or info.get("aof_rewrite_scheduled", "0").strip() != "0"
+            )
+            if not busy:
+                status = info.get("aof_last_bgrewrite_status", "").strip()
+                if status != "ok":
+                    raise StepError(f"la reescritura del AOF de «{svc}» falló: aof_last_bgrewrite_status = {status!r}")
+                return
+            if time.monotonic() > deadline:
+                raise late()
+            time.sleep(self.poll_interval)
+
+    def disk_contains(self, service: str, needles: Sequence[str]) -> list[str]:
+        """Cuáles de los `needles` aparecen en algún fichero de `/data` del contenedor (tal cual o con escapes de JSON).
+        Se busca con `grep` dentro del contenedor: no se copia nada al host."""
+        svc = self._service(service)
+        for needle in needles:
+            if not needle or "\n" in needle or "\x00" in needle or len(needle) > MAX_NEEDLE:
+                raise StepError(
+                    f"centinela no válido (vacío, con salto de línea o NUL, o de más de {MAX_NEEDLE}): {needle!r}"
+                )
+        if not needles:
+            return []
+        patterns = [needle_pattern(needle) for needle in needles]
+        out = self._lines(self._exec(svc, "sh", "-c", _SCAN_SCRIPT, "sh", REDIS_DATA_DIR, *patterns))
+        errors = [line for line in out if line.startswith("error:")]
+        if errors:
+            raise StepError(f"no se pudo leer {REDIS_DATA_DIR} de «{svc}» con grep ({errors[0]})")
+        found = {int(line) for line in out if line.isdigit()}
+        return [needle for index, needle in enumerate(needles, 1) if index in found]
+
+    def redis_set_temp(self, service: str, key: str, value: str, ttl: int) -> None:
+        """`SET <key> <value> EX <ttl>`: una clave de la prueba (`baas:e2e:…`) que caduca sola si no se borra."""
+        svc = self._service(service)
+        if not _E2E_KEY.fullmatch(key):
+            raise StepError(f"clave no permitida: {key!r} (la prueba solo escribe «baas:e2e:<nombre>»)")
+        if not value or "\x00" in value or not 1 <= ttl <= 3600:
+            raise StepError("valor o caducidad no válidos para la clave temporal")
+        reply = self._redis_cli(svc, "SET", key, value, "EX", str(ttl)).strip()
+        if reply != "OK":
+            raise StepError(f"SET {key} en «{svc}»: {reply[:100]!r}")
+
+    def redis_delete(self, service: str, key: str) -> None:
+        svc = self._service(service)
+        if not _E2E_KEY.fullmatch(key):
+            raise StepError(f"clave no permitida: {key!r} (la prueba solo borra «baas:e2e:<nombre>»)")
+        self._redis_cli(svc, "DEL", key)
 
     def mcp_org_dirs(self) -> list[str]:
         out = self._exec("mcp-server", "ls", "-1", f"{self.mcp_data_dir}/orgs", check_rc=False)
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        return self._lines(out)
 
     def mcp_quarantine(self) -> list[str]:
         out = self._exec("mcp-server", "ls", "-1", f"{self.mcp_data_dir}/.quarantine", check_rc=False)
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        return self._lines(out)
 
 
 class MissingInspector:
@@ -533,20 +758,11 @@ class MissingInspector:
     def __init__(self, why: str) -> None:
         self.why = why
 
-    def _fail(self) -> Any:
+    def _fail(self, *_: Any, **__: Any) -> Any:
         raise StepError(f"{self.why}. Usa --inspect podman|docker (y --compose-project) o --inspect none para omitirlo")
 
-    def vault_rows(self, slug: str) -> int:
-        return self._fail()
-
-    def redis_keys(self, slug: str) -> list[str]:
-        return self._fail()
-
-    def mcp_org_dirs(self) -> list[str]:
-        return self._fail()
-
-    def mcp_quarantine(self) -> list[str]:
-        return self._fail()
+    vault_rows = conversation_ids = redis_services = redis_keys = redis_setting = redis_residue = disk_files = _fail
+    force_aof_rewrite = disk_contains = redis_set_temp = redis_delete = mcp_org_dirs = mcp_quarantine = _fail
 
 
 def build_inspector(args: argparse.Namespace) -> Inspector | None:
@@ -590,6 +806,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="ORG_ADMIN de otra organización: primer miembro de la que se elimina")  # fmt: skip
     p.add_argument("--bypass-org", default="demo", help="Organización con AI-IP apagado")
     p.add_argument("--bypass-email", default="analista@demo.test", help="Usuario de la organización sin AI-IP")
+    p.add_argument("--anon-org", default="privada", help="Organización con AI-IP y anonimizador encendidos (grupo 10)")
+    p.add_argument("--anon-email", default="analista@privada.test", help="Usuario (USER) de esa organización")
     p.add_argument("--password", default=DEV_PASSWORD)
     p.add_argument("--totp-secret", default=DEV_TOTP_SECRET)
     p.add_argument("--only", type=h3._csv(GROUPS), default=list(GROUPS),
@@ -597,13 +815,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--apis", type=h3._csv(APIS), default=list(APIS),
                    help=f"APIs que se prueban, separadas por comas: {', '.join(APIS)} (todas)")  # fmt: skip
     p.add_argument("--inspect", choices=("auto", "podman", "docker", "none"), default="auto",
-                   help="Motor para ver el vault, Redis y la cuarentena del MCP («none» omite esos pasos)")  # fmt: skip
+                   help="Motor para mirar los contenedores («none» omite 9.1b, 9.8 y el grupo 10)")  # fmt: skip
     p.add_argument("--compose-project", default=os.environ.get("COMPOSE_PROJECT_NAME") or "baas-dev",
                    help="Proyecto de compose de la pila (por defecto, $COMPOSE_PROJECT_NAME o baas-dev)")  # fmt: skip
     p.add_argument("--mcp-data-dir", default="/data", help="BAAS_DATA_DIR del contenedor del MCP")
     p.add_argument("--trace-timeout", type=float, default=30, help="Segundos de espera de cada traza o propagación")
     p.add_argument("--propagation-wait", type=float, default=1.5,
                    help="Segundos entre cambiar el anonimizador y el turno siguiente (Pub/Sub)")  # fmt: skip
+    p.add_argument("--flush-wait", type=float, default=2.0,
+                   help="Segundos de espera antes de mirar el AOF vivo (Redis lo escribe con retraso)")  # fmt: skip
     p.add_argument("--timeout", type=float, default=60, help="Tiempo máximo de cada petición HTTP")
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
@@ -627,20 +847,42 @@ class Conv:
     past: list[tuple[str, str]] = field(default_factory=list)  # (usuario, asistente) de cada turno ya respondido
 
 
+@dataclass
+class OriginalCase:
+    """Un turno del grupo 10: lo que se envió y de quién es la conversación que debería aparecer en la webapp."""
+
+    case: h3.Case
+    email: str
+    org: str
+
+
+CONTROL_TTL = 300  # segundos que vive la clave del control positivo si la limpieza falla
+SETTLE = 5.0  # lo más que se espera a que Redis suelte los ficheros viejos tras reescribir el AOF
+
+
+def fmt_needles(needles: Iterable[str]) -> str:
+    return ", ".join(f"«{needle}»" for needle in needles)
+
+
 class E2EH4:
     def __init__(self, args: argparse.Namespace, inspector: Inspector | None = None, nonce: str | None = None) -> None:
         self.args = args
         self.nonce = nonce or h3.new_nonce()
         self.inspector = inspector
-        emails = {args.email, args.admin_email, args.orgadmin_email, args.bypass_email}
+        emails = {args.email, args.admin_email, args.orgadmin_email, args.bypass_email, args.anon_email}
         self.keys = {email: dev_api_key(email) for email in emails}
         self.sessions: dict[str, str] = {}
         self.binding: dict[str, Any] = {}
         self.bypass_binding: dict[str, Any] = {}
+        self.anon_binding: dict[str, Any] = {}
+        self.original_cases: list[OriginalCase] = []
         self.observed: list[h3.Case] = []  # casos con el anonimizador apagado que respondieron 200
         self.conversations: dict[str, dict[str, Conv]] = {"A": {}, "B": {}, "C": {}}
         self.slug = new_slug(self.nonce)
         self.member_binding: dict[str, Any] = {}  # handshake de orgadmin_email en la organización que se elimina
+        self.org_conversations: list[
+            str
+        ] = []  # las conversaciones de esa organización según el vault (antes de eliminarla)
         prefix = f"huerf-{self.nonce}"  # grupo «huérfanos» (11)
         self.orph_slugs = {key: f"{prefix}-{key}" for key in ORPHAN_ORGS}
         self.orph = {label: Person(label, f"{prefix}-{label}@{ORPHAN_DOMAIN}", f"Huerfano {label.upper()} {self.nonce}")
@@ -830,6 +1072,10 @@ class E2EH4:
     def handshake_bypass(self) -> str:
         self.bypass_binding = self.handshake(self.args.bypass_email, self.args.bypass_org, ai_ip=False)
         return f"«{self.args.bypass_org}» con AI-IP apagado · {self.bypass_binding['proxy_anthropic_url']}"
+
+    def handshake_anon(self) -> str:
+        self.anon_binding = self.handshake(self.args.anon_email, self.args.anon_org, ai_ip=True)
+        return f"«{self.args.anon_org}» con AI-IP activo · {self.anon_binding['proxy_anthropic_url']}"
 
     def login(self, *emails: str) -> str:
         a = self.args
@@ -1310,12 +1556,22 @@ class E2EH4:
         )
 
     def vault_before(self) -> str:
-        """Antes de eliminar, el vault tiene entradas de la organización (si no, «vacío» después no probaría nada)."""
+        """Antes de eliminar, el vault tiene entradas de la organización (si no, «vacío» después no probaría nada) y
+        se anotan sus conversaciones: las claves de la instancia efímera se buscan por conversación (H4-02)."""
         insp, slug = self.inspector, self.slug
         assert insp is not None  # el paso solo se registra con inspector
         problems = self.poll(lambda: [] if insp.vault_rows(slug) > 0 else ["el vault no tiene entradas"], 5)
         check(not problems, f"antes de eliminar, el vault de «{slug}» debería tener entradas: {problems}")
-        return f"el vault tiene {insp.vault_rows(slug)} fila(s) de «{slug}»"
+        self.org_conversations = insp.conversation_ids(slug)
+        check(
+            self.org_conversations, f"el vault tiene filas de «{slug}» pero ninguna conversación: ¿cambió el esquema?"
+        )
+        rows, convs = insp.vault_rows(slug), len(self.org_conversations)
+        detail = f"el vault tiene {rows} fila(s) de «{slug}» en {convs} conversación(es)"
+        if EPHEMERAL in insp.redis_services():
+            held = [k for k in insp.redis_keys(slug, self.org_conversations) if k.startswith(f"[{EPHEMERAL}]")]
+            return f"{detail}; {EPHEMERAL} guarda {len(held)} clave(s) de ellas"
+        return f"{detail}; la pila no tiene {EPHEMERAL}"
 
     def delete_rules(self) -> str:
         a, slug, problems = self.args, self.slug, []
@@ -1478,14 +1734,19 @@ class E2EH4:
             lambda: self.inside_problems(insp, self.slug)
         )  # el proxy y el MCP lo hacen al recibir org.deleted
         check(not problems, "\n".join(problems))
-        return "vault vacío, Redis sin sus claves y el directorio del MCP en cuarentena (.quarantine/)"
+        services = insp.redis_services()
+        redis = " y ".join(f"«{s}»" for s in services)
+        note = "" if EPHEMERAL in services else f" (la pila no tiene {EPHEMERAL}: solo se miró «{PERSISTENT}»)"
+        return f"vault vacío, sin claves en Redis ({redis}) y el directorio del MCP en cuarentena (.quarantine/){note}"
 
     def inside_problems(self, insp: Inspector, slug: str) -> list[str]:
         problems = []
         rows = insp.vault_rows(slug)
         if rows:
             problems.append(f"el vault conserva {rows} fila(s) de la organización")
-        keys = insp.redis_keys(slug)
+        if not self.org_conversations:
+            problems.append("no se anotaron las conversaciones de la organización antes de eliminarla (¿falló 9.1b?)")
+        keys = insp.redis_keys(slug, self.org_conversations)
         if keys:
             problems.append(f"Redis conserva claves de la organización: {', '.join(keys[:5])}")
         return problems + self.quarantine_problems(insp, slug)
@@ -1497,6 +1758,207 @@ class E2EH4:
         if not [name for name in insp.mcp_quarantine() if name.startswith(f"{slug}-")]:
             problems.append(f"no hay ninguna entrada «{slug}-<fecha>» en .quarantine/ del MCP")
         return problems
+
+    # --- 10: los originales no llegan al disco de Redis (H4-02, la prueba canario) ---------------------------------
+    def settle(self) -> float:
+        return min(self.args.trace_timeout, SETTLE)
+
+    def redis_inspector(self) -> Inspector:
+        assert self.inspector is not None  # los pasos del grupo solo se registran con inspector
+        return self.inspector
+
+    def has_ephemeral(self) -> str:
+        services = self.redis_inspector().redis_services()
+        check(
+            EPHEMERAL in services,
+            f"sin {EPHEMERAL}: los originales siguen llegando al AOF de «{PERSISTENT}» (la pila es anterior a H4-02 o "
+            "le falta el servicio; sin BAAS_REDIS_EPHEMERAL_URL el proxy y la webapp usan una sola instancia)",
+        )
+        return f"la pila tiene {' y '.join(f'«{s}»' for s in services)}"
+
+    def no_residue(self) -> str:
+        """La persistente no guarda lo que dejó una pila anterior a A′ (H4-02): copias calientes del vault y trazas con
+        valores originales. Se mira antes de enviar nada, para que no se confunda con una fuga de esta ejecución."""
+        residue = self.redis_inspector().redis_residue(PERSISTENT)
+        if residue:
+            what = {
+                "baas:conv:*:vault": "clave(s) `baas:conv:*:vault` (copias calientes del vault)",
+                "baas:conv:*:events": "clave(s) `baas:conv:*:events`",
+                "baas:traces": "entrada(s) en el stream `baas:traces`",
+            }
+            found = ", ".join(f"{n} {what.get(pattern, pattern)}" for pattern, n in residue.items())
+            raise StepError(
+                f"«{PERSISTENT}» (persistente) conserva {found}: residuo de una pila anterior a A′ (H4-02): "
+                "ejecuta `deploy/scripts/purge-redis-originals.sh` (y vuelve a lanzar la prueba). Si ya lo habías "
+                "ejecutado y vuelve a salir, algo escribe todavía los originales en la persistente: busca en "
+                f"BAAS_REDIS_EPHEMERAL_URL del proxy y de la webapp (10.4 y 10.6 lo delatan con `--only originales`)"
+            )
+        return f"«{PERSISTENT}» no guarda copias calientes del vault, claves de eventos ni trazas de una pila anterior"
+
+    def send_originals(self) -> str:
+        """Un turno con los tres valores y la cadena de la ejecución por cada modo, API y forma (con y sin stream)."""
+        a = self.args
+        modes = [
+            ("bypass", self.bypass_binding, a.bypass_email, a.bypass_org),
+            ("observe", self.binding, a.email, a.org),
+            ("anon", self.anon_binding, a.anon_email, a.anon_org),
+        ]
+        problems: list[str] = []
+        self.original_cases = []
+        for api in self.apis():
+            for stream in (False, True):
+                for mode, binding, email, org in modes:
+                    case = self.case(f"orig-{mode}", api, stream)
+                    case.payload = h3.request_body(api, case.model, f"{case.tag}. {SENSITIVE_TEXT}.", stream=stream)
+                    res = self.send(binding, email, api, case.payload)[1]
+                    if res.status == 200:
+                        self.original_cases.append(OriginalCase(case, email, org))
+                    else:
+                        problems.append(f"«{org}» · {case.label} → HTTP {res.status}: {h3.snippet(res.body)}")
+        check(not problems, "\n".join(problems))
+        return (
+            f"{len(self.original_cases)} turno(s) con DNI, email e IBAN: «{a.bypass_org}» (AI-IP apagado), "
+            f"«{a.org}» (anonimizador apagado) y «{a.anon_org}» (anonimizador encendido), en {self.api_names()}, "
+            "con y sin streaming"
+        )
+
+    def originals_consumed(self) -> str:
+        """La webapp ya consumió las trazas: cada conversación aparece en la lista de su dueño."""
+
+        def missing() -> list[str]:
+            seen: dict[tuple[str, str], set[str]] = {}
+            lost = []
+            for item in self.original_cases:
+                key = (item.email, item.org)
+                if key not in seen:
+                    seen[key] = {str(i.get("model")) for i in self.list_conversations(*key) if i.get("turn_count")}
+                if item.case.model not in seen[key]:
+                    lost.append(f"«{item.org}» · {item.case.label}")
+            return [f"la webapp no muestra {len(lost)} conversación(es): {'; '.join(lost[:4])}"] if lost else []
+
+        problems = self.poll(missing)
+        check(not problems, "\n".join(problems))
+        return f"las {len(self.original_cases)} conversaciones aparecen en la webapp: sus trazas ya se consumieron"
+
+    def data_dir_problems(self, service: str) -> list[str]:
+        """Si Redis escribe en otro directorio, el escáner (que mira `/data`) no vería sus ficheros."""
+        where = self.redis_inspector().redis_setting(service, "dir").rstrip("/") or "/"
+        if where != REDIS_DATA_DIR:
+            return [f"«{service}» escribe en {where}, no en {REDIS_DATA_DIR}: el escáner no vería sus ficheros"]
+        return []
+
+    def aof_live_clean(self) -> str:
+        """Antes de reescribir nada: la traza de cada turno se escribió (y se borró) en alguna instancia; si fue en la
+        persistente, su texto sigue en el AOF vivo aunque ya no esté en memoria (el problema de H4-02)."""
+        insp = self.redis_inspector()
+        time.sleep(self.args.flush_wait)  # con appendfsync everysec, Redis puede retrasar hasta 2 s escribir el AOF
+        problems = self.data_dir_problems(PERSISTENT)
+        found = insp.disk_contains(PERSISTENT, run_needles(self.nonce))
+        if found:
+            problems.append(
+                f"«{PERSISTENT}» (persistente) tiene en el AOF, sin reescribirlo: {fmt_needles(found)}. "
+                "Las trazas con los originales llegan a su disco y borrarlas no las saca del fichero (H4-02)"
+            )
+        check(not problems, "\n".join(problems))
+        files = insp.disk_files(PERSISTENT)
+        return (
+            f"{len(files)} fichero(s) en {REDIS_DATA_DIR} de «{PERSISTENT}» y ningún «caso-{self.nonce}» "
+            "(el AOF vivo, sin reescribir; vale si el control positivo 10.5 pasa)"
+        )
+
+    def remove_control(self, key: str, sentinel: str) -> list[str]:
+        """Borra la clave del control y reescribe el AOF para que su valor salga del fichero. No lanza: devuelve los
+        problemas (si no se puede, la clave caduca sola)."""
+        insp = self.redis_inspector()
+        try:
+            insp.redis_delete(PERSISTENT, key)
+            insp.force_aof_rewrite(PERSISTENT)
+            return self.poll(
+                lambda: (
+                    [f"el control positivo sigue en el disco de «{PERSISTENT}» tras borrar «{key}» y reescribir"]
+                    if insp.disk_contains(PERSISTENT, [sentinel])
+                    else []
+                ),
+                self.settle(),
+            )
+        except StepError as exc:
+            return [
+                f"no se pudo limpiar el control positivo: {exc}. La clave «{key}» (valor «{sentinel}») "
+                f"caduca sola en {CONTROL_TTL} s"
+            ]
+
+    def scanner_control(self) -> str:
+        """Control positivo del escáner: un valor propio en la persistente, que el escáner tiene que encontrar en el
+        AOF vivo y tras reescribirlo (si no, «ningún original» no probaría nada). Se borra y se reescribe siempre."""
+        insp = self.redis_inspector()
+        key, sentinel = f"baas:e2e:escaner-{self.nonce}", f"e2e-control-{self.nonce}"
+        problems: list[str] = []
+        try:
+            insp.redis_set_temp(PERSISTENT, key, sentinel, CONTROL_TTL)
+            if self.poll(lambda: [] if insp.disk_contains(PERSISTENT, [sentinel]) else ["no"], self.settle()):
+                problems.append(
+                    f"el escáner no encuentra el control positivo «{sentinel}» en el AOF vivo de «{PERSISTENT}»: "
+                    "no vería los originales que escribiera Redis"
+                )
+            insp.force_aof_rewrite(PERSISTENT)
+            if not insp.disk_contains(PERSISTENT, [sentinel]):
+                problems.append(
+                    f"el escáner no encuentra el control positivo «{sentinel}» tras reescribir el AOF de "
+                    f"«{PERSISTENT}»: no vería lo que Redis conserva en la base reescrita"
+                )
+        except StepError as exc:
+            problems.append(str(exc))
+        finally:
+            problems += self.remove_control(key, sentinel)
+        check(not problems, "\n".join(problems))
+        return (
+            f"el escáner encuentra «{sentinel}» en el AOF vivo y tras reescribirlo, y ya no lo encuentra tras "
+            f"borrar «{key}» y reescribir"
+        )
+
+    def aof_rewritten_clean(self) -> str:
+        """Tras `BGREWRITEAOF` el AOF es lo que Redis tiene en memoria: ningún original vivo (el vault caliente)."""
+        insp = self.redis_inspector()
+        insp.force_aof_rewrite(PERSISTENT)
+        needles = disk_needles(self.nonce)
+
+        def scan() -> list[str]:
+            found = insp.disk_contains(PERSISTENT, needles)
+            if not found:
+                return []
+            return [
+                f"«{PERSISTENT}» (persistente) contiene tras reescribir el AOF: {fmt_needles(found)}. "
+                "Lo que Redis guarda en memoria incluye originales y llega a su disco (H4-02)"
+            ]
+
+        problems = self.poll(scan, self.settle())  # Redis borra los ficheros viejos un instante después
+        check(not problems, "\n".join(problems))
+        files = insp.disk_files(PERSISTENT)
+        return (
+            f"tras BGREWRITEAOF, ninguno de los {len(needles)} centinelas en los {len(files)} fichero(s) "
+            f"de «{PERSISTENT}»"
+        )
+
+    def ephemeral_clean(self) -> str:
+        """La efímera no persiste nada: sin AOF ni RDB, sin ficheros en `/data` y sin centinelas en ellos."""
+        insp = self.redis_inspector()
+        problems = []
+        for name, want in (("appendonly", "no"), ("save", "")):
+            got = insp.redis_setting(EPHEMERAL, name)
+            if got != want:
+                problems.append(f"«{EPHEMERAL}» tiene {name} = {got!r} (se esperaba {want!r})")
+        problems += self.data_dir_problems(EPHEMERAL)
+        files = insp.disk_files(EPHEMERAL)
+        if files:
+            problems.append(
+                f"«{EPHEMERAL}» tiene {len(files)} fichero(s) en {REDIS_DATA_DIR} ({', '.join(files[:4])}): "
+                "sin volumen no debería haber ninguno"
+            )
+        found = insp.disk_contains(EPHEMERAL, disk_needles(self.nonce))
+        if found:
+            problems.append(f"«{EPHEMERAL}» contiene en disco: {fmt_needles(found)}")
+        check(not problems, "\n".join(problems))
+        return f'«{EPHEMERAL}»: appendonly no, save "", {REDIS_DATA_DIR} sin ficheros y sin centinelas'
 
     # --- 11: usuarios que se quedan sin organización (huérfanos) --------------------------------------------
     def slug_of(self, key: str) -> str:
@@ -2120,19 +2582,31 @@ class E2EH4:
         s4 = f"4. «{a.org}» con el anonimizador apagado"
         step(s0, self.webapp_up)
         step(s1, self.fake_debug)
-        need_obs = bool(groups & {"observacion", "interruptor"})
+        present = residue = None
+        if "originales" in groups and self.inspector is not None:
+            # lo primero de todo, antes de enviar nada: así el residuo de una pila anterior no se confunde con lo que
+            # escriban en la persistente los grupos 5 a 9 si el proxy o la webapp siguen usando una sola instancia
+            present = f"10.1 la pila tiene {EPHEMERAL} (sin ella los originales siguen en el AOF)"
+            step(present, self.has_ephemeral)
+            residue = "10.0 la persistente no guarda residuo de una pila anterior a A′ (H4-02)"
+            step(residue, self.no_residue, needs=[present])
+        s2c = f"2c. handshake de {a.anon_email} ({a.anon_org}, AI-IP activo)"
+        need_obs = bool(groups & {"observacion", "interruptor", "originales"})
         if need_obs:
             step(s2, self.handshake_observation, needs=[s0])
-        if "observacion" in groups:
+        if groups & {"observacion", "originales"}:
             step(s2b, self.handshake_bypass, needs=[s0])
+        if "originales" in groups:
+            step(s2c, self.handshake_anon, needs=[s0])
         logins = (
             [a.admin_email, a.email]
-            + ([a.bypass_email] if "observacion" in groups else [])
+            + ([a.bypass_email] if groups & {"observacion", "originales"} else [])
+            + ([a.anon_email] if "originales" in groups else [])
             + ([a.orgadmin_email] if groups & {"interruptor", "eliminar"} else [])
         )
         step(s3, lambda: self.login(*logins), needs=[s0])
         cases = [(api, stream) for api in APIS for stream in (False, True)]
-        if groups & {"observacion", "interruptor"}:
+        if groups & {"observacion", "interruptor", "originales"}:
             step(s4, self.ensure_off, needs=[s3])
         if "observacion" in groups:
             names = []
@@ -2194,6 +2668,19 @@ class E2EH4:
             step("9.7 la auditoría conserva org.deleted", self.audit_survives, needs=[deleted])
             if self.inspector is not None:
                 step("9.8 vault vacío, Redis sin claves y MCP en cuarentena", self.inside, needs=[deleted])
+        if "originales" in groups and present is not None and residue is not None:
+            sent = "10.2 turnos con valores centinela: bypass, observación y AI-IP con anonimizador"
+            step(sent, self.send_originals, needs=[present, s2, s2b, s2c, s4])
+            consumed = "10.3 la webapp consume las trazas (las conversaciones aparecen)"
+            step(consumed, self.originals_consumed, needs=[sent, s3])
+            step("10.4 AOF de la persistente sin originales, tal como está", self.aof_live_clean,
+                 needs=[consumed, residue])  # fmt: skip
+            control = "10.5 control positivo del escáner (valor propio, reescritura y limpieza)"
+            step(control, self.scanner_control, needs=[present])
+            step("10.6 AOF de la persistente sin originales tras forzar la reescritura", self.aof_rewritten_clean,
+                 needs=[consumed, control, residue])  # fmt: skip
+            step("10.7 la efímera no persiste nada: sin AOF, sin RDB y sin ficheros", self.ephemeral_clean,
+                 needs=[consumed, control])  # fmt: skip
         if "huerfanos" in groups:
             base = [s0, s1, s3]
             setup = "11.1 crear 4 organizaciones y 7 usuarios (invitar, activar, claves personales)"
@@ -2231,10 +2718,13 @@ class E2EH4:
 def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> int:
     args = parse_args(argv)
     runner = Runner()
-    inspector = inspector if inspector is not None else build_inspector(args) if "eliminar" in args.only else None
+    wants_containers = bool({"eliminar", "originales"} & set(args.only))
+    inspector = inspector if inspector is not None else build_inspector(args) if wants_containers else None
     e2e = E2EH4(args, inspector)
     print(f"Prueba de punta a punta H4 · webapp {args.app_url} · proveedor falso {args.fake_url}"
           f" · organización {args.org} · ejecución {e2e.nonce}")  # fmt: skip
+    if "originales" in args.only and inspector is None:
+        print("NOTA: el grupo «originales» mira dentro de los contenedores (--inspect podman|docker): se omite")
     e2e.run(runner)
     report = {**runner.report(), "app_url": args.app_url, "fake_url": args.fake_url, "nonce": e2e.nonce,
               "only": args.only, "apis": args.apis,
