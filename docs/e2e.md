@@ -331,6 +331,7 @@ borra, con caducidad de 300 s por si la limpieza fallara.
 
 | Paso | Comprobación |
 | :--- | :--- |
+| 10.0 | **Sin residuo de una pila anterior a A′** en la persistente: ninguna clave `baas:conv:*:vault` (copias calientes del vault, con valores originales) ni `baas:conv:*:events` (se buscan con `SCAN`, nunca con `KEYS`) y `baas:traces` ausente o con `XLEN` 0. Una pila que **venía de H4-08** conserva en `redis` esas copias (en una pila de integración, casi un millar), que 10.6 vería como una fuga. Si hay, **falla** con cuántas claves y de qué tipo y con la receta: «residuo de una pila anterior a A′ (H4-02): ejecuta `deploy/scripts/purge-redis-originals.sh` (y vuelve a lanzar la prueba)». Depende de 10.1 y **se ejecuta, junto con 10.1, antes que cualquier otro paso con tráfico** (justo después de 1): así lo que escriban en la persistente los grupos 5 a 9 si el proxy o la webapp siguen con una sola instancia no se confunde con residuo, y lo delatan 10.4 y 10.6 |
 | 10.1 | La pila tiene `redis` **y `redis-ephemeral`**. Si no (una pila anterior a H4-02), **falla** con «sin redis-ephemeral: los originales siguen llegando al AOF» y el resto del grupo queda `SALTADO` |
 | 10.2 | Un turno por **modo** (bypass en `demo` con `analista@demo.test`, observación en `observacion` con `observador@observacion.test`, AI-IP con anonimizador en `privada` con `analista@privada.test`), **API** (Messages, Chat Completions y Responses) y forma (con y sin *streaming*): 18 conversaciones, todas `200`. Se eligen estas tres organizaciones, que ya existen en la semilla, para no crear ni cambiar nada; la tercera pasa por el vault (la copia caliente con los valores) y las tres por las trazas |
 | 10.3 | La webapp **consume** las trazas: cada conversación aparece en la lista de su dueño (si no, las trazas podrían seguir en el stream y el resto no probaría lo que debe) |
@@ -345,7 +346,9 @@ del contenedor y con los centinelas como **argumentos** (ni el script ni el *she
 conocidos: solo mira `/data` (10.4 y 10.7 comprueban que `dir` es `/data`); un texto largo y repetitivo en el
 preámbulo RDB de la base del AOF puede ir comprimido con LZF y no encontrarse literalmente (la primera copia de cada
 centinela siempre va sin comprimir, y el control positivo prueba que la base se lee); **10.4 solo vale si 10.5 pasa**
-(un escáner ciego daría «no encontrado» en los dos), y por eso 10.6 y 10.7 dependen de 10.5.
+(un escáner ciego daría «no encontrado» en los dos), y por eso 10.6 y 10.7 dependen de 10.5. 10.4 y 10.6 dependen además de 10.0: con residuo no se pronuncian (quedan `SALTADO`), pero 10.5 y 10.7 sí se ejecutan.
+
+**Limpiar el residuo de una pila real.** Al actualizar una pila de H4-08 a A′, la persistente conserva las copias calientes del vault y las trazas pendientes que escribió el proxy antes: `deploy/scripts/purge-redis-originals.sh` las borra (con `--check` solo comprueba, sin borrar nada). Después, el AOF puede seguir teniendo esos originales hasta que se reescriba: el grupo reescribe el AOF en 10.5 y 10.6 y comprueba que ya no están. Si 10.0 vuelve a fallar tras purgar, algo sigue escribiendo originales en la persistente (¿falta `BAAS_REDIS_EPHEMERAL_URL` en el proxy o en la webapp?): lanza `--only originales` para ver qué paso lo delata.
 
 **Usuarios que se quedan sin organización** (parte `huerfanos`; contrato §6). Todo con nombres únicos de la ejecución
 (`huerf-<ejecución>-…`): organizaciones `…-o1` a `…-o4` y usuarios `…-a` a `…-g@huerf.test`, creados y activados por la API
@@ -440,6 +443,7 @@ motivo; `test_every_fault_is_detected` falla si se añade un fallo sin su caso.
 | `originals-in-aof` (las trazas **y** la copia caliente del vault van a la persistente) | 10.4 y 10.6 |
 | `scanner-blind` (el escáner no lee la base binaria del AOF) | 10.5; 10.6 y 10.7 quedan `SALTADO` |
 | `ephemeral-persists` (`redis-ephemeral` con `appendonly yes` y ficheros en `/data`) | 10.7 |
+| `residue-in-persistent` (la persistente conserva copias calientes del vault, claves de eventos y trazas de una pila anterior a A′) | 10.0 (10.4 y 10.6, `SALTADO`) |
 | `preview-lists-all` (lista a todos los miembros) · `preview-needs-block` (exige la organización bloqueada) | 11.3 |
 | `preview-open` (la pide un ORG_ADMIN o un USER) | 11.4 |
 | `orphans-kept` (no desactiva a nadie) · `orphans-other-org` (desactiva también a quien conserva otra organización) | 11.5 |
@@ -501,8 +505,9 @@ confirmarlos al integrar:
   (la prueba se autentica con la del propio contenedor), `sh`, `grep` (con `-r`, `-E`, `-a`, `-q`, `-s`) y `find`;
   el proxy y la webapp llevan `BAAS_REDIS_EPHEMERAL_URL`; `baas_vault` tiene `conversation_state(conversation_id,
   org_slug)` y `vault_entries(conversation_id, org_slug)`; la organización `privada` (AI-IP y anonimizador encendidos)
-  y `analista@privada.test` están en la semilla de desarrollo (los de H3). En una pila sin `redis-ephemeral` los pasos
-  9.1b y 9.8 miran solo `redis` y el grupo `originales` falla en 10.1.
+  y `analista@privada.test` están en la semilla de desarrollo (los de H3); `deploy/scripts/purge-redis-originals.sh`
+  existe (lo cita 10.0). En una pila sin `redis-ephemeral` los pasos 9.1b y 9.8 miran solo `redis` y el grupo
+  `originales` falla en 10.1.
 - **Pila**: el contenedor de PostgreSQL se llama por su servicio (`com.docker.compose.service=postgres`) y admite
   `psql -U postgres` sin contraseña desde dentro; el de Redis tiene `BAAS_REDIS_PASSWORD` en su entorno; el del MCP lleva
   `ls`. Con `--inspect none`, o sin `podman`/`docker` que vea el proyecto, los pasos 9.1b y 9.8 y el grupo `originales`

@@ -1040,7 +1040,7 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(len([n for n in steps if n.startswith("5.")]), 6)
         once = ["0.", "1.", "2.", "2b.", "3.", "4.", "6.", "7.1", "7.2", "7.3", "8.1 ", "8.2", "8.3", "8.4", "8.5"]
         once += ["8.6", "8.7", "8.8", "8.9", "8.10", "8.11", "8.12", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5"]
-        once += ["9.6", "9.7", "9.8", "10.1", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7"]
+        once += ["9.6", "9.7", "9.8", "10.0", "10.1", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7"]
         once += ["11.1 ", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7", "11.8", "11.9", "11.10", "11.11", "11.12 "]
         once += ["11.12b", "11.13", "11.14"]
         for prefix in once:
@@ -1116,7 +1116,7 @@ class FullRunTest(unittest.TestCase):
             sent = [(c.org, c.api) for c in stack.state.convs.values() if "-orig-" in c.model]
         self.assert_all_ok(code, steps, out)
         self.assertEqual(sorted(steps)[0][:4], "0. w")
-        self.assertEqual(len([n for n in steps if n.startswith("10.")]), 7)
+        self.assertEqual(len([n for n in steps if n.startswith("10.")]), 8)
         self.assertEqual(len(sent), 18, "3 modos × 3 APIs × con y sin streaming")
         self.assertEqual({org for org, _ in sent}, {"demo", "observacion", "privada"})
         self.assertEqual(temporary, [], "la clave del control positivo se borró")
@@ -1239,6 +1239,13 @@ class FaultsTest(unittest.TestCase):
         "ephemeral-persists": {"10.7": ("«redis-ephemeral»", "appendonly", "fichero", "caso-")},
         "scanner-blind": {"10.5": ("control positivo", "tras reescribir", "no vería")},
         "no-ephemeral": {"10.1": ("sin redis-ephemeral", "los originales siguen llegando al AOF")},
+        "residue-in-persistent": {
+            "10.0": (
+                "residuo de una pila anterior a A′ (H4-02)",
+                "deploy/scripts/purge-redis-originals.sh",
+                "vuelve a lanzar",
+            ),
+        },
         "no-quarantine": {"9.8": (".quarantine", "no hay ninguna entrada")},
         "audit-missing": {"9.7": ("org.deleted",)},
         "delete-removes-users": {"9.5": ("handshake",)},
@@ -1286,6 +1293,47 @@ class FaultsTest(unittest.TestCase):
                         for fragment in fragments:
                             self.assertIn(fragment, step["detail"], f"{fault}: {name}")
 
+    def test_residue_is_reported_before_anything_is_sent_and_says_what_to_do(self) -> None:
+        with fake_h4_stack.FakeH4Stack(faults={"residue-in-persistent"}) as stack:
+            code, steps, out = run_e2e(stack, "--trace-timeout", "0.5")
+        self.assertEqual(code, 1, out)
+        names = list(steps)
+        first = next(n for n in names if n.startswith("10.0"))
+        self.assertLess(next(i for i, n in enumerate(names) if n.startswith("10.1")), names.index(first))
+        self.assertLess(names.index(first), next(i for i, n in enumerate(names) if n.startswith("2.")))
+        self.assertEqual(steps[first]["status"], "FALLO")
+        detail = steps[first]["detail"]
+        self.assertRegex(detail, r"3 clave\(s\) `baas:conv:\*:vault`")
+        self.assertRegex(detail, r"1 clave\(s\) `baas:conv:\*:events`")
+        self.assertRegex(detail, r"2 entrada\(s\) en el stream `baas:traces`")
+        by_prefix = {n.split(" ")[0]: s["status"] for n, s in steps.items()}
+        self.assertEqual(by_prefix["10.4"], "SALTADO", "el residuo no se confunde con una fuga")
+        self.assertEqual(by_prefix["10.6"], "SALTADO")
+        self.assertEqual(by_prefix["10.5"], "OK", "el control positivo no depende del residuo")
+        self.assertEqual(by_prefix["10.7"], "OK")
+        self.assertEqual(
+            [n for n, s in steps.items() if s["status"] != "OK" and not n.startswith("10.")], [], "lo demás sigue"
+        )
+
+    def test_once_the_residue_is_purged_the_whole_group_passes(self) -> None:
+        with fake_h4_stack.FakeH4Stack(faults={"residue-in-persistent"}) as stack:
+            persistent = stack.state.redis[fake_h4_stack.PERSISTENT]
+            for key in [k for k in persistent.live if k.startswith(("baas:conv:", "baas:traces"))]:
+                persistent.delete(key)
+            persistent.rewrite()
+            code, steps, out = run_e2e(stack)
+        self.assertEqual(code, 0, out)
+        self.assertEqual({s["status"] for s in steps.values()}, {"OK"}, out)
+
+    def test_a_leak_of_this_run_is_not_mistaken_for_residue(self) -> None:
+        """Los pasos 10.0 y 10.1 miran antes de enviar nada: lo que escriben los grupos 5 a 9 en la persistente lo
+        delatan 10.4 y 10.6, no 10.0 (que mandaría a purgar una pila que se vuelve a ensuciar)."""
+        with fake_h4_stack.FakeH4Stack(faults={"originals-in-aof"}) as stack:
+            code, steps, out = run_e2e(stack, "--trace-timeout", "0.5")
+        self.assertEqual(code, 1, out)
+        by_prefix = {n.split(" ")[0]: s["status"] for n, s in steps.items()}
+        self.assertEqual((by_prefix["10.0"], by_prefix["10.4"], by_prefix["10.6"]), ("OK", "FALLO", "FALLO"))
+
     def test_a_blind_scanner_makes_the_dependent_check_skip_and_still_cleans_up(self) -> None:
         with fake_h4_stack.FakeH4Stack(faults={"scanner-blind"}) as stack:
             code, steps, out = run_e2e(stack, "--trace-timeout", "0.5", "--only", "originales")
@@ -1306,6 +1354,7 @@ class FaultsTest(unittest.TestCase):
             ("ephemeral-keys-kept", {"9.8"}),
             ("ephemeral-persists", {"10.7"}),
             ("traces-in-aof", {"10.4"}),  # la traza ya no está en memoria: solo el AOF vivo delata la fuga
+            ("residue-in-persistent", {"10.0"}),  # el residuo no se confunde con una fuga en 10.4 ni en 10.6
         )
         for fault, failing in cases:
             steps = self.run_fault(fault)

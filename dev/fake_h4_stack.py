@@ -130,6 +130,7 @@ FAULTS = {
     "ephemeral-persists": "la instancia efímera tiene appendonly yes y escribe ficheros en /data",
     "scanner-blind": "el escáner de disco no lee los ficheros binarios de la persistente (la base reescrita del AOF)",
     "no-ephemeral": "la pila no tiene redis-ephemeral (antigua): los originales siguen llegando al AOF",
+    "residue-in-persistent": "la persistente conserva copias calientes y trazas de una pila anterior a A′",
     "no-quarantine": "el directorio del MCP no pasa a cuarentena",
     "audit-missing": "la eliminación no deja rastro en la auditoría",
     "delete-removes-users": "al eliminar una organización se elimina también a sus usuarios",
@@ -340,12 +341,25 @@ class StackState:
         self.audit: list[dict[str, Any]] = []
         self.redis_keys: set[str] = set()  # instancia persistente: política y membresías
         self.redis = {PERSISTENT: FakeRedis(True), EPHEMERAL: FakeRedis("ephemeral-persists" in faults)}
+        if "residue-in-persistent" in faults:
+            self.seed_residue()
         for user in users:
             for slug in user.memberships:
                 self.redis_keys.add(f"baas:member:{user.id}:{slug}")
         self.redis_keys |= {f"baas:policy:org:{slug}" for slug in self.orgs}
         self.mcp_dirs: dict[str, dict[str, str]] = {}
         self.quarantine: list[str] = []
+
+    def seed_residue(self) -> None:
+        """Lo que una pila de H4-08 dejaría en la persistente: tres copias calientes del vault con valores, una clave
+        de eventos y dos entradas sin consumir del stream de trazas."""
+        old = self.redis[PERSISTENT]
+        values = json.dumps({"[[DNI_001]]": "12345678Z", "[[EMAIL_001]]": "ana.perez@privada.test"})
+        for _ in range(3):
+            old.set(f"baas:conv:{uuid.uuid4()}:vault", values)
+        old.set(f"baas:conv:{uuid.uuid4()}:events", values)
+        for n in (1, 2):
+            old.set(f"baas:traces:antigua-{n}", values)
 
     @property
     def ephemeral_keys(self) -> set[str]:
@@ -983,6 +997,16 @@ class FakeInspector:
                     held = sorted(k for k in self.state.ephemeral_keys if k.startswith(f"baas:conv:{conv}:"))
                     found += [f"[{EPHEMERAL}] {k}" for k in held]
             return found
+
+    def redis_residue(self, service: str) -> dict[str, int]:
+        with self.state.lock:
+            live = self.state.redis[service].live
+            counts = {
+                "baas:conv:*:vault": sum(k.startswith("baas:conv:") and k.endswith(":vault") for k in live),
+                "baas:conv:*:events": sum(k.startswith("baas:conv:") and k.endswith(":events") for k in live),
+                "baas:traces": sum(k.startswith("baas:traces:") for k in live),
+            }
+            return {pattern: n for pattern, n in counts.items() if n}
 
     def redis_setting(self, service: str, name: str) -> str:
         with self.state.lock:

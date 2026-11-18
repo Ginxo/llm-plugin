@@ -1776,6 +1776,25 @@ class E2EH4:
         )
         return f"la pila tiene {' y '.join(f'«{s}»' for s in services)}"
 
+    def no_residue(self) -> str:
+        """La persistente no guarda lo que dejó una pila anterior a A′ (H4-02): copias calientes del vault y trazas con
+        valores originales. Se mira antes de enviar nada, para que no se confunda con una fuga de esta ejecución."""
+        residue = self.redis_inspector().redis_residue(PERSISTENT)
+        if residue:
+            what = {
+                "baas:conv:*:vault": "clave(s) `baas:conv:*:vault` (copias calientes del vault)",
+                "baas:conv:*:events": "clave(s) `baas:conv:*:events`",
+                "baas:traces": "entrada(s) en el stream `baas:traces`",
+            }
+            found = ", ".join(f"{n} {what.get(pattern, pattern)}" for pattern, n in residue.items())
+            raise StepError(
+                f"«{PERSISTENT}» (persistente) conserva {found}: residuo de una pila anterior a A′ (H4-02): "
+                "ejecuta `deploy/scripts/purge-redis-originals.sh` (y vuelve a lanzar la prueba). Si ya lo habías "
+                "ejecutado y vuelve a salir, algo escribe todavía los originales en la persistente: busca en "
+                f"BAAS_REDIS_EPHEMERAL_URL del proxy y de la webapp (10.4 y 10.6 lo delatan con `--only originales`)"
+            )
+        return f"«{PERSISTENT}» no guarda copias calientes del vault, claves de eventos ni trazas de una pila anterior"
+
     def send_originals(self) -> str:
         """Un turno con los tres valores y la cadena de la ejecución por cada modo, API y forma (con y sin stream)."""
         a = self.args
@@ -2563,6 +2582,14 @@ class E2EH4:
         s4 = f"4. «{a.org}» con el anonimizador apagado"
         step(s0, self.webapp_up)
         step(s1, self.fake_debug)
+        present = residue = None
+        if "originales" in groups and self.inspector is not None:
+            # lo primero de todo, antes de enviar nada: así el residuo de una pila anterior no se confunde con lo que
+            # escriban en la persistente los grupos 5 a 9 si el proxy o la webapp siguen usando una sola instancia
+            present = f"10.1 la pila tiene {EPHEMERAL} (sin ella los originales siguen en el AOF)"
+            step(present, self.has_ephemeral)
+            residue = "10.0 la persistente no guarda residuo de una pila anterior a A′ (H4-02)"
+            step(residue, self.no_residue, needs=[present])
         s2c = f"2c. handshake de {a.anon_email} ({a.anon_org}, AI-IP activo)"
         need_obs = bool(groups & {"observacion", "interruptor", "originales"})
         if need_obs:
@@ -2641,18 +2668,17 @@ class E2EH4:
             step("9.7 la auditoría conserva org.deleted", self.audit_survives, needs=[deleted])
             if self.inspector is not None:
                 step("9.8 vault vacío, Redis sin claves y MCP en cuarentena", self.inside, needs=[deleted])
-        if "originales" in groups and self.inspector is not None:
-            present = f"10.1 la pila tiene {EPHEMERAL} (sin ella los originales siguen en el AOF)"
-            step(present, self.has_ephemeral)
+        if "originales" in groups and present is not None and residue is not None:
             sent = "10.2 turnos con valores centinela: bypass, observación y AI-IP con anonimizador"
             step(sent, self.send_originals, needs=[present, s2, s2b, s2c, s4])
             consumed = "10.3 la webapp consume las trazas (las conversaciones aparecen)"
             step(consumed, self.originals_consumed, needs=[sent, s3])
-            step("10.4 AOF de la persistente sin originales, tal como está", self.aof_live_clean, needs=[consumed])
+            step("10.4 AOF de la persistente sin originales, tal como está", self.aof_live_clean,
+                 needs=[consumed, residue])  # fmt: skip
             control = "10.5 control positivo del escáner (valor propio, reescritura y limpieza)"
             step(control, self.scanner_control, needs=[present])
             step("10.6 AOF de la persistente sin originales tras forzar la reescritura", self.aof_rewritten_clean,
-                 needs=[consumed, control])  # fmt: skip
+                 needs=[consumed, control, residue])  # fmt: skip
             step("10.7 la efímera no persiste nada: sin AOF, sin RDB y sin ficheros", self.ephemeral_clean,
                  needs=[consumed, control])  # fmt: skip
         if "huerfanos" in groups:
