@@ -5,8 +5,14 @@ Implementa lo justo de los contratos de la Fase 1 para probar el plugin sin el s
 - `POST /api/v1/plugin/handshake` (arquitectura §3.1, contrato §6), con los datos de
   desarrollo del contrato §8 y sus API keys deterministas.
 - `POST /org/<slug>/mcp` (fase-1-mvp §2.2, contrato §7.1): `initialize`,
-  `notifications/initialized`, `tools/list` y `tools/call` de `baas_whoami` y
-  `baas_get_script`, con sesión `Mcp-Session-Id` y respuestas en JSON o en SSE.
+  `notifications/initialized`, `tools/list` y `tools/call` de `baas_whoami`, `baas_get_script` y,
+  desde el hito H5 (contrato §7.4), `baas_list_skills` ampliada, `baas_get_skill_package` y
+  `baas_get_skill_files`, con sesión `Mcp-Session-Id` y respuestas en JSON o en SSE.
+
+Skills como paquetes (H5): `FakeBaas.add_skill(org, nombre, {ruta: contenido})` publica un paquete;
+`state.skills[org][nombre]` es un `SkillPackage` editable. Interruptores de prueba: `package_paths`
+(rutas del manifiesto como `skills/<skill>/<ruta>` o relativas), `mcp_delay` (servidor lento),
+`list_filter` (la lista omite skills accesibles) y `tool_calls(nombre)` (llamadas recibidas).
 
 Uso manual: `python3 dev/fake_baas.py --port 8765` (imprime las claves de prueba).
 Solo biblioteca estándar.
@@ -21,6 +27,7 @@ import hashlib
 import json
 import secrets
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -131,6 +138,105 @@ def default_scripts() -> dict[str, dict[str, Script]]:
     }
 
 
+@dataclass
+class PkgFile:
+    """Un fichero de un paquete de skill (bytes). `sha256_override` hace que el manifiesto declare otro hash."""
+
+    content: bytes
+    executable: bool = False
+    sha256_override: str | None = None
+
+    @property
+    def sha256(self) -> str:
+        return self.sha256_override or hashlib.sha256(self.content).hexdigest()
+
+    @property
+    def real_sha256(self) -> str:
+        return hashlib.sha256(self.content).hexdigest()
+
+    def encoding(self) -> str:
+        try:
+            self.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return "base64"
+        return "base64" if b"\x00" in self.content else "utf8"
+
+    def encoded(self) -> str:
+        return self.content.decode("utf-8") if self.encoding() == "utf8" else base64.b64encode(self.content).decode()
+
+
+@dataclass
+class SkillPackage:
+    """Paquete de una skill (contrato §7.4): ficheros relativos a la skill, roles y `baas.yaml` sintetizado."""
+
+    name: str
+    files: dict[str, PkgFile]
+    roles: list[str] = field(default_factory=list)  # ["*"] = cualquier miembro
+    status: str = "active"  # active | deprecated
+    depends_on: list[str] = field(default_factory=list)
+    knowledge: list[str] = field(default_factory=list)
+    requires: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def executable(self) -> list[str]:
+        return sorted(p for p, f in self.files.items() if f.executable)
+
+    def metadata(self) -> dict[str, Any]:
+        meta: dict[str, Any] = {"version": 1, "roles": self.roles, "status": self.status}
+        if self.requires:
+            meta["requires"] = self.requires
+        if self.depends_on or self.knowledge:
+            meta["depends_on"] = {"skills": self.depends_on, "knowledge": self.knowledge}
+        if self.executable:
+            meta["executable"] = self.executable
+        return meta
+
+    def all_files(self) -> dict[str, PkgFile]:
+        """Los ficheros del paquete incluido `baas.yaml` (JSON es YAML válido)."""
+        yaml = PkgFile(json.dumps(self.metadata(), ensure_ascii=False).encode() + b"\n")
+        return {**self.files, "baas.yaml": yaml}
+
+    @property
+    def package_sha256(self) -> str:
+        """SHA-256 de las líneas `<sha256>  <ruta>\\n`, ordenadas por ruta (contrato §7.4)."""
+        files = self.all_files()
+        text = "".join(f"{files[p].sha256}  {p}\n" for p in sorted(files, key=lambda p: p.encode()))
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    @property
+    def size(self) -> int:
+        return sum(len(f.content) for f in self.all_files().values())
+
+
+def _as_pkg_file(value: bytes | str | PkgFile) -> PkgFile:
+    if isinstance(value, PkgFile):
+        return value
+    return PkgFile(value.encode() if isinstance(value, str) else value)
+
+
+def skill_md(name: str, description: str = "Skill de ejemplo") -> str:
+    return f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"
+
+
+def default_skills(scripts: dict[str, dict[str, Script]]) -> dict[str, dict[str, SkillPackage]]:
+    """Un paquete por skill con los scripts de `default_scripts()` bajo `scripts/` (compatibilidad con H2).
+
+    El script con hash alterado va en su propia skill (`alterada`): un paquete entero se descarga y verifica
+    de una vez, y uno corrupto no debe estropear a los demás scripts de `informe`.
+    """
+    skills: dict[str, dict[str, SkillPackage]] = {}
+    for org, by_path in scripts.items():
+        for path, script in by_path.items():
+            _, skill, _, fname = path.split("/", 3)
+            if script.sha256_override:
+                skill = "alterada"
+            pkg = skills.setdefault(org, {}).setdefault(
+                skill, SkillPackage(skill, {"SKILL.md": PkgFile(skill_md(skill).encode())}, roles=list(script.roles))
+            )
+            pkg.files[f"scripts/{fname}"] = PkgFile(script.content.encode(), sha256_override=script.sha256_override)
+    return skills
+
+
 class FakeBaas:
     """Estado del servidor falso; los tests lo manipulan directamente."""
 
@@ -138,6 +244,10 @@ class FakeBaas:
         self.orgs = default_orgs()
         self.users = default_users()
         self.scripts = default_scripts()
+        self.skills = default_skills(self.scripts)  # paquetes (hito H5): org → nombre → SkillPackage
+        self.package_paths = "store"  # rutas del manifiesto: "store" (skills/<skill>/<ruta>) o "relative"
+        self.mcp_delay = 0.0  # segundos que tarda el MCP en responder (simula un servidor lento)
+        self.list_filter: set[str] | None = None  # si se fija, baas_list_skills solo lista estas skills
         self.global_kill_switch = False
         self.base_url = ""  # se rellena al arrancar
         self.requests: list[dict[str, Any]] = []
@@ -148,6 +258,42 @@ class FakeBaas:
         self.proxy_base = ""  # base de las URLs del proxy (por defecto, <base_url>/proxy)
         self.stateless = False  # MCP sin estado: sin Mcp-Session-Id (como el MCP real de la Fase 1)
         self.lock = threading.Lock()
+
+    # --- paquetes de skills (hito H5) ---------------------------------------------
+    def add_skill(
+        self,
+        org: str,
+        name: str,
+        files: dict[str, bytes | str | PkgFile],
+        *,
+        roles: list[str] | None = None,
+        executable: tuple[str, ...] | list[str] = (),
+        **kwargs: Any,
+    ) -> SkillPackage:
+        """Publica (o reemplaza) el paquete de una skill. `SKILL.md` se crea si falta."""
+        pkg_files = {path: _as_pkg_file(content) for path, content in files.items()}
+        pkg_files.setdefault("SKILL.md", PkgFile(skill_md(name).encode()))
+        for path in executable:
+            pkg_files[path].executable = True
+        pkg = SkillPackage(name, pkg_files, roles=list(roles or []), **kwargs)
+        self.skills.setdefault(org, {})[name] = pkg
+        return pkg
+
+    def tool_calls(self, name: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        """Las llamadas `tools/call` recibidas: lista de (tool, argumentos)."""
+        calls = []
+        for req in self.requests:
+            if req["method"] != "POST" or not req["body"]:
+                continue
+            try:
+                msg = json.loads(req["body"])
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("method") == "tools/call":
+                params = msg.get("params") or {}
+                if name is None or params.get("name") == name:
+                    calls.append((params.get("name"), params.get("arguments") or {}))
+        return calls
 
     # --- utilidades ---------------------------------------------------------------
     def user_for_key(self, key: str | None) -> UserState | None:
@@ -276,6 +422,8 @@ def make_handler(state: FakeBaas) -> type[BaseHTTPRequestHandler]:
                 return self._json(404, {"error": "NOT_FOUND"})
             if state.mcp_status:
                 return self._json(state.mcp_status, {"error": "UNAVAILABLE", "message": "Sin política disponible"})
+            if state.mcp_delay:
+                time.sleep(state.mcp_delay)
             try:
                 msg = json.loads(body)
             except ValueError:
@@ -360,7 +508,134 @@ def make_handler(state: FakeBaas) -> type[BaseHTTPRequestHandler]:
                         required_roles=script.roles,
                     )
                 return _tool_ok({"path": script.path, "sha256": script.sha256, "content": script.content})
+            if name == "baas_list_skills":
+                return self._list_skills(user, target, args)
+            if name in ("baas_get_skill_package", "baas_get_skill_files"):
+                return self._package_tool(user, target, name, args)
             return _tool_error("INVALID_ARGUMENT", "Tool desconocida", field="name")
+
+        # --- skills como paquetes (contrato §7.4) -----------------------------------------
+        def _is_admin(self, user: UserState, slug: str) -> bool:
+            member = state.membership(user, slug)
+            return user.platform_admin or (member is not None and member.governance_role == "ORG_ADMIN")
+
+        def _can_read(self, user: UserState, slug: str, pkg: SkillPackage) -> bool:
+            member = state.membership(user, slug)
+            if self._is_admin(user, slug):
+                return True
+            roles = set(member.functional_roles) if member else set()
+            return ("*" in pkg.roles and member is not None) or bool(roles & set(pkg.roles))
+
+        def _store_path(self, skill: str, rel: str) -> str:
+            return f"skills/{skill}/{rel}" if state.package_paths == "store" else rel
+
+        def _list_skills(self, user: UserState, slug: str, args: dict[str, Any]) -> dict[str, Any]:
+            rows = []
+            for name, pkg in sorted(state.skills.get(slug, {}).items()):
+                if pkg.status != "active" or not self._can_read(user, slug, pkg):
+                    continue
+                if state.list_filter is not None and name not in state.list_filter:
+                    continue
+                skill_md_file = pkg.files["SKILL.md"]
+                scripts = [
+                    {"name": p.removeprefix("scripts/"), "path": f"skills/{name}/{p}", "sha256": f.sha256,
+                     "size": len(f.content)}
+                    for p, f in sorted(pkg.files.items())
+                    if p.startswith("scripts/")
+                ]  # fmt: skip
+                rows.append(
+                    {
+                        "name": name,
+                        "title": name,
+                        "description": "Skill de ejemplo",
+                        "path": f"skills/{name}/SKILL.md",
+                        "roles": pkg.roles,
+                        "sha256": skill_md_file.sha256,
+                        "scripts": scripts,
+                        "package_sha256": pkg.package_sha256,
+                        "status": pkg.status,
+                        "files": len(pkg.all_files()),
+                        "size": pkg.size,
+                        "depends_on": {"skills": pkg.depends_on, "knowledge": pkg.knowledge},
+                        "executable": pkg.executable,
+                        "warnings": [],
+                    }
+                )
+            return _tool_ok({"organization": slug, "skills": rows})
+
+        def _dependency(self, user: UserState, slug: str, name: str) -> dict[str, Any]:
+            dep = state.skills.get(slug, {}).get(name)
+            ok = dep is not None and dep.status == "active" and self._can_read(user, slug, dep)
+            info: dict[str, Any] = {"name": name, "accessible": ok}
+            if ok:
+                info["package_sha256"] = dep.package_sha256
+            return info
+
+        def _package_tool(self, user: UserState, slug: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+            allowed = {"skill", "org"} | ({"paths"} if tool == "baas_get_skill_files" else set())
+            unknown = set(args) - allowed
+            if unknown or not isinstance(args.get("skill"), str):
+                field = sorted(unknown)[0] if unknown else "skill"
+                return _tool_error("INVALID_ARGUMENT", f"Argumento no válido «{field}»", field=field)
+            name = args["skill"]
+            pkg = state.skills.get(slug, {}).get(name)
+            resource = f"skills/{name}"
+            if pkg is None or (pkg.status != "active" and not self._is_admin(user, slug)):
+                return _tool_error("NOT_FOUND", "La skill no existe", resource=resource)
+            if not self._can_read(user, slug, pkg):
+                return _tool_error(
+                    "AUTHORIZATION_DENIED", f"No tienes acceso a «{resource}».", resource=resource,
+                    required_roles=pkg.roles,
+                )  # fmt: skip
+            files = pkg.all_files()
+            if tool == "baas_get_skill_package":
+                entries = [
+                    {
+                        "path": self._store_path(name, p),
+                        "sha256": f.sha256,
+                        "size": len(f.content),
+                        "encoding": f.encoding(),
+                        "executable": f.executable,
+                    }
+                    for p, f in sorted(files.items())
+                ]
+                return _tool_ok(
+                    {
+                        "skill": name,
+                        "name": name,
+                        "status": pkg.status,
+                        "roles": pkg.roles,
+                        "package_sha256": pkg.package_sha256,
+                        "frontmatter": {"name": name, "description": "Skill de ejemplo"},
+                        "metadata": pkg.metadata(),
+                        "files": entries,
+                        "depends_on": {
+                            "skills": [self._dependency(user, slug, d) for d in pkg.depends_on],
+                            "knowledge": pkg.knowledge,
+                        },
+                        "warnings": [],
+                    }
+                )
+            by_server_path = {self._store_path(name, p): p for p in files}
+            wanted = args.get("paths")
+            if wanted is None:
+                wanted = list(by_server_path)
+            out = []
+            for path in wanted:
+                rel = by_server_path.get(path)
+                if rel is None:
+                    return _tool_error("NOT_FOUND", "El fichero no pertenece a la skill", resource=str(path))
+                f = files[rel]
+                out.append(
+                    {
+                        "path": path,
+                        "sha256": f.real_sha256,
+                        "size": len(f.content),
+                        "encoding": f.encoding(),
+                        "content": f.encoded(),
+                    }
+                )
+            return _tool_ok({"skill": name, "files": out})
 
     return Handler
 
@@ -370,6 +645,8 @@ TOOLS = [
     "baas_list_skills",
     "baas_get_skill",
     "baas_get_script",
+    "baas_get_skill_package",
+    "baas_get_skill_files",
     "baas_search_knowledge",
     "baas_read_document",
     "baas_write_document",
