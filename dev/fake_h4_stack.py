@@ -22,6 +22,10 @@ que el hito H4 añade (contrato §4, §5.2, §6 y §8; plan, tareas W2 a W5, P2,
 - **Las dos instancias de Redis** (H4-02): la persistente (AOF) y la efímera (`redis-ephemeral`, sin ficheros). El proxy
   escribe en la efímera lo que lleva valores originales: la traza de cada turno (que la webapp consume en el acto) y
   la copia caliente del vault. Cada instancia guarda lo que tendría en memoria y en los ficheros de `/data`.
+- **Flujo de dispositivo del plugin** (`POST /api/v1/plugin/device/start` y `/device/poll`, públicos): `DeviceFlow`
+  se programa desde la prueba (`stack.device`): aprobar en el sondeo N, denegar, caducar, responder 429 al empezar o
+  fallar. Al aprobar crea una clave personal nueva (solo en el primer sondeo aprobado; el siguiente dice `expired`) que
+  el handshake acepta. `StackState.revoke_key` deja sin efecto una clave guardada (handshake `401`).
 - `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, Redis, discos y MCP).
 
 `faults` inyecta los fallos que la prueba tiene que detectar (`FAULTS`).
@@ -273,6 +277,39 @@ class Conv:
             self.now_anonymizer = self.anonymizer
 
 
+DEVICE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I/L (contrato del flujo de dispositivo)
+
+
+@dataclass
+class DeviceCode:
+    device_code: str
+    user_code: str
+    client_name: str
+    polls: int = 0
+    consumed: bool = False
+
+
+class DeviceFlow:
+    """Lo que el servidor responde al flujo de dispositivo, programable desde la prueba.
+
+    - `outcome`: `approve` (aprueba en el sondeo `approve_after`; antes dice `pending`), `deny` o `expire`
+      (igual: a partir del sondeo `approve_after`).
+    - `start_status`: `200` o el error con el que responde `device/start` (p. ej. `429`).
+    - `email`: quién aprueba; su clave nueva se añade a las que acepta el handshake.
+    Cuenta `starts`, `polls` y guarda las claves emitidas en `issued_keys`.
+    """
+
+    def __init__(self, email: str = "analista@demo.test") -> None:
+        self.email = email
+        self.outcome = "approve"
+        self.approve_after = 1
+        self.start_status = 200
+        self.starts = 0
+        self.polls = 0
+        self.issued_keys: list[str] = []
+        self.codes: dict[str, DeviceCode] = {}
+
+
 @dataclass
 class Subscriber:
     user: User
@@ -329,6 +366,7 @@ class StackState:
         self.users = {u.email: u for u in users}
         self.users_by_id = {u.id: u for u in users}
         self.by_key = {dev_api_key(u.email): u for u in users}
+        self.device = DeviceFlow()
         self.sessions: dict[str, User] = {}
         self.links: dict[str, tuple[User, Link]] = {}  # token → (usuario, enlace de activación)
         self.deleted_slugs: set[str] = set()
@@ -445,6 +483,57 @@ class StackState:
             "platform_role": "PLATFORM_ADMIN" if user.platform_admin else "USER",
         }
         return {"user": user_json, "global_kill_switch": False, "organizations": orgs}
+
+    def revoke_key(self, key: str) -> None:
+        """La clave deja de valer: el handshake responde 401 (revocada, o de otra base de datos)."""
+        with self.lock:
+            self.by_key.pop(key, None)
+
+    def device_start(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        flow = self.device
+        with self.lock:
+            if flow.start_status != 200:
+                error = "RATE_LIMITED" if flow.start_status == 429 else "UNAVAILABLE"
+                return flow.start_status, {"error": error, "message": "simulado"}
+            name = body.get("client_name")
+            if not isinstance(name, str) or not 1 <= len(name) <= 100:
+                return 422, {"error": "VALIDATION_ERROR", "message": "client_name inválido"}
+            flow.starts += 1
+            user_code = "".join(secrets.choice(DEVICE_ALPHABET) for _ in range(8))
+            user_code = f"{user_code[:4]}-{user_code[4:]}"
+            code = DeviceCode(secrets.token_urlsafe(24), user_code, name)
+            flow.codes[code.device_code] = code
+            return 200, {
+                "device_code": code.device_code,
+                "user_code": user_code,
+                "verification_url": f"{self.app_url}/connect?code={user_code}",
+                "expires_in": 600,
+                "interval": 3,
+            }
+
+    def device_poll(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        flow = self.device
+        with self.lock:
+            code = flow.codes.get(str(body.get("device_code")))
+            if code is None or code.consumed:
+                return 200, {"status": "expired"}
+            code.polls += 1
+            flow.polls += 1
+            if code.polls < flow.approve_after:
+                return 200, {"status": "pending"}
+            if flow.outcome == "deny":
+                code.consumed = True
+                return 200, {"status": "denied"}
+            if flow.outcome == "expire":
+                code.consumed = True
+                return 200, {"status": "expired"}
+            user = self.users[flow.email]
+            secret = "baas_" + secrets.token_urlsafe(32)  # la clave se crea ahora y solo viaja en esta respuesta
+            user.keys.append(Key(str(uuid.uuid4()), f"Claude Code · {code.client_name}", secret))
+            self.by_key[secret] = user
+            flow.issued_keys.append(secret)
+            code.consumed = True
+            return 200, {"status": "approved", "api_key": secret, "email": user.email}
 
     def create_org(self, actor: User, slug: str, name: str) -> tuple[int, dict[str, Any]]:
         if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?", slug):
@@ -1165,6 +1254,11 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
                 if user is None:
                     return self._json(401, {"error": "UNAUTHENTICATED", "message": "Invalid API key"})
                 return self._json(200, state.handshake(user))
+            if self.path in ("/api/v1/plugin/device/start", "/api/v1/plugin/device/poll"):  # públicos, sin CSRF
+                device_body = json.loads(raw or b"{}")
+                if self.path.endswith("/start"):
+                    return self._json(*state.device_start(device_body))
+                return self._json(*state.device_poll(device_body))
             if self.headers.get("X-Requested-With") != "baas-webapp":
                 return self._json(403, _CSRF)
             body = json.loads(raw or b"{}")
@@ -1280,6 +1374,10 @@ class FakeH4Stack:
     @property
     def fake_url(self) -> str:
         return self._servers[0].url
+
+    @property
+    def device(self) -> DeviceFlow:
+        return self.state.device
 
     @property
     def proxy_url(self) -> str:
