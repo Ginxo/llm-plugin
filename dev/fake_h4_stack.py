@@ -26,7 +26,13 @@ que el hito H4 añade (contrato §4, §5.2, §6 y §8; plan, tareas W2 a W5, P2,
   se programa desde la prueba (`stack.device`): aprobar en el sondeo N, denegar, caducar, responder 429 al empezar o
   fallar. Al aprobar crea una clave personal nueva (solo en el primer sondeo aprobado; el siguiente dice `expired`) que
   el handshake acepta. `StackState.revoke_key` deja sin efecto una clave guardada (handshake `401`).
-- `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, Redis, discos y MCP).
+- **Límite de claves no válidas por cliente** (H4-13, contrato §7.5): proxy y MCP con un cubo de fichas cada uno
+  (`burst` 30 y 10 por minuto, con un reloj que la prueba adelanta: `StackState.advance`); una clave que no existe gasta
+  una ficha y, sin fichas, `429` con `Retry-After` en la forma de cada uno. Una clave válida no pasa por el limitador y
+  una que existe (revocada) devuelve su ficha. El cliente es quien conecta: la pila simulada hace de Caddy, que
+  sobrescribe el `X-Forwarded-For` que envía la petición.
+- `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, Redis, discos y MCP) y las
+  peticiones del grupo «limite», que van a la pila simulada con el contenedor `fake-upstream` como cliente.
 
 `faults` inyecta los fallos que la prueba tiene que detectar (`FAULTS`).
 
@@ -44,6 +50,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import math
 import queue
 import re
 import secrets
@@ -55,6 +62,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from email.message import Message
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -87,6 +95,9 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 BLOCKED_MESSAGE = "Acceso bloqueado por BaaS-AI-IP: la organización está bloqueada por la plataforma"
 DENIED_MESSAGE = "Acceso bloqueado por BaaS-AI-IP: la organización no existe o no eres miembro"
 _SEVERITY = {None: 0, "CLEAN": 1, "WARNING": 2, "ERROR": 3}
+CONTAINER = "fake-upstream"  # el cliente de las peticiones del grupo «limite» (`FakeInspector.caddy_requests`)
+LIMIT_MESSAGE = "BaaS-AI-IP: demasiadas API keys no válidas desde tu red; vuelve a intentarlo en {seconds} s"
+MCP_LIMIT_MESSAGE = "Demasiadas API keys no válidas desde tu red; vuelve a intentarlo en {seconds} s."
 
 FAULTS = {
     # modo observación y estado por conversación (proxy)
@@ -159,6 +170,14 @@ FAULTS = {
     "reactivate-audit-no-org": "la fila user.reactivated no lleva la organización a la que se invita (org_id nulo)",
     "audit-orgadmin-sees-disabled": "el ORG_ADMIN de la organización ve las filas user.disabled de sus miembros",
     "audit-orgadmin-blind": "el ORG_ADMIN no ve ninguna fila de la auditoría de su organización",
+    # límite de claves no válidas por cliente (H4-13)
+    "limit-off-proxy": "el proxy no limita las claves desconocidas",
+    "limit-off-mcp": "el MCP no limita las claves desconocidas",
+    "limit-trusts-xff": "el cliente sale del X-Forwarded-For de la petición (el remitente elige su cubo)",
+    "limit-blocks-known": "una clave ya válida recibe 429 desde un cliente frenado",
+    "limit-global": "un solo cubo para todos los clientes: el equipo queda frenado con el contenedor",
+    "limit-no-retry-after": "el 429 del límite no lleva Retry-After",
+    "limit-shape": "el 429 del proxy no tiene la forma del proveedor (lleva la del MCP)",
 }
 
 
@@ -204,6 +223,34 @@ class FakeRedis:
     def text(self, *, binary: bool = True) -> str:
         """Lo que hay en los ficheros; `binary=False` deja fuera la base (el preámbulo RDB)."""
         return (self.base or "" if binary else "") + self.incr
+
+
+class FakeLimiter:
+    """Cubo de fichas por cliente (contrato §7.5): `burst` fichas que se recargan a `per_minute`. El reloj es el del
+    proceso más `offset`, que la prueba adelanta para no esperar de verdad."""
+
+    def __init__(self, burst: int, per_minute: float) -> None:
+        self.burst, self.rate = burst, per_minute / 60
+        self.offset = 0.0
+        self.buckets: dict[str, tuple[float, float]] = {}  # cliente → (fichas, instante)
+
+    def _now(self) -> float:
+        return time.monotonic() + self.offset
+
+    def take(self, client: str) -> int | None:
+        """Toma una ficha: `None` si la había; si no, los segundos hasta la siguiente (redondeados hacia arriba)."""
+        now = self._now()
+        tokens, at = self.buckets.get(client, (float(self.burst), now))
+        tokens = min(float(self.burst), tokens + (now - at) * self.rate)
+        if tokens >= 1:
+            self.buckets[client] = (tokens - 1, now)
+            return None
+        self.buckets[client] = (tokens, now)
+        return max(1, math.ceil((1 - tokens) / self.rate))
+
+    def refund(self, client: str) -> None:
+        tokens, at = self.buckets[client]
+        self.buckets[client] = (min(float(self.burst), tokens + 1), at)
 
 
 # --- modelo -----------------------------------------------------------------------------------------
@@ -345,7 +392,9 @@ def ws_frame(opcode: int, payload: bytes = b"") -> bytes:
 
 
 class StackState:
-    def __init__(self, faults: set[str], provider_url: str) -> None:
+    def __init__(
+        self, faults: set[str], provider_url: str, *, auth_fail_burst: int = 30, auth_fail_per_minute: float = 10
+    ) -> None:
         self.faults = faults
         self.provider_url = provider_url
         self.proxy_url = self.app_url = ""
@@ -366,6 +415,8 @@ class StackState:
         self.users = {u.email: u for u in users}
         self.users_by_id = {u.id: u for u in users}
         self.by_key = {dev_api_key(u.email): u for u in users}
+        self.seed_keys = set(self.by_key)
+        self.limiters = {name: FakeLimiter(auth_fail_burst, auth_fail_per_minute) for name in ("proxy", "mcp")}
         self.device = DeviceFlow()
         self.sessions: dict[str, User] = {}
         self.links: dict[str, tuple[User, Link]] = {}  # token → (usuario, enlace de activación)
@@ -855,6 +906,58 @@ class StackState:
         with self.lock:
             return sum(len(c.vault.tokens) + len(c.vault.counters) + 1 for c in self.convs.values() if c.org == slug)
 
+    # --- límite de claves no válidas por cliente (H4-13, contrato §7.5) ---------------------------------------
+    def advance(self, seconds: float) -> None:
+        """Adelanta el reloj de los limitadores (lo que una espera de verdad recargaría)."""
+        with self.lock:
+            for limiter in self.limiters.values():
+                limiter.offset += seconds
+
+    def key_exists(self, key: str) -> bool:
+        """La clave existe, con cualquier estado (vigente o revocada)."""
+        return (key in self.by_key or key in self.seed_keys
+                or any(k.secret == key for u in self.users.values() for k in u.keys))  # fmt: skip
+
+    def limit_client(self, peer: str, headers: Any) -> str:
+        """El cliente del limitador: quien conecta (el remitente no elige su cubo con el `X-Forwarded-For` de la
+        petición)."""
+        if "limit-global" in self.faults:
+            return "*"
+        spoofed = str(headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        return spoofed if spoofed and "limit-trusts-xff" in self.faults else peer
+
+    def limit_reply(
+        self, component: str, route: str | None, peer: str, headers: Any
+    ) -> tuple[int, str, bytes, dict[str, str]] | None:
+        """El `429` del limitador de `component` (`proxy`, con su `route`, o `mcp`); `None` si la petición sigue (la
+        clave es válida, existe o quedaban fichas)."""
+        if component == "proxy":
+            key = str(headers.get("X-Baas-Api-Key") or "")
+        else:
+            auth = str(headers.get("Authorization") or "")
+            key = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        if not key.startswith("baas_") or len(key) > 256:  # mal formada: se rechaza sin consultar
+            return None
+        with self.lock:
+            if f"limit-off-{component}" in self.faults:
+                return None
+            if key in self.by_key and "limit-blocks-known" not in self.faults:
+                return None  # una clave válida no pasa por el limitador
+            limiter, client = self.limiters[component], self.limit_client(peer, headers)
+            wait = limiter.take(client)
+            if wait is None:
+                if self.key_exists(key):
+                    limiter.refund(client)  # existe (con cualquier estado): no era una clave desconocida
+                return None
+        extra = {} if "limit-no-retry-after" in self.faults else {"Retry-After": str(wait)}
+        if component == "mcp" or "limit-shape" in self.faults:
+            body = encode({"error": "RATE_LIMITED", "message": MCP_LIMIT_MESSAGE.format(seconds=wait)})
+        else:
+            api = ROUTES[route or ""][0]
+            etype = "rate_limit_error" if api == "messages" else "requests"
+            body = error_body(api, etype, "baas_auth_rate_limited", LIMIT_MESSAGE.format(seconds=wait))
+        return 429, "application/json", body, extra
+
     # --- proxy ---------------------------------------------------------------------------------------------
     def proxy_org(self, slug: str) -> Org | None:
         return self.orgs.get(slug) or (self.ghosts.get(slug) if "proxy-still-serves" in self.faults else None)
@@ -1061,11 +1164,30 @@ class StackState:
         return 200, {"jsonrpc": "2.0", "id": mid, "result": result}
 
 
+@dataclass
+class Reply:
+    """Lo que devuelve `caddy_requests` (la forma de `e2e_h2.Http`)."""
+
+    status: int
+    headers: list[tuple[str, str]]
+    body: bytes
+
+    def json(self) -> Any:
+        try:
+            return json.loads(self.body or b"null")
+        except ValueError:
+            return None
+
+
 class FakeInspector:
     """Lo que `ContainerInspector` mira dentro de los contenedores, leído de la pila simulada."""
 
     def __init__(self, state: StackState) -> None:
         self.state = state
+        self.caddy_calls: list[list[Any]] = []  # las peticiones de cada `caddy_requests`
+        # Lo que «tarda» cada petición de `caddy_requests` (un ejecutor lento): adelanta el reloj de los limitadores,
+        # que recargan fichas durante la ráfaga, y se suma a lo que se mide.
+        self.caddy_delay = 0.0
 
     def vault_rows(self, slug: str) -> int:
         return self.state.vault_rows(slug)
@@ -1131,6 +1253,36 @@ class FakeInspector:
         with self.state.lock:
             return list(self.state.quarantine)
 
+    def caddy_requests(self, requests: Sequence[Any]) -> tuple[float, list[Reply]]:
+        """Las peticiones del grupo «limite» (`host`, `path`, `headers`, `body`) a la pila simulada, enrutadas por la
+        ruta (proxy o MCP) y con el contenedor `fake-upstream` como cliente."""
+        self.caddy_calls.append(list(requests))
+        start, replies = time.monotonic(), []
+        for request in requests:
+            if self.caddy_delay:
+                self.state.advance(self.caddy_delay)
+            replies.append(self._caddy(request))
+        return time.monotonic() - start + self.caddy_delay * len(requests), replies
+
+    def _caddy(self, request: Any) -> Reply:
+        headers = Message()
+        for name, value in request.headers.items():
+            headers[name] = value
+        raw = str(request.body).encode()
+        if m := _PROXY_PATH.fullmatch(request.path):
+            limited = self.state.limit_reply("proxy", m.group(2), CONTAINER, headers)
+            if limited is not None:
+                return Reply(limited[0], list(limited[3].items()), limited[2])
+            status, _, body = self.state.proxy_turn(m.group(1), m.group(2), headers, raw)
+            return Reply(status, [], body)
+        if m := _MCP_PATH.fullmatch(request.path):
+            limited = self.state.limit_reply("mcp", None, CONTAINER, headers)
+            if limited is not None:
+                return Reply(limited[0], list(limited[3].items()), limited[2])
+            status, data = self.state.mcp(m.group(1), headers, json.loads(raw or b"{}"))
+            return Reply(status, [], encode(data) if data is not None else b"")
+        return Reply(404, [], b"{}")
+
 
 # --- servidores HTTP -------------------------------------------------------------------------------------
 
@@ -1150,6 +1302,9 @@ def proxy_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
             m = _PROXY_PATH.fullmatch(self.path)
             if m is None:
                 return self._json(404, {"error": {"type": "not_found_error", "message": "ruta no simulada"}})
+            limited = state.limit_reply("proxy", m.group(2), self.client_address[0], self.headers)
+            if limited is not None:
+                return self._send(*limited)
             status, ctype, body = state.proxy_turn(m.group(1), m.group(2), self.headers, raw)
             return self._send(status, ctype, body)
 
@@ -1246,6 +1401,9 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             raw = self._read()
             if m := _MCP_PATH.fullmatch(self.path):
+                limited = state.limit_reply("mcp", None, self.client_address[0], self.headers)
+                if limited is not None:
+                    return self._send(*limited)
                 status, data = state.mcp(m.group(1), self.headers, json.loads(raw or b"{}"))
                 return self._json(status, data) if data is not None else self._send(status, "application/json", b"")
             if self.path == "/api/v1/plugin/handshake":
@@ -1357,16 +1515,21 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
 
 
 class FakeH4Stack:
-    """Las tres piezas en puertos efímeros de `host`. `faults` ⊆ `FAULTS`; `debug_body` = `json` o `text`."""
+    """Las tres piezas en puertos efímeros de `host`. `faults` ⊆ `FAULTS`; `debug_body` = `json` o `text`;
+    `auth_fail_burst` y `auth_fail_per_minute`, el límite de claves no válidas (H4-13) del proxy y del MCP."""
 
-    def __init__(self, faults: Any = (), *, debug_body: str = "json", host: str = "127.0.0.1") -> None:
+    def __init__(
+        self, faults: Any = (), *, debug_body: str = "json", host: str = "127.0.0.1", auth_fail_burst: int = 30,
+        auth_fail_per_minute: float = 10,
+    ) -> None:  # fmt: skip
         chosen = set(faults)
         unknown = chosen - FAULTS.keys()
         if unknown:
             raise ValueError(f"fallos desconocidos: {', '.join(sorted(unknown))}")
         self.provider = EchoProvider(debug_body)
         self._servers = [_Server(provider_handler(self.provider), host)]
-        self.state = StackState(chosen, self._servers[0].url)
+        self.state = StackState(chosen, self._servers[0].url, auth_fail_burst=auth_fail_burst,
+                                auth_fail_per_minute=auth_fail_per_minute)  # fmt: skip
         self._servers += [_Server(proxy_handler(self.state), host), _Server(webapp_handler(self.state), host)]
         self.state.proxy_url, self.state.app_url = self._servers[1].url, self._servers[2].url
         self.inspector = FakeInspector(self.state)

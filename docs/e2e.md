@@ -7,7 +7,8 @@ distribuyen con el plugin.
 - [Hito H3 (AI-IP)](#hito-h3-ai-ip): `dev/e2e_h3.py`, anonimización y rehidratación por el proxy.
 - [Hito H4 (observación y eliminación de organizaciones)](#hito-h4-observación-y-eliminación-de-organizaciones):
   `dev/e2e_h4.py`, el anonimizador apagado, el interruptor, eliminar una organización, la prueba canario de H4-02
-  (los originales no llegan al disco de Redis) y qué pasa con los usuarios que se quedan sin ninguna.
+  (los originales no llegan al disco de Redis), qué pasa con los usuarios que se quedan sin ninguna y el límite de
+  claves no válidas por IP a través de Caddy (H4-13).
 - [`/baas-init` guiado](#baas-init-guiado-conexión-por-aprobación-en-el-navegador): `tests/test_e2e_connect.py`, la
   conexión por aprobación en el navegador sobre la pila simulada.
 - [Mediciones de H4](#mediciones-de-h4): `dev/measure_h4.py` y `dev/measure_frozen_redis.py`.
@@ -15,7 +16,7 @@ distribuyen con el plugin.
 
 ## En la CI
 
-`e2e_h4.py` (los seis grupos) y `e9_roles.py` corren en GitHub Actions con el workflow `e2e` del repositorio
+`e2e_h4.py` (los siete grupos) y `e9_roles.py` corren en GitHub Actions con el workflow `e2e` del repositorio
 `deploy`: levanta la pila con el proveedor falso, descarga `main` de cada repositorio (o la rama que se pida con
 `plugin_ref`, `webapp_ref`, `proxy_ref` o `mcp_ref`) y sube un resumen y el diagnóstico. Se lanza a mano, de
 momento (`gh workflow run e2e.yml -R baas-ai-ip/deploy`). Cómo funciona, qué necesita y cómo repetirlo en local:
@@ -252,6 +253,9 @@ Pendiente de la integración (C2). Contra la pila simulada, la ejecución comple
 > contra el contrato** (§6 de `knowledge/02-arquitectura/contratos-fase-1.md`: `delete-preview`, `disable_orphans`,
 > `user.disabled`, `USER_DISABLED`, `user.reactivated`) y contra la pila simulada: la webapp que lo implementa se
 > desarrolla a la vez. Los supuestos que conviene verificar al ejecutarla de verdad están en el apartado 5.
+>
+> El grupo `limite` (pasos 14.x, H4-13: claves no válidas frenadas por IP en el proxy y el MCP) se añadió el
+> 2026-11-19 y se ejecutó contra una pila real (`h413-int`) con las ramas `feat/h4-13-limite-claves` del proxy y del MCP.
 
 `dev/e2e_h4.py` comprueba por **HTTP directo** (sin Claude Code) las novedades de H4 de punta a punta, con las
 claves deterministas del contrato §8 de `observador@observacion.test`, `admin@baas.test` (PLATFORM_ADMIN),
@@ -291,9 +295,9 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--orgadmin-email` | `orgadmin@demo.test` | ORG_ADMIN de otra organización: debe recibir `404` al cambiar el interruptor y es el primer miembro de la organización que se elimina |
 | `--bypass-org` · `--bypass-email` | `demo` · `analista@demo.test` | Organización con AI-IP apagado |
 | `--anon-org` · `--anon-email` | `privada` · `analista@privada.test` | Organización con AI-IP y anonimizador **encendidos** (la de H3) y su usuario: el tercer modo del grupo `originales` |
-| `--only` | `observacion,interruptor,eliminar,originales,huerfanos,uso,acl` | Partes que se ejecutan (separadas por comas). `huerfanos` crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y los activa por la API: **necesita `BAAS_DEV_SKIP_TOTP=1`**. `uso` (Fase 4) necesita la pila con la observabilidad de uso y `env/dev/mcp-server.env` de `deploy` (ventana de 5 s, foto de disco cada 30 s). `acl` (H4-05) necesita la pila con la ACL de Redis de `deploy` y `--inspect` |
+| `--only` | `observacion,interruptor,eliminar,originales,huerfanos,uso,acl,limite` | Partes que se ejecutan (separadas por comas). `huerfanos` crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y los activa por la API: **necesita `BAAS_DEV_SKIP_TOTP=1`**. `uso` (Fase 4) necesita la pila con la observabilidad de uso y `env/dev/mcp-server.env` de `deploy` (ventana de 5 s, foto de disco cada 30 s). `acl` (H4-05) necesita la pila con la ACL de Redis de `deploy` y `--inspect`. `limite` (H4-13) necesita el proxy y el MCP con el límite de claves no válidas y el contenedor `fake-upstream` (`--fake-upstream`) |
 | `--apis` | `messages,chat,responses` | APIs que se prueban |
-| `--inspect` | `auto` | `podman`, `docker` o `auto` (el primero que vea el proyecto) para mirar el vault, las dos instancias de Redis (claves y disco) y la cuarentena del MCP; `none` omite esos pasos (9.1b, 9.8, todo el grupo `originales`, 12.4, 12.5, 12.7, 12.8 y 12.9 y todo el grupo `acl`), que no se registran (con `--only originales`, `uso` o `acl` lo dice en una nota) |
+| `--inspect` | `auto` | `podman`, `docker` o `auto` (el primero que vea el proyecto) para mirar el vault, las dos instancias de Redis (claves y disco) y la cuarentena del MCP, y para enviar las peticiones del grupo `limite` desde el contenedor `fake-upstream`; `none` omite esos pasos (9.1b, 9.8, todo el grupo `originales`, 12.4, 12.5, 12.7, 12.8 y 12.9 y todos los grupos `acl` y `limite`), que no se registran (con `--only originales`, `uso`, `acl` o `limite` lo dice en una nota) |
 | `--compose-project` | `$COMPOSE_PROJECT_NAME` o `baas-dev` | Proyecto de compose de la pila |
 | `--mcp-data-dir` | `/data` | `BAAS_DATA_DIR` del contenedor del MCP |
 | `--trace-timeout` | `30` | Segundos de espera de cada traza o de lo que se propaga (bloqueo, eliminación, cuarentena) |
@@ -304,6 +308,8 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--overhead-n` | `200` | Grupo `uso` (12.10): pares de peticiones (directo y por el proxy) que se miden |
 | `--overhead-p95-ms` | `10` | Grupo `uso` (12.10): umbral del p95 del sobrecoste (el objetivo de `fase-1-h4-mediciones.md`); se puede subir en un ejecutor lento de la CI sin tocar el código |
 | `--usage-window` | `5` | Grupo `uso`: `BAAS_USAGE_WINDOW_SECONDS` del MCP de la pila (5 en desarrollo); 12.3 espera una ventana más 1 s antes de dar el recuento por cerrado |
+| `--auth-fail-burst` | `30` | Grupo `limite`: `BAAS_AUTH_FAIL_BURST` del proxy y del MCP de la pila (claves desconocidas que un cliente puede probar seguidas antes del `429`) |
+| `--auth-fail-per-minute` | `10` | Grupo `limite`: `BAAS_AUTH_FAIL_PER_MINUTE` de la pila; con él se calcula cuántas fichas pudieron volver durante una ráfaga lenta y cuánto esperar a que se llene el cubo (`burst × 60 / ritmo` + 1 s, 181 s) si una ejecución anterior lo dejó a medias |
 | `--json <fichero>` | — | Informe en JSON (pasos, estado, duración, detalle, identificador de la ejecución) |
 
 ### 2. Qué comprueba
@@ -430,6 +436,34 @@ otro de `webapp`, `proxy`, `mcp` o `monitor`. Los intentos que Redis acepta (un 
 | 13.4 | `XADD baas:traces * data x` como `webapp` en la efímera → `NOPERM` (solo el proxy escribe trazas); `ACL GETUSER mcp` como `default` en la efímera → vacío (el MCP no tiene usuario allí) |
 | 13.5 | Como `monitor`: `GET baas:platform:status` y `HGETALL baas:policy:org:demo` → `NOPERM` (solo escribe su informe) |
 
+**Límite de claves no válidas por IP** (grupo `limite`, H4-13; contrato §7.5, filas H4-13 de §7.1 y §7.2). Las
+peticiones de 14.1 a 14.3 salen **desde dentro del contenedor `fake-upstream`** (`podman exec -i … python3 -c`, con
+`urllib`; las claves van por la entrada estándar, no en la línea de órdenes) hacia Caddy por la red de compose
+(`http://caddy:80`, con el `Host` de las URLs del *handshake*: `proxy.localhost` o `mcp.localhost`), así que tienen
+otra IP que el resto de la prueba y no gastan fichas del equipo. Las claves desconocidas son distintas y bien formadas
+(`baas_` y 43 caracteres base64url): el proxy guarda 30 s en caché una clave inválida repetida y no la cuenta, y una mal
+formada se rechaza sin consultar. Todas van a la organización sin AI-IP (`--bypass-org`, `demo`) de `--bypass-email`.
+
+| Paso | Qué comprueba |
+| :--- | :--- |
+| 14.1 | **Proxy**: 31 claves desconocidas distintas a Chat Completions y 5 de más (por si vuelven fichas durante la ráfaga), cada una con un `X-Forwarded-For` aleatorio distinto → las 30 primeras `401 baas_invalid_api_key` y la 31.ª `429` con `Retry-After` (entero ≥ 1), `error.type: requests`, `error.code: baas_auth_rate_limited` y el mensaje con esa espera; una más a Messages → `429` `rate_limit_error`. Prueba que el remitente no elige su cubo con `X-Forwarded-For`: si el cliente saliera de la cabecera, cada clave tendría su cubo y ninguna recibiría `429` |
+| 14.2 | **Proxy**: desde el equipo, la clave de `--bypass-email` → `200` (el proxy la resuelve como válida); desde el contenedor, tres desconocidas (la última **debe** recibir `429`: la IP sigue frenada) y después esa clave → `200` contra el proveedor falso, no `429` |
+| 14.3 | **MCP**: desde el equipo, `baas_whoami` con la clave de `--bypass-email` (el MCP la resuelve como válida); desde el contenedor, 31 `initialize` (y 5 de más) con claves desconocidas distintas y un `X-Forwarded-For` falso distinto → 30 × `401` y la 31.ª `429` `{"error": "RATE_LIMITED"}` con `Retry-After` y la espera en el mensaje (`Accept-Language: es`); después, la clave ya válida → `200` desde la IP frenada. El MCP no guarda los «no existe»: cada intento cuenta |
+| 14.4 | Desde el equipo (otra IP), una clave desconocida → `401` en el proxy (`baas_invalid_api_key`) y en el MCP, sin `429`: el límite es por cliente |
+
+**Si la IP del contenedor no tiene el cubo lleno** (otra ejecución del grupo hace menos de 3 min: 30 fichas a 10 por
+minuto), el `429` llega antes de la 31.ª: el paso lo dice (`N × 401 antes del primer 429`), espera a que se llene
+(`--auth-fail-burst × 60 / --auth-fail-per-minute` + 1 s, 181 s) y repite la ráfaga **una vez**; la segunda tiene que
+dar 30 × `401` y el `429`. Un límite con otra capacidad falla igual tras la espera.
+
+**Si la ráfaga es lenta** (un ejecutor cargado), vuelven fichas mientras dura: el primer `429` vale en cualquier
+posición entre la 31.ª y la 31.ª + `floor(elapsed × --auth-fail-per-minute / 60)`, con `elapsed` lo que tardó la
+ráfaga medido dentro del contenedor (las 5 claves de más cubren una ráfaga de hasta 36 s), sin esperar ni repetir. Una
+`401` de más que no cabe en ese margen falla («sin límite, o el cliente sale del `X-Forwarded-For`»). Si la de
+Messages, la última, se llevó una ficha que acababa de volver (recibe `401` y las `401` caben en el margen), se envía
+otra justo después, que tiene que recibir el `429`. Mientras espera 14.1 se llena también el cubo del MCP, así que
+una segunda ejecución seguida espera una sola vez. Un reinicio del proxy o del MCP vacía sus cubos.
+
 Con podman, `podman start` de `webapp-api` vuelve a ejecutar sus dependencias ya terminadas (`webapp-migrate` y
 `webapp-seed`, idempotentes); `podman restart` no sirve con `podman-compose` (las da por «no arrancadas»). Si una ejecución se corta en el grupo `uso`, puede quedar una organización `uso-<ejecución>-<paso>` (se bloquea y elimina igual desde W3), un servicio en pausa o parado (`podman unpause`/`podman start` de `webapp-api` o `mcp-server`) y, si se corta en 12.8, la retención de métricas en 60 meses (la siguiente ejecución de 12.8 lo avisa; se restaura en Plataforma → Uso). La pila
 simulada (`dev/fake_h4_stack.py`) no simula este grupo: sus utilidades e inspector se prueban en `tests/test_e2e_uso.py` (y las del grupo `acl`, en `tests/test_e2e_acl.py`).
@@ -437,7 +471,7 @@ simulada (`dev/fake_h4_stack.py`) no simula este grupo: sus utilidades e inspect
 Los pasos que dependen de uno fallido quedan `SALTADO` (y cuentan como fallo). El bloqueo, la eliminación y la
 cuarentena se esperan hasta `--trace-timeout` s porque llegan a proxy y MCP por Pub/Sub; igual la revocación de claves y
 la pérdida de la membresía en la parte `huerfanos`. Una ejecución completa envía unas 45 peticiones al proveedor, más
-siete de la parte `huerfanos` y unas 530 del grupo `uso` (sobre todo 12.7 y 12.10) (`/_debug/requests` guarda las 50 últimas; el grupo `originales` no lo lee, y `uso` tampoco). Si una ejecución se corta entre 9.1 y 9.4,
+siete de la parte `huerfanos`, dos del grupo `limite` (14.2) y unas 530 del grupo `uso` (sobre todo 12.7 y 12.10) (`/_debug/requests` guarda las 50 últimas; el grupo `originales` no lo lee, y `uso` tampoco). Si una ejecución se corta entre 9.1 y 9.4,
 queda una organización `e2e-<ejecución>` que se puede bloquear y eliminar a mano desde W3; si se corta la parte
 `huerfanos`, quedan organizaciones `huerf-<ejecución>-o1…o4` (se eliminan igual). Los inicios de sesión están limitados a
 20 por minuto y por IP: la parte `huerfanos` inicia sesión unas 15 veces y espera lo que diga `retry_after_seconds` si
@@ -449,9 +483,11 @@ recibe `429`.
 | :--- | :--- |
 | Utilidades puras (SSE, comprobaciones de contenido, cliente WebSocket, inspector) | **Ejecutado**: `tests/test_e2e_h4.py` (la CI) |
 | Recorrido completo contra `dev/fake_h4_stack.py` (webapp, proxy, MCP y proveedor simulados) | **Ejecutado**: todos los pasos en verde con el cuerpo del proveedor guardado como objeto y como texto, y dos ejecuciones seguidas |
-| Cada fallo inyectable de la pila simulada (64) detectado por el paso que le corresponde | **Ejecutado** (tabla de abajo) |
+| Cada fallo inyectable de la pila simulada (71) detectado por el paso que le corresponde | **Ejecutado** (tabla de abajo) |
 | El inspector de Redis (`CONFIG GET`, `find`, `BGREWRITEAOF` y su espera, la búsqueda con `grep`) | **Ejecutado** contra un motor falso que **corre de verdad el script de búsqueda** sobre un directorio temporal (`tests/fake_engine.py`) y, aparte, a mano contra dos contenedores `redis:7` desechables (uno con AOF y otro con `tmpfs` y sin AOF) con `podman`, sin tocar ninguna pila: el control positivo, la reescritura, la fuga detectada y la limpieza (2026-11-18) |
 | Contra la pila real de H4 (`h4-int`): proxy real con el modo observación y el estado por conversación, webapp real con el interruptor, la eliminación, la vista del PLATFORM_ADMIN y el WebSocket, MCP real con la cuarentena, vault y Redis reales, **el proxy y la webapp con `BAAS_REDIS_EPHEMERAL_URL`** (grupo `originales` y 9.8 con las dos instancias) y el 11 (usuarios sin organización: la webapp, el proxy y el MCP con la revocación de claves) | **Ejecutado el 2026-11-18** en `h4-int` con H4-08, A′ y los huérfanos juntos: `e2e_h4.py` completo (los cinco grupos) y `e9_roles.py` |
+| Las peticiones del grupo `limite` desde un contenedor (`caddy_requests`) | **Ejecutado**: el motor falso corre de verdad el script de `python3 -c` contra un servidor local que hace de Caddy (`Host`, `X-Forwarded-For`, estado, `Retry-After`, cuerpo, conexión rechazada y entradas inseguras rechazadas antes de lanzar nada) |
+| El grupo `limite` contra la pila real (`h413-int`, 2026-11-19: proxy y MCP de `feat/h4-13-limite-claves`, `webapp` y `deploy` de `main`) | **Ejecutado**: 14.1 a 14.4 en verde a la primera, y otra vez justo después (con la espera de 181 s); el `WARN` del proxy y del MCP lleva la IP del contenedor, no las falsas. En la misma pila, `e2e_h4.py` completo (los siete grupos, 76 pasos) y `e9_roles.py` (12 pasos) en verde: ningún paso anterior recibe `429`. Repetido tras la revisión final (ramas rebasadas sobre `main`, con el episodio del `WARN` hasta que el cubo se llena y la tolerancia a una ráfaga lenta): otra vez 76 + 12 pasos en verde; un `--only limite` justo después encontró 4 fichas, esperó 181 s y pasó, y el proxy no repitió el `WARN` con esas 4 fichas, solo tras llenarse el cubo |
 | La interfaz web (W3, W7, W8, W11 en el navegador, en `es` y `en`) y «el PLATFORM_ADMIN no ve el contenido **por la UI**» | **Fuera de esta prueba.** La UI pinta lo que devuelve la API que se comprueba aquí (`content_available`); el recorrido en el navegador es de C2 |
 | Claude Code real y Codex real | Fuera de esta prueba (prueba manual del usuario, C2; `docs/codex.md`) |
 
@@ -462,7 +498,9 @@ organizaciones, usuarios nuevos con enlace de activación, claves personales, la
 `disable_orphans`, la reactivación, la auditoría con la forma de `GET /api/v1/audit` —`target_label` incluido—, la vista
 de verificación del PLATFORM_ADMIN y el WebSocket), un proxy que sustituye y
 restaura email, IBAN y DNI **solo con el anonimizador encendido** y que en observación reenvía el cuerpo tal cual con
-`WARNING` y `residual_matches`, un MCP con `baas_write_document` y la cuarentena, y el proveedor con eco de H3. Importa
+`WARNING` y `residual_matches`, un MCP con `baas_write_document` y la cuarentena, y el proveedor con eco de H3. Proxy y
+MCP limitan las claves desconocidas por cliente (H4-13) con un cubo de fichas cuyo reloj adelanta la prueba en vez de
+esperar; las peticiones del grupo `limite` van del inspector simulado a la pila con el contenedor como cliente. Importa
 de `dev/fake_h3_stack.py` el proveedor, el vault y la rehidratación sin tocarlo. No es una implementación de referencia:
 es un doble para probar la prueba.
 
@@ -513,6 +551,13 @@ motivo; `test_every_fault_is_detected` falla si se añade un fallo sin su caso.
 | `reactivate-no-audit` (sin `user.reactivated`) · `reactivate-restores-keys` (vuelven a valer las claves revocadas) · `reactivate-audit-no-org` (la fila `user.reactivated` no lleva la organización) | 11.12 |
 | `audit-orgadmin-sees-disabled` (el ORG_ADMIN ve `user.disabled`) · `audit-orgadmin-blind` (no ve ni `user.reactivated`) | 11.12b |
 | `orphans-links-kept` (no invalida los enlaces de activación sin usar) | 11.13 |
+| `limit-off-proxy` (el proxy no limita) | 14.1 (14.2, `SALTADO`) |
+| `limit-off-mcp` (el MCP no limita) | 14.3 |
+| `limit-trusts-xff` (el cliente sale del `X-Forwarded-For` de la petición: el remitente elige su cubo) | 14.1 y 14.3 |
+| `limit-blocks-known` (una clave ya válida recibe `429` desde un cliente frenado) | 14.2 y 14.3 |
+| `limit-global` (un solo cubo para todos: el equipo queda frenado con el contenedor) | 14.4 |
+| `limit-no-retry-after` (el `429` sin `Retry-After`) | 14.1 y 14.3 |
+| `limit-shape` (el `429` del proxy con la forma del MCP, sin `baas_auth_rate_limited` ni `rate_limit_error`) | 14.1 |
 
 ### 5. Supuestos sobre los demás componentes
 
@@ -565,6 +610,14 @@ confirmarlos al integrar:
   y `analista@privada.test` están en la semilla de desarrollo (los de H3); `deploy/scripts/purge-redis-originals.sh`
   existe (lo cita 10.0). En una pila sin `redis-ephemeral` los pasos 9.1b y 9.8 miran solo `redis` y el grupo
   `originales` falla en 10.1.
+- **Proxy y MCP (límite de claves no válidas, H4-13)**: con `BAAS_AUTH_FAIL_BURST` 30 y `BAAS_AUTH_FAIL_PER_MINUTE` 10
+  (los valores por omisión; otros, con `--auth-fail-burst` y `--auth-fail-per-minute`), el cliente es la **última**
+  entrada de `X-Forwarded-For` y Caddy (sin `trusted_proxies`) sustituye la que envía el cliente por la IP de quien
+  conecta. `429` del proxy: OpenAI `error.type: requests` · `error.code: baas_auth_rate_limited`, Anthropic
+  `rate_limit_error`, mensaje `BaaS-AI-IP: demasiadas API keys no válidas desde tu red; vuelve a intentarlo en N s` y
+  `Retry-After: N`; del MCP, `{"error": "RATE_LIMITED", "message": "…N s."}` y `Retry-After: N`. Una clave que la
+  instancia ya resolvió como válida no pasa por el limitador. La pila tiene el servicio `caddy` (escucha en el 80 de la
+  red de compose) y `fake-upstream` (`python:3.13-slim`, con `python3`) en la misma red.
 - **Pila**: el contenedor de PostgreSQL se llama por su servicio (`com.docker.compose.service=postgres`) y admite
   `psql -U postgres` sin contraseña desde dentro; el de Redis tiene `BAAS_REDIS_PASSWORD` en su entorno; el del MCP lleva
   `ls`. Con `--inspect none`, o sin `podman`/`docker` que vea el proyecto, los pasos 9.1b y 9.8 y el grupo `originales`
