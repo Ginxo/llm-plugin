@@ -554,7 +554,13 @@ El simulado se programa desde la prueba con `stack.device` (`outcome`: `approve`
 `start_status`, `email`) y `stack.state.revoke_key(clave)`. No hay un script `dev/e2e_connect.py` contra la pila real:
 aprobar exige una persona en el navegador.
 
-Verificación manual en la pila de desarrollo: pendiente
+Verificación manual en la pila de desarrollo (2026-11-19, webapp de la rama `feat/device-flow-plugin` en `baas-dev`, `http://app.localhost:8080`; el plugin con `HOME` y proyecto temporales; la aprobación se hizo por la API con `orgadmin@demo.test`, no en el navegador): **correcta**.
+
+- `init` sin clave → código 20 con enlace y código; `init --wait` tras aprobar → 0 `[BAAS_RESULT linked]`; `.env` y `settings.local.json` con permisos 0600; la clave nueva no aparece en ninguna salida; un tercer `init` → `unchanged`.
+- La clave nueva pasa el proxy (`/org/demo/anthropic`): la respuesta 401 es del proveedor por la credencial de Anthropic falsa que se envió a propósito, no del proxy.
+- Clave revocada desde la API → `init` la renueva solo (aviso «ya no es válida», código 20); un segundo `init` reutiliza el mismo código; tras aprobar → `linked`.
+- Dirección inexistente → código 6 con `[BAAS_APP_URL …]` y nada guardado.
+- Pendiente: recorrido con la pantalla `/connect` en un navegador y con Claude Code real (skill y reinicio).
 
 ## E9 (roles funcionales)
 
