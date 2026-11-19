@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import os
@@ -378,7 +379,7 @@ def test_wait_honors_retry_after_capped(server: FakeDeviceServer) -> None:
     result = device.wait(server.url, "c", interval=1, max_seconds=600, sleep=clock.sleep, now=clock.now)
     assert result.status == "denied"
     assert clock.sleeps == [5, device.MAX_RETRY_AFTER]
-    assert device.MAX_RETRY_AFTER <= 10
+    assert device.MAX_RETRY_AFTER == 30
 
 
 # --- estado pendiente --------------------------------------------------------------------------
@@ -524,3 +525,30 @@ def test_pending_error_carries_the_link() -> None:
     err = ApprovalPendingError(verification_url="https://app.example.com/connect?code=KQRT-7MWB", user_code="KQRT-7MWB")
     assert "https://app.example.com/connect?code=KQRT-7MWB" in err.render()
     assert "KQRT-7MWB" in err.render()
+
+
+def test_pending_flow_keeps_the_servers_interval(paths: BaasPaths) -> None:
+    device.save_pending(paths, dataclasses.replace(_flow(), interval=7))
+    loaded = device.load_pending(paths, now=0.0)
+    assert loaded is not None
+    assert loaded.interval == 7
+
+
+def test_pending_file_without_interval_still_loads_with_the_default(paths: BaasPaths) -> None:
+    data = dataclasses.asdict(_flow())
+    del data["interval"]
+    paths.pending_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.pending_file.write_text(json.dumps(data))
+    loaded = device.load_pending(paths, now=0.0)
+    assert loaded is not None
+    assert loaded.interval == device.DEFAULT_INTERVAL == 3
+
+
+@pytest.mark.parametrize("bad", [0, -1, "3", None, True, 2.5])
+def test_pending_file_with_a_bad_interval_uses_the_default(paths: BaasPaths, bad: object) -> None:
+    data = dataclasses.asdict(_flow()) | {"interval": bad}
+    paths.pending_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.pending_file.write_text(json.dumps(data))
+    loaded = device.load_pending(paths, now=0.0)
+    assert loaded is not None
+    assert loaded.interval == 3

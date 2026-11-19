@@ -71,7 +71,7 @@ Cada fila es un requisito: debe tener mensaje propio y prueba.
 | No pertenece a ninguna organización | «Tu cuenta aún no tiene organización. Pide acceso a un administrador.» | Nada más que hacer; mensaje con quién avisar si el servidor lo informa. |
 | Sin red | «No tengo conexión con internet o con el servidor.» | Reintentar. |
 | Demasiados intentos (límite de tasa) | «Demasiados intentos. Espera un minuto.» | Reintento automático tras la espera. |
-| La sesión no pasa por el proxy (p. ej. Claude Desktop o carpeta sin confiar) | Mensaje corto que dice qué hacer en su caso (reiniciar y aceptar la confianza, o usar el CLI/IDE) | El guard **deja pasar `/baas-init` y `/baas-status`** aunque no haya proxy; solo bloquea el resto. |
+| La sesión no pasa por el proxy (p. ej. Claude Desktop o carpeta sin confiar) | Mensaje corto que dice qué hacer en su caso (reiniciar y aceptar la confianza, o usar el CLI/IDE) | El guard **deja pasar `/baas-init` y `/baas-status`** aunque no haya proxy, excepto en Claude Desktop, donde no hay excepción; solo bloquea el resto. |
 | Fichero local corrupto o versionado en git | «He encontrado una configuración dañada; la repara el asistente.» | Se hace copia y se regenera, con aviso; nunca pedir al usuario que lo arregle. |
 | Ya está conectado y todo va bien | «Ya estás conectado a <organización>. ¿Cambiar de organización?» | Cambiar o salir. |
 
@@ -101,7 +101,7 @@ Cada fila es un requisito: debe tener mensaje propio y prueba.
   `localhost`). Si no hay ninguna, se pregunta una vez y se recuerda. **[mía]**
 - **Compatibilidad:** las claves existentes y `set-key` siguen funcionando; el flujo nuevo se
   añade, no reemplaza. **[mía]**
-- **Guard:** `/baas-init` y `/baas-status` pasan siempre. Es un cambio acotado en `baas_guard.py`,
+- **Guard:** `/baas-init` y `/baas-status` pasan siempre, excepto en Claude Desktop (donde la clave viaja al proveedor y se sigue bloqueando todo). Es un cambio acotado en `baas_guard.py`,
   que debe seguir siendo autónomo y sin romper la sesión de quien no use BaaS.
 - **Servidor:** tres operaciones, acotadas a un flujo de autorización de dispositivo:
   iniciar (devuelve código y enlace), consultar (el plugin sondea) y aprobar (la webapp, con sesión

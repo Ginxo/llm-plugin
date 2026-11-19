@@ -11,9 +11,9 @@ from .errors import (
     AuthError,
     BaasError,
     ConfigError,
-    NetworkError,
     NoOrganizationsError,
     OrgNotFoundError,
+    PlainNetworkError,
     SelectionRequiredError,
 )
 
@@ -93,16 +93,18 @@ def perform_handshake(app_url: str, api_key: str, *, timeout: float = 15) -> Han
     resp = httpclient.post_json(url, {}, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout)
     if resp.status in (401, 403):
         raise AuthError(
-            "La API key no es válida o está revocada.",
-            hint="Crea una nueva en la webapp (Mis API keys) y guárdala con `set-key`.",
+            "Tu conexión con BaaS-AI-IP ya no vale.",
+            hint="Escribe /baas-init y aprueba la conexión en el navegador.",
         )
     if resp.status == 429:
-        retry = resp.header("Retry-After")
-        raise NetworkError(
-            "El handshake ha superado el límite de tasa." + (f" Reintenta en {retry} s." if retry else "")
+        raise PlainNetworkError(
+            "Se han pedido demasiadas conexiones seguidas a BaaS-AI-IP.", hint="Espera un minuto e inténtalo de nuevo."
         )
     if resp.status != 200:
-        raise NetworkError(f"La webapp respondió HTTP {resp.status} al handshake. Inténtalo más tarde.")
+        raise PlainNetworkError(
+            "BaaS-AI-IP no está disponible ahora mismo.",
+            hint="Inténtalo de nuevo en unos minutos; si sigue pasando, avisa a quien administra BaaS-AI-IP.",
+        )
     return parse_handshake(resp.json())
 
 

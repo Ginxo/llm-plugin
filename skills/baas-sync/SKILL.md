@@ -27,7 +27,7 @@ Trae al equipo las skills de la organización a la que está vinculado este proy
    | `0` con `KILL_SWITCH_ACTIVE` | El acceso de la organización está cortado (plataforma detenida, organización bloqueada o pausada): **se han retirado todas** sus skills del equipo. Informa y detente; no busques otra vía. Volverán con la siguiente sincronización cuando se levante. |
    | `0` con «Otra sincronización está en curso» | Hay otra en marcha (p. ej. la del hook de inicio): que repita en unos segundos. |
    | `2` | `[BAAS_KEY_MISSING]` o proyecto sin vincular: sigue las indicaciones de `/baas-init`. |
-   | `5` `[BAAS_AUTH_ERROR]` | La API key no vale: que cree otra en la webapp y la guarde con `set-key`. |
+   | `5` `[BAAS_AUTH_ERROR]` | Di: «Tu conexión ya no vale: escribe /baas-init y aprueba en el navegador.» No pidas ni muestres ninguna clave. |
    | `6` `[BAAS_NETWORK_ERROR]`, `10` `[BAAS_MCP_…]` | Sin red, MCP lento o con error: **no se ha tocado nada**. Sugiere `/baas-status` y reintentar. |
    | `12` `[BAAS_SYNC_INCOMPLETE]` | Alguna skill no se pudo instalar (hash que no coincide, ruta insegura): el resto sí se aplicó y la anterior versión de esa skill sigue como estaba. Muestra qué skill y el motivo y que avise al administrador de la organización. |
    | `13` `[BAAS_SYNC_FOREIGN_DIR]` | Existe `~/.claude/skills/<organización>/` y no lo gestiona BaaS: **no se tocó nada**. Muestra el mensaje; que lo renombre o lo mueva si quiere que el plugin lo gestione. **No** lo borres tú. |

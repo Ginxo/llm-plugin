@@ -21,7 +21,8 @@ from .errors import ConfigError, NetworkError
 
 START_PATH = "/api/v1/plugin/device/start"
 POLL_PATH = "/api/v1/plugin/device/poll"
-MAX_RETRY_AFTER = 5  # segundos: tope a lo que se respeta un `Retry-After` del servidor
+DEFAULT_INTERVAL = 3  # segundos entre consultas (el del contrato); también el mínimo que se respeta
+MAX_RETRY_AFTER = 30  # segundos: tope a lo que se respeta un `Retry-After` del servidor
 
 _UNREACHABLE = "No he podido conectar con BaaS-AI-IP."
 _UNREACHABLE_HINT = "Comprueba tu conexión a internet e inténtalo de nuevo en unos minutos."
@@ -220,6 +221,7 @@ class PendingFlow:
     user_code: str
     verification_url: str
     expires_at: float  # epoch (time.time()): tiene que sobrevivir al proceso
+    interval: int = DEFAULT_INTERVAL  # segundos entre consultas que pide el servidor
 
 
 def save_pending(paths: BaasPaths, flow: PendingFlow) -> None:
@@ -244,7 +246,8 @@ def _parse_pending(raw: str) -> PendingFlow | None:
     if not all(texts) or isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
         return None
     app_url, device_code, user_code, verification_url = texts
-    return PendingFlow(app_url, device_code, user_code, verification_url, float(expires_at))  # type: ignore[arg-type]
+    interval = _positive_int(data.get("interval")) or DEFAULT_INTERVAL  # los ficheros antiguos no lo traen
+    return PendingFlow(app_url, device_code, user_code, verification_url, float(expires_at), interval)  # type: ignore[arg-type]
 
 
 def load_pending(paths: BaasPaths, *, now: float) -> PendingFlow | None:

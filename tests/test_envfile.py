@@ -127,8 +127,11 @@ def test_validate_api_key_rejects_other_formats(bad: str) -> None:
 def test_load_credentials_without_file_asks_for_key(home: Path) -> None:
     with pytest.raises(MissingApiKeyError) as exc:
         envfile.load_credentials(envfile.BaasPaths.default())
-    # El mensaje indica dónde guardarla, sin pedirla en el chat
-    assert "baas-ai-ip/.env" in str(exc.value)
+    # El mensaje manda a /baas-init: ni rutas, ni `set-key`, ni pide la clave
+    text = exc.value.render()
+    assert "/baas-init" in text
+    for fragment in ("baas-ai-ip", ".env", "set-key"):
+        assert fragment not in text
 
 
 def test_load_credentials_with_empty_key_asks_for_key(home: Path) -> None:

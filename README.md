@@ -51,13 +51,13 @@ Una dirección que no responde nunca se guarda.
 
 ### Para administradores y CI: `set-key`
 
-Quien automatiza (CI, equipos sin navegador, claves de servicio) puede seguir guardando una clave existente **en una terminal**, fuera del chat; `/baas-init` la usa sin pedir aprobación:
+Quien automatiza (CI, equipos sin navegador) puede seguir guardando una clave **personal** existente **en una terminal**, fuera del chat; `/baas-init` la usa sin pedir aprobación. Solo valen las claves **personales**: el servidor rechaza las de servicio en este paso:
 
 ```bash
 python3 "<ruta del plugin>/scripts/baas.py" set-key --app-url https://app.<dominio>
 ```
 
-La pide sin mostrarla; también acepta `… | python3 …/baas.py set-key --stdin` o `BAAS_API_KEY=…` en `~/baas-ai-ip/.env`. Las claves ya existentes siguen funcionando; si una está revocada, `/baas-init` la descarta y pide aprobación de nuevo.
+La pide sin mostrarla; también acepta `… | python3 …/baas.py set-key --stdin` o `BAAS_API_KEY=…` en `~/baas-ai-ip/.env`. Las claves personales ya existentes siguen funcionando; si el servidor rechaza una (revocada, caducada, de otra base de datos o de servicio), `/baas-init` la descarta de ese fichero y empieza la aprobación en el navegador.
 
 ## Qué se guarda y dónde
 
@@ -132,7 +132,7 @@ El plugin `baas` es de Claude Code, pero **Codex CLI** también puede pasar por 
 
 La pestaña Code de Claude Desktop **no aplica el proxy del proyecto**: con cuenta de claude.ai, Desktop arranca Claude Code con `ANTHROPIC_BASE_URL=https://api.anthropic.com` e ignora la de `.claude/settings.local.json`. Las peticiones irían directas a Anthropic, sin AI-IP ni trazas, y con la cabecera `X-Baas-Api-Key` (que sí se aplica).
 
-**Guardia (fallo cerrado).** El plugin trae dos *hooks* (`hooks/hooks.json` → `scripts/baas_guard.py`): en un proyecto vinculado cuya sesión no pase por el proxy, `SessionStart` avisa y `UserPromptSubmit` **bloquea los prompts** con una explicación en llano de qué hacer. **Excepción: `/baas-init` y `/baas-status`**, solo escritos tal cual (con, a lo sumo, una organización), siempre pasan: así la persona puede arreglar el problema desde la propia sesión. En proyectos no vinculados no hacen nada. Cubre también el CLI sin la confianza aceptada.
+**Guardia (fallo cerrado).** El plugin trae dos *hooks* (`hooks/hooks.json` → `scripts/baas_guard.py`): en un proyecto vinculado cuya sesión no pase por el proxy, `SessionStart` avisa y `UserPromptSubmit` **bloquea los prompts** con una explicación en llano de qué hacer. **Excepción: `/baas-init` y `/baas-status`**, solo escritos tal cual (con, a lo sumo, una organización), pasan: así la persona puede arreglar el problema desde la propia sesión. **La excepción no aplica en Claude Desktop**: allí la clave viaja al proveedor del modelo, así que se sigue bloqueando todo (también esos dos) con la explicación de qué hacer. En proyectos no vinculados no hacen nada. Cubre también el CLI sin la confianza aceptada.
 
 **Para trabajar en un proyecto BaaS**, elige:
 

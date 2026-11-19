@@ -145,7 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # Proyecto vinculado: un fallo ya no puede dejar pasar el prompt sin protección.
     try:
-        allowed = event == "prompt" and is_allowed_prompt(data)
+        # En Claude Desktop la clave de BaaS viaja al proveedor del modelo: ahí no hay excepción que valga.
+        allowed = event == "prompt" and not is_desktop(dict(os.environ)) and is_allowed_prompt(data)
     except Exception:
         allowed = False
     try:

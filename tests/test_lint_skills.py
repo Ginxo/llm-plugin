@@ -234,3 +234,41 @@ def test_readme_documents_first_use_and_server_address() -> None:
     assert "set-key" not in first_use  # el primer uso son tres pasos, sin claves ni terminales
     troubleshooting = text.split("## Solución de problemas", 1)[1].split("\n## ", 1)[0]
     assert "set-key" not in troubleshooting  # `set-key` es solo para administradores y CI
+
+
+def test_no_skill_tells_the_user_to_use_set_key_or_local_paths() -> None:
+    for skill in sorted((REPO / "skills").glob("*/SKILL.md")):
+        text = skill.read_text(encoding="utf-8")
+        assert "set-key" not in text, skill.parent.name
+        # Las skills de publicar, exportar y brain solo le dicen a Claude que NO lea esos ficheros; lo que se dice
+        # a la persona (entre «…») nunca los nombra.
+        for sentence in _shown_texts(skill):
+            assert "~/baas-ai-ip" not in sentence, (skill.parent.name, sentence)
+
+
+def test_sync_skill_sends_a_dead_connection_to_baas_init() -> None:
+    text = (REPO / "skills" / "baas-sync" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Tu conexión ya no vale: escribe /baas-init y aprueba en el navegador" in text
+
+
+def test_init_skill_handles_more_than_four_organisations_and_names_the_account() -> None:
+    text = INIT_SKILL.read_text(encoding="utf-8")
+    assert "más de 4" in text
+    assert "lista numerada" in text
+    assert "Conectado a <nombre de la organización> con la cuenta <correo>" in text
+    assert "no reconoce la cuenta" in text.lower() or "no reconoces la cuenta" in text.lower()
+
+
+def test_readme_admin_section_is_honest_about_personal_keys() -> None:
+    text = (REPO / "README.md").read_text(encoding="utf-8")
+    admin = text.split("### Para administradores y CI: `set-key`", 1)[1].split("\n## ", 1)[0]
+    assert "personal" in admin.lower()
+    assert "claves de servicio" not in admin
+    assert "descarta" in admin  # una clave que el servidor rechaza se descarta y empieza la aprobación
+    desktop = text.split("## Claude Desktop (pestaña Code)", 1)[1].split("\n## ", 1)[0]
+    assert "no aplica en Claude Desktop" in desktop
+
+
+def test_design_spec_guard_row_excludes_claude_desktop() -> None:
+    spec = (REPO / "docs/superpowers/specs/2026-11-19-baas-init-guiado-design.md").read_text(encoding="utf-8")
+    assert "excepto en Claude Desktop" in spec

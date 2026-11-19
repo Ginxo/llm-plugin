@@ -179,9 +179,8 @@ def normalize_app_url(value: str) -> str:
 
 def missing_key_error(paths: BaasPaths) -> MissingApiKeyError:
     return MissingApiKeyError(
-        f"No hay API key de BaaS-AI-IP en {paths.env_file} (ruta ~/baas-ai-ip/.env).",
-        hint="Guárdala sin pasar por el chat: ejecuta `set-key` en una terminal o edita ese fichero "
-        "(línea BAAS_API_KEY=...). Nunca la pegues en la conversación.",
+        "Este equipo todavía no está conectado a BaaS-AI-IP.",
+        hint="Escribe /baas-init y aprueba la conexión en el navegador.",
     )
 
 

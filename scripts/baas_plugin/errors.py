@@ -59,6 +59,11 @@ class NetworkError(BaasError):
     marker = "BAAS_NETWORK_ERROR"
 
 
+class PlainNetworkError(NetworkError):
+    """El servidor respondió, pero con un límite de intentos o un fallo propio: ya trae el texto en llano
+    (no se sustituye por el genérico de «sin conexión»)."""
+
+
 class ProjectSafetyError(BaasError):
     exit_code = 7
     marker = "BAAS_PROJECT_UNSAFE"

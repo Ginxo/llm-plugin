@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -949,3 +950,84 @@ def test_init_with_mcp_not_registered_is_linked(home, project, server, fake_clau
     assert code == 0, out
     assert "AVISO" in out
     assert last_line(out) == "[BAAS_RESULT linked]"
+
+
+# --- revisión final ----------------------------------------------------------------------------------------
+
+
+def test_handshake_rate_limit_and_server_errors_keep_their_own_plain_wording(
+    home, project, server, fake_claude, capsys
+) -> None:
+    save_key("analista@demo.test", server.url)
+    server.state.handshake_status = 429
+    code, out = run(init(project), capsys)
+    assert code == 6
+    assert "demasiadas" in out
+    assert "Espera un minuto" in out
+    assert_plain_network_error(out)
+    server.state.handshake_status = 503
+    code, out = run(init(project), capsys)
+    assert code == 6
+    assert "no está disponible ahora mismo" in out
+    assert "Comprueba tu conexión" not in out
+    assert_plain_network_error(out)
+
+
+def test_plain_connection_failure_keeps_the_check_your_connection_text(home, project, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", "http://127.0.0.1:9")
+    code, out = run(init(project), capsys)
+    assert code == 6
+    assert "Comprueba tu conexión" in out
+
+
+def test_auth_error_and_missing_key_point_to_baas_init(home, server, capsys) -> None:
+    from baas_plugin import handshake
+
+    with pytest.raises(handshake.AuthError) as info:
+        handshake.perform_handshake(server.url, dev_api_key("nadie@demo.test"))
+    texts = [info.value.render(), envfile.missing_key_error(paths_()).render()]
+    for text in texts:
+        assert "/baas-init" in text
+        for fragment in ("set-key", "~/", ".env", "API key", "baas.py"):
+            assert fragment not in text, (fragment, text)
+
+
+def test_wait_uses_the_servers_interval_but_never_less_than_three(home, project, fake_device, capsys) -> None:
+    for interval, expected in ((7, 7), (1, 3)):
+        seed_pending()
+        pending = device.load_pending(paths_(), now=time.time())
+        assert pending is not None
+        device.save_pending(paths_(), dataclasses.replace(pending, interval=interval))
+        fake_device.wait_calls.clear()
+        assert run(init(project, "--wait", "--app-url", APP), capsys)[0] == 21
+        assert fake_device.wait_calls == [(APP, DEVICE_CODE, expected, 90)]
+
+
+def test_new_flow_remembers_the_servers_interval(home, project, fake_device, capsys) -> None:
+    assert run(init(project, "--app-url", APP), capsys)[0] == 20
+    pending = device.load_pending(paths_(), now=time.time())
+    assert pending is not None
+    assert pending.interval == 3  # el del servidor de pruebas
+
+
+def test_wait_without_pending_but_with_a_key_stored_by_another_project_binds_without_a_second_approval(
+    home, project, server, fake_claude, fake_device, capsys
+) -> None:
+    """Otro proyecto terminó su `--wait` y guardó la clave: este no abre una segunda aprobación."""
+    key = save_key("analista@demo.test", server.url)
+    code, out = run(init(project, "--wait"), capsys)
+    assert code == 0, out
+    assert fake_device.start_calls == []
+    assert fake_device.wait_calls == []
+    assert last_line(out) == "[BAAS_RESULT linked]"
+    assert key not in out
+    assert json.loads((project / ".claude/baas.local.json").read_text())["org"] == "demo"
+
+
+def test_wait_without_pending_and_with_a_rejected_key_starts_the_flow(
+    home, project, server, fake_device, capsys
+) -> None:
+    save_key("nadie@demo.test", server.url)
+    code, _ = run(init(project, "--wait"), capsys)
+    assert code == 20
+    assert len(fake_device.start_calls) == 1

@@ -64,6 +64,7 @@ from .errors import (
     ConfigError,
     MissingAppUrlError,
     NetworkError,
+    PlainNetworkError,
     ProjectSafetyError,
 )
 
@@ -147,7 +148,7 @@ def _project_dir(args: argparse.Namespace) -> Path:
 
 STALE_KEY_NOTICE = "Tu conexión anterior ya no es válida; vamos a renovarla."
 REPAIRED_NOTICE = "He reparado una configuración dañada (copia guardada)."
-WAIT_INTERVAL = 3  # segundos entre consultas (el del contrato)
+WAIT_INTERVAL = device.DEFAULT_INTERVAL  # mínimo entre consultas; se respeta el del servidor si es mayor
 WAIT_SECONDS = 90  # lo que espera una sola llamada de `init --wait`
 
 
@@ -201,6 +202,8 @@ def _handshake(app_url: str, api_key: str) -> handshake.Handshake:
     """Handshake con los fallos de red en llano (sin URLs ni rutas); una clave revocada sigue siendo `AuthError`."""
     try:
         return handshake.perform_handshake(app_url, api_key)
+    except PlainNetworkError:
+        raise  # límite de intentos o fallo del servidor: ya viene en llano y la skill lo distingue
     except (NetworkError, http.client.HTTPException):
         raise device.unreachable() from None
 
@@ -222,7 +225,7 @@ def _start_flow(paths: BaasPaths, proj: Path, app_url: str) -> NoReturn:
     flow = device.start(app_url, _client_name(proj))  # NetworkError (código 6): la URL aún no se guarda
     update_env(paths, {"BAAS_APP_URL": app_url})
     pending = device.PendingFlow(
-        app_url, flow.device_code, flow.user_code, flow.verification_url, time.time() + flow.expires_in
+        app_url, flow.device_code, flow.user_code, flow.verification_url, time.time() + flow.expires_in, flow.interval
     )
     device.save_pending(paths, pending)
     _open_browser(flow.verification_url)
@@ -235,7 +238,12 @@ def _await_approval(paths: BaasPaths, app_url: str) -> str | None:
     pending = device.load_pending(paths, now=time.time())
     if pending is None or normalize_app_url(pending.app_url) != app_url:
         return None
-    result = device.wait(pending.app_url, pending.device_code, interval=WAIT_INTERVAL, max_seconds=WAIT_SECONDS)
+    result = device.wait(
+        pending.app_url,
+        pending.device_code,
+        interval=max(pending.interval, WAIT_INTERVAL),
+        max_seconds=WAIT_SECONDS,
+    )
     if result.status == "approved" and result.api_key:
         update_env(paths, {"BAAS_API_KEY": result.api_key, "BAAS_APP_URL": app_url})
         device.clear_pending(paths)
@@ -270,6 +278,17 @@ def _init(args: argparse.Namespace, paths: BaasPaths, values: dict[str, str], ap
     if args.wait:
         api_key = _await_approval(paths, app_url)
         via_approval = api_key is not None
+        if api_key is None:
+            # Sin conexión pendiente aquí: puede que otro proyecto la terminara y guardara ya la clave.
+            stored = read_env(paths)[0].get("BAAS_API_KEY", "").strip()
+            if API_KEY_RE.match(stored):
+                try:
+                    hs = _handshake(app_url, stored)
+                except AuthError:
+                    pass  # una clave que no vale no es una conexión: se empieza la aprobación
+                else:
+                    api_key, via_approval = stored, True  # hay que reiniciar, como tras una aprobación
+                    update_env(paths, {"BAAS_APP_URL": app_url})
     else:
         stored = values.get("BAAS_API_KEY", "").strip()
         if stored:
@@ -383,7 +402,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     binding = project.read_binding(proj)
     _p(f"API key: {key_prefix(creds.api_key)} en {paths.env_file} · webapp: {creds.app_url or 'sin configurar'}")
     if not creds.app_url:
-        raise MissingAppUrlError("Falta BAAS_APP_URL en ~/baas-ai-ip/.env; lanza /baas-init con --app-url.")
+        raise MissingAppUrlError(
+            "No sé a qué dirección de BaaS-AI-IP conectarme.", hint="Escribe /baas-init y te la pregunto."
+        )
     hs = handshake.perform_handshake(creds.app_url, creds.api_key)
     _p(
         f"Usuario: {hs.email} · rol de plataforma: {hs.platform_role}",
@@ -443,7 +464,9 @@ def cmd_desktop_config(args: argparse.Namespace) -> int:
         raise missing_key_error(paths)
     creds = load_credentials(paths)
     if not creds.app_url:
-        raise MissingAppUrlError("Falta BAAS_APP_URL en ~/baas-ai-ip/.env; lanza /baas-init con --app-url.")
+        raise MissingAppUrlError(
+            "No sé a qué dirección de BaaS-AI-IP conectarme.", hint="Escribe /baas-init y te la pregunto."
+        )
     proj = _project_dir(args)
     current = (project.read_binding(proj) or {}).get("org")
     hs = handshake.perform_handshake(creds.app_url, creds.api_key)
