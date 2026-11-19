@@ -1,42 +1,82 @@
 ---
 name: baas-init
-description: Vincula este proyecto a una organización de BaaS-AI-IP (handshake con la webapp, proxy de Anthropic y servidor MCP `baas`). Úsala solo cuando el usuario lance /baas-init o pida configurar o cambiar la organización del proyecto.
-argument-hint: "[slug-de-organización]"
+description: Conecta este proyecto con la organización de BaaS-AI-IP de quien lo usa. La persona solo aprueba en el navegador; no copia claves ni ejecuta nada. Úsala solo cuando el usuario lance /baas-init o pida conectar este proyecto o cambiar de organización.
+argument-hint: "[organización]"
 disable-model-invocation: true
-allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" init *)
+allowed-tools:
+  - Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" init *)
+  - Bash(git rm --cached .claude/settings.local.json)
+  - Bash(git rm --cached .claude/baas.local.json)
 ---
 
 # /baas-init
 
-Configura este proyecto para BaaS-AI-IP. El trabajo lo hace un script; tú lo ejecutas e interpretas su salida.
+Conecta este proyecto con BaaS-AI-IP. La persona que te lee **no es técnica**: tú eres toda su interfaz. Un script hace el trabajo y tú lo ejecutas e interpretas.
 
-## Regla de oro: la API key nunca pasa por el chat
+## Cómo hablar con la persona
 
-- **No pidas nunca la API key en la conversación**, no la leas de `~/baas-ai-ip/.env` ni de `.claude/settings.local.json`, y no la muestres.
-- Si el argumento `$ARGUMENTS` o un mensaje del usuario parece una API key (empieza por `baas_`), **no la uses**: dile que ya ha quedado en el historial de la conversación, que la **revoque en la webapp** (Mis API keys), cree otra y la guarde con `set-key` (abajo).
+- Cada mensaje dice **qué ha pasado y qué hacer ahora**, en español llano y en una o dos frases.
+- **Nunca** le muestres ni le pidas nada de lo siguiente: nombres de ficheros o rutas, comandos, códigos de salida, marcas entre corchetes, ni palabras como *proxy*, *handshake*, *hook*, *API key*, *token* o *settings*. La salida del script es técnica: **resúmela, no la copies**.
+- Los textos entre «comillas angulares» de esta skill son los que debes decir (puedes ajustar el género o rellenar los huecos `<…>`). Si el script devuelve un caso que no está aquí, di con tus palabras qué ha pasado y que puede volver a intentarlo escribiendo /baas-init.
+
+## La clave nunca pasa por el chat
+
+- No pidas, leas ni muestres ninguna clave o contraseña. La persona no tiene que crear ni copiar nada: aprueba en el navegador y el script guarda la conexión por su cuenta.
+- Si `$ARGUMENTS` o un mensaje de la persona parece una clave (empieza por `baas_`), **no la uses** ni la repitas. Dile: «Eso parece una clave y ha quedado en el historial de esta conversación. Cámbiala desde la web de tu organización (o pide a quien la administra que lo haga) para que la anterior deje de valer; no hace falta que me la des: conectarse solo requiere aprobar en el navegador.» Y sigue sin ella.
 
 ## Pasos
 
-1. Ejecuta (si `$ARGUMENTS` es un slug de organización, añade `--org <slug>`; si no, nada más):
+1. Ejecuta, sustituyendo `<organización>` y `<dirección>` solo si aplican (ver más abajo):
 
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" init --project "${CLAUDE_PROJECT_DIR}"
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" init --project "${CLAUDE_PROJECT_DIR}" [--org <organización>] [--app-url <dirección>]
    ```
 
-2. Según el código de salida y la marca entre corchetes de la salida:
+   - `--org`: solo si `$ARGUMENTS` es el identificador de una organización (letras minúsculas, cifras y guiones, p. ej. `acme`). Cualquier otra cosa, no la pases al comando.
+   - `--app-url`: solo si la persona te ha dado una dirección (nunca la inventes). Usa exactamente el texto que te dio, entre comillas.
+
+2. Mira el código de salida y la marca entre corchetes de la salida, y actúa según esta tabla. Al terminar cada caso, la persona debe saber **qué ha pasado y qué hacer ahora**.
 
    | Salida | Qué hacer |
    | :--- | :--- |
-   | `0` | Resume al usuario la organización, las URLs y los `AVISO:` (kill switch, MCP sin registrar). Dile que **reinicie Claude Code** en este proyecto (y acepte la confianza en la carpeta) para cargar el MCP `baas` y el proxy, que lo compruebe con `/baas-status` y que lance `/baas-sync` para traer las skills de la organización. |
-   | `2` `[BAAS_KEY_MISSING]` | Falta la API key. Pide al usuario que la guarde **fuera del chat**, en una terminal aparte: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" set-key --app-url <URL de la webapp>` (la pide sin mostrarla y la guarda en `~/baas-ai-ip/.env` con permisos 0600), o que edite ese fichero con la línea `BAAS_API_KEY=...`. Cuando confirme, vuelve al paso 1. |
-   | `2` `[BAAS_APP_URL_MISSING]` | Pregunta la URL de la webapp (p. ej. `https://app.<dominio>`; no es secreta) y repite el paso 1 con `--app-url <URL>`. |
-   | `3` `[BAAS_ORG_SELECTION_REQUIRED]` | El usuario pertenece a varias organizaciones: muéstrale la lista y pregúntale cuál vincular (AskUserQuestion si está disponible). Repite el paso 1 con `--org <slug>`. |
-   | `4` `[BAAS_NO_ORGANIZATIONS]` | Avisa de que no pertenece a ninguna organización y de que debe pedir acceso a un administrador. No hay nada más que hacer. |
-   | `5` `[BAAS_AUTH_ERROR]` | La clave no es válida o está revocada: que cree otra en la webapp y la guarde con `set-key`. |
-   | `6` `[BAAS_NETWORK_ERROR]` | Sin red, URL incorrecta o servidor no disponible / límite de tasa: muestra el mensaje y sugiere reintentar. |
-   | `7` `[BAAS_PROJECT_UNSAFE]` | Un fichero local está versionado o no es JSON válido: muestra el mensaje y la solución propuesta. **No** lo arregles por tu cuenta sin que el usuario lo pida. |
-   | `8` `[BAAS_ORG_NOT_FOUND]` | El slug pedido no es una de sus organizaciones: muestra las disponibles. |
+   | `0`, primera línea con «vinculado» | Dilo en una frase: «Listo: este proyecto queda conectado a <nombre de la organización>.» Si hay líneas `AVISO:` cuéntalas en llano (ver el apartado *Avisos*). Cierra con: «Cierra y vuelve a abrir Claude Code en esta carpeta y acepta la confianza si te la pide.» Añade que después puede escribir /baas-status para comprobarlo y /baas-sync para traer las skills de su organización. |
+   | `0`, primera línea con «actualizado» (ya estaba conectado) | Si la persona escribió una organización concreta, trátalo como la fila anterior. Si no, di en una línea: «Ya estás conectado a <nombre de la organización>.» y pregunta con `AskUserQuestion` si quiere **cambiar de organización** o **dejarlo como está**. Si lo deja: «Todo sigue como estaba. Si Claude te avisa de que esta sesión aún no está protegida, cierra y vuelve a abrir Claude Code en esta carpeta.» Si quiere cambiar, ver el apartado *Cambiar de organización*. |
+   | `20` `[BAAS_APPROVAL_PENDING]` | Saca el enlace y el código de la salida y di: «Abre este enlace para conectar este proyecto: <enlace>. El código es <código>; comprueba que es el que ves en la página. Te he abierto el navegador si he podido.» **Sin esperar respuesta**, ejecuta enseguida el mismo comando con `--wait` añadido (ver el apartado *Esperar la aprobación*). |
+   | `21` `[BAAS_APPROVAL_WAITING]` | Todavía no ha aprobado. Repite `init --wait` (mismas opciones). Tras **4 repeticiones seguidas** sin éxito, deja de repetir y di: «Sigo esperando a que apruebes la conexión en el navegador; avísame cuando lo hayas hecho.» y espera su mensaje; cuando escriba, vuelve a ejecutar `init --wait`. |
+   | `22` `[BAAS_APPROVAL_DENIED]` | «Has cancelado la conexión, así que no se ha cambiado nada.» Pregunta con `AskUserQuestion`: «¿Genero otro enlace?» (sí o no). Si sí, repite el paso 1 (mismas opciones). Si no, termina: «Cuando quieras conectarlo, escribe /baas-init.» |
+   | `23` `[BAAS_APPROVAL_EXPIRED]` | «El enlace ha caducado.» Pregunta con `AskUserQuestion`: «¿Genero otro enlace?». Si sí, repite el paso 1. Si no, termina como en el caso anterior. |
+   | `6` `[BAAS_NETWORK_ERROR]` | Di: «No encuentro el servidor de BaaS-AI-IP en <dirección>.» (si no conoces la dirección, «No encuentro el servidor de BaaS-AI-IP.») y añade «Puede que no tengas conexión a internet o que la dirección no sea la correcta.» Pregunta con `AskUserQuestion` qué prefiere: **reintentar** (repite el paso 1 igual) o **escribir otra dirección**. Si escribe otra, pídesela en la propia pregunta, **con la dirección actual ya escrita en el texto de la pregunta** si la conoces, y repite el paso 1 con `--app-url <dirección>`. Si vuelve a fallar tres veces, deja de insistir: «Sigo sin poder conectar. Comprueba tu conexión o pregunta a quien administra BaaS-AI-IP cuál es la dirección correcta, y escribe /baas-init cuando lo tengas.» |
+   | `2` `[BAAS_APP_URL_MISSING]` | Pregunta con `AskUserQuestion`: «¿Cuál es la dirección de BaaS-AI-IP de tu organización? Te la puede dar quien la administra.» Repite el paso 1 con `--app-url <dirección>`. Si no la sabe: «Pídesela a quien administra BaaS-AI-IP y escribe /baas-init cuando la tengas.» |
+   | `3` `[BAAS_ORG_SELECTION_REQUIRED]` | Pertenece a varias organizaciones. De la lista de la salida (identificador · nombre) pregunta con `AskUserQuestion` a cuál conectar este proyecto, mostrando solo los **nombres**. Repite el paso 1 con `--org <identificador>` de la elegida. |
+   | `4` `[BAAS_NO_ORGANIZATIONS]` | «Tu cuenta todavía no pertenece a ninguna organización. Pide a quien administra BaaS-AI-IP que te dé acceso y escribe /baas-init cuando lo tengas.» No hay nada más que hacer. |
+   | `8` `[BAAS_ORG_NOT_FOUND]` | «No formas parte de esa organización.» Pregunta con `AskUserQuestion` a cuál de las que salen en la lista quiere conectar (solo nombres) y repite el paso 1 con su `--org`. Si la lista no tiene ninguna, como en el caso `4`. |
+   | `7` `[BAAS_PROJECT_UNSAFE]` | Ver el apartado *Un fichero local está en git*. |
 
-3. Relanzar `/baas-init` es seguro: actualiza la configuración sin duplicar nada. Para **cambiar de organización**: `/baas-init <slug>`.
+3. Relanzar `/baas-init` es seguro: no duplica nada.
 
-Qué escribe el script (todo local y fuera del control de versiones): `~/baas-ai-ip/.env` (clave, 0600), `.claude/settings.local.json` (`ANTHROPIC_BASE_URL` y la cabecera `X-Baas-Api-Key`), `.claude/baas.local.json` (organización y URLs), entradas en `.gitignore` y el servidor MCP `baas` en el ámbito *local* de Claude Code, con un `headersHelper` que lee la clave de `~/baas-ai-ip/.env`.
+## Esperar la aprobación
+
+`init --wait` espera hasta ~90 segundos a que la persona apruebe en el navegador y termina con uno de los códigos de la tabla: `0` (ya conectado, sigue como arriba), `21` (sigue esperando), `22` o `23`. Si dice que no hay nada pendiente y vuelve a dar el enlace (`20`), preséntalo igual que arriba. Mientras esperas no le pidas nada más: ya sabe lo que tiene que hacer.
+
+## Cambiar de organización
+
+Solo si la persona ya estaba conectada y quiere cambiar. Para saber cuáles tiene, ejecuta el paso 1 con `--org cambiar` (no es una organización: la salida `8` trae la lista de las suyas). Si solo tiene una: «Solo formas parte de una organización, así que no hay nada que cambiar.» Si tiene varias, pregunta cuál con `AskUserQuestion` (solo nombres) y repite el paso 1 con `--org <identificador>` de la elegida; al terminar, como en `0`.
+
+## Un fichero local está en git (código 7)
+
+Hay dos causas; distínguelas por el mensaje de la salida (no lo copies):
+
+- **Un fichero de este proyecto está en el control de versiones (git)** (el mensaje nombra `.claude/settings.local.json` o `.claude/baas.local.json`). Explícalo en llano y pide permiso con `AskUserQuestion`: «Un archivo de configuración personal de este proyecto está incluido en el control de versiones, y podría acabar compartiéndose con tus credenciales. Puedo dejar de seguirlo sin borrarlo de tu carpeta; después ese cambio tendrás que guardarlo como cualquier otro cambio del proyecto. ¿Lo hago?»
+  - **Solo si acepta**, ejecuta únicamente `git rm --cached <fichero>` para **cada fichero afectado** y nada más (exactamente `git rm --cached .claude/settings.local.json` y/o `git rm --cached .claude/baas.local.json`), vuelve al paso 1 y, en el resumen final, recuérdale que ese cambio queda pendiente de guardar en el proyecto, como cualquier otro.
+  - Si no acepta: «De acuerdo, no toco nada. Mientras ese archivo siga en el control de versiones no puedo conectar este proyecto; escribe /baas-init cuando quieras que lo arreglemos.»
+- **Un fichero de configuración está dañado** (no es legible). El script lo repara solo y deja una copia, así que normalmente no llegas aquí. Si llegas: «He encontrado una configuración dañada que no he podido reparar. Pide ayuda a quien administra BaaS-AI-IP.»
+
+## Avisos (`AVISO:` en una salida `0`)
+
+Cuéntalos en una frase llana, sin copiar el texto:
+
+- Organización **pausada o bloqueada**, o parada general de la plataforma: «Tu organización está en pausa ahora mismo, así que no podrás usar BaaS-AI-IP hasta que quien la administra la reactive; la conexión ya queda hecha.»
+- **No se pudo registrar el servidor de conocimiento** (el aviso trae un comando): «Hay que completar un paso que te indicará quien administra BaaS-AI-IP.» **No** imprimas el comando.
+- Cualquier otro aviso: dilo con tus palabras y que no hace falta que haga nada, salvo que avise a quien administra BaaS-AI-IP si le afecta.
+
+Si en la salida aparece que se ha renovado una conexión anterior o reparado una configuración, basta con decir: «He renovado tu conexión anterior» o «He reparado una configuración dañada».

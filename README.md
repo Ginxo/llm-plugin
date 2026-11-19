@@ -4,7 +4,7 @@
 
 Este repositorio es a la vez el **marketplace** `baas-ai-ip` y el **plugin** `baas`. Conecta Claude Code con BaaS-AI-IP:
 
-- **`/baas-init`**: guarda tu API key fuera del chat, hace el *handshake* con la webapp y vincula el proyecto a una de tus organizaciones (proxy de Anthropic + servidor MCP `baas`).
+- **`/baas-init`**: conecta el proyecto con tu organización. Claude te da un enlace, **apruebas en el navegador** y ya está: no se copia ninguna clave ni se ejecuta nada a mano (proxy de Anthropic + servidor MCP `baas` por debajo).
 - **`/baas-status`**: usuario, organización del proyecto, roles, kill switch (global, bloqueo, pausa), AI-IP y si el proxy y el MCP funcionan en esta sesión.
 - **Skill `baas-brain`**: enseña al agente a usar las tools `baas_*` (skills, scripts y conocimiento de la organización) y a **detenerse** ante `AUTHORIZATION_DENIED` o `KILL_SWITCH_ACTIVE`.
 - **`/baas-sync`**: copia en tu equipo las skills de la organización que tus roles autorizan, con sus scripts, plantillas y ficheros de contexto, como un plugin de Claude Code que se invoca **`/<organización>:<skill>`**. También se sincroniza solo, en segundo plano, al iniciar y al cerrar la sesión. Quitar un rol, retirar una skill o activar el kill switch la elimina del equipo en la siguiente sincronización ([Skills de la organización](#skills-de-la-organización-sincronización)).
@@ -15,12 +15,12 @@ Este repositorio es a la vez el **marketplace** `baas-ai-ip` y el **plugin** `ba
 
 - Claude Code (CLI o extensión de IDE). Probado con 2.1.325.
 - **Python 3.10 o superior** como `python3` (solo biblioteca estándar: no hay que instalar nada).
-- Una cuenta de BaaS-AI-IP con una **API key** (webapp → *Mis API keys*) y la URL de la webapp (`https://app.<dominio>`).
+- Una cuenta de BaaS-AI-IP con acceso a una organización. La dirección de la aplicación solo hace falta si el plugin no la trae ya puesta ([La dirección de BaaS-AI-IP](#la-dirección-de-baas-ai-ip)).
 - Linux o macOS. Windows no está probado.
 
-## Instalación (menos de 2 minutos)
+## Primer uso (tres pasos)
 
-1. En Claude Code, añade el marketplace e instala el plugin:
+1. **Instala el plugin.** En Claude Code:
 
    ```text
    /plugin marketplace add baas-ai-ip/llm-plugin
@@ -29,24 +29,42 @@ Este repositorio es a la vez el **marketplace** `baas-ai-ip` y el **plugin** `ba
 
    (Desde Claude Code 2.1.275 basta con `/plugin install baas --marketplace baas-ai-ip/llm-plugin`.)
 
-2. Abre Claude Code en tu proyecto y lanza **`/baas-init`**. La primera vez te dará un comando para guardar la clave **en una terminal aparte** (la pide sin mostrarla):
+2. **Abre Claude Code en tu proyecto y escribe `/baas-init`.** Claude te da un enlace y un código corto, y abre el navegador si puede.
+3. **Aprueba en el navegador.** Entra con tu cuenta, comprueba que el código es el mismo y pulsa *Aprobar*. Claude lo detecta solo, conecta el proyecto y te pide **cerrar y volver a abrir Claude Code en esa carpeta** (acepta la confianza si te la pide). Con `/baas-status` puedes comprobar que todo está en orden.
 
-   ```bash
-   python3 "<ruta del plugin>/scripts/baas.py" set-key --app-url https://app.<dominio>
-   ```
+No hay que crear ni copiar ninguna clave: la aprobación genera una clave personal para ese equipo (la ves y la revocas en la web, en *Mis API keys*) y se guarda sola, fuera del control de versiones. **No pegues nunca una clave en el chat**: quedaría en el historial y se enviaría al modelo; si lo haces, Claude te dirá cómo cambiarla.
 
-   También puedes pasarla por tubería desde tu gestor de contraseñas (`… | python3 …/baas.py set-key --stdin`) o escribir `BAAS_API_KEY=…` en `~/baas-ai-ip/.env`. **No pegues nunca la clave en el chat**: quedaría en el historial y se enviaría al modelo. Si lo haces, revócala en la webapp.
+Si no hay una dirección de BaaS-AI-IP conocida, Claude te la pregunta una vez (te la da quien administra la plataforma) y la recuerda. Si perteneces a varias organizaciones, te pregunta cuál (también puedes escribir `/baas-init <organización>`). Si algo falla, Claude te dice qué ha pasado y qué hacer; relanzar `/baas-init` es siempre seguro y no duplica nada. Para **cambiar de organización**, vuelve a lanzarlo.
 
-3. Vuelve a lanzar `/baas-init`. Si perteneces a varias organizaciones te preguntará cuál; con una, la elige sola.
-4. **Reinicia Claude Code** en el proyecto y acepta la confianza en la carpeta. Comprueba con `/baas-status` y `/mcp` (servidor `baas` conectado).
+Los comandos también responden con su nombre completo: `/baas:baas-init`, `/baas:baas-status`, `/baas:baas-sync`.
 
-Los comandos también responden con su nombre completo: `/baas:baas-init`, `/baas:baas-status`, `/baas:baas-sync`. Para **cambiar de organización**: `/baas-init <slug>`. Relanzar `/baas-init` es seguro (no duplica nada).
+### La dirección de BaaS-AI-IP
+
+El plugin necesita saber a qué servidor conectarse. Se resuelve así, por orden:
+
+1. `--app-url <dirección>` en la línea de órdenes (lo usa Claude cuando se la das en el chat).
+2. La variable de entorno **`BAAS_APP_URL`**.
+3. La que ya recuerda el equipo (`BAAS_APP_URL` en `~/baas-ai-ip/.env`, que `/baas-init` guarda solo cuando el servidor responde).
+4. **`DEFAULT_APP_URL`** de `scripts/baas_plugin/defaults.py`: vacía en el repositorio, **se rellena al publicar el plugin** para que quien lo instala no tenga que escribir ninguna dirección.
+
+Una dirección que no responde nunca se guarda.
+
+### Para administradores y CI: `set-key`
+
+Quien automatiza (CI, equipos sin navegador, claves de servicio) puede seguir guardando una clave existente **en una terminal**, fuera del chat; `/baas-init` la usa sin pedir aprobación:
+
+```bash
+python3 "<ruta del plugin>/scripts/baas.py" set-key --app-url https://app.<dominio>
+```
+
+La pide sin mostrarla; también acepta `… | python3 …/baas.py set-key --stdin` o `BAAS_API_KEY=…` en `~/baas-ai-ip/.env`. Las claves ya existentes siguen funcionando; si una está revocada, `/baas-init` la descarta y pide aprobación de nuevo.
 
 ## Qué se guarda y dónde
 
 | Dónde | Qué | ¿Versionado? |
 | :--- | :--- | :--- |
-| `~/baas-ai-ip/.env` (0600, directorio 0700) | `BAAS_API_KEY` y `BAAS_APP_URL` | No: está en tu `HOME` |
+| `~/baas-ai-ip/.env` (0600, directorio 0700) | `BAAS_API_KEY` (la crea la aprobación en el navegador) y `BAAS_APP_URL` | No: está en tu `HOME` |
+| `~/baas-ai-ip/pending.json` (0600) | Mientras esperas la aprobación: el código pendiente (sin ninguna clave), que caduca a los 10 minutos y se borra al terminar | No |
 | `~/baas-ai-ip/bin/baas_mcp_headers.py` | *Helper* que da a Claude Code la cabecera del MCP leyendo `.env` | No |
 | `~/baas-ai-ip/bin/baas_desktop_credentials.py` | Solo con Claude Desktop en modo gateway (`desktop-config`): da a Desktop la API key de Anthropic y la cabecera `X-Baas-Api-Key` leyendo `.env` | No |
 | `<proyecto>/.claude/settings.local.json` (0600) | `ANTHROPIC_BASE_URL` (proxy de la organización) y `ANTHROPIC_CUSTOM_HEADERS` con `X-Baas-Api-Key`. Se conservan tus otros ajustes | **No**: el plugin lo añade a `.gitignore` y se niega a escribir si ya está versionado |
@@ -114,12 +132,12 @@ El plugin `baas` es de Claude Code, pero **Codex CLI** también puede pasar por 
 
 La pestaña Code de Claude Desktop **no aplica el proxy del proyecto**: con cuenta de claude.ai, Desktop arranca Claude Code con `ANTHROPIC_BASE_URL=https://api.anthropic.com` e ignora la de `.claude/settings.local.json`. Las peticiones irían directas a Anthropic, sin AI-IP ni trazas, y con la cabecera `X-Baas-Api-Key` (que sí se aplica).
 
-**Guardia (fallo cerrado).** El plugin trae dos *hooks* (`hooks/hooks.json` → `scripts/baas_guard.py`): en un proyecto vinculado cuya sesión no pase por el proxy, `SessionStart` avisa y `UserPromptSubmit` **bloquea cada prompt** con la explicación. En proyectos no vinculados no hacen nada. Cubre también el CLI sin la confianza aceptada.
+**Guardia (fallo cerrado).** El plugin trae dos *hooks* (`hooks/hooks.json` → `scripts/baas_guard.py`): en un proyecto vinculado cuya sesión no pase por el proxy, `SessionStart` avisa y `UserPromptSubmit` **bloquea los prompts** con una explicación en llano de qué hacer. **Excepción: `/baas-init` y `/baas-status`**, solo escritos tal cual (con, a lo sumo, una organización), siempre pasan: así la persona puede arreglar el problema desde la propia sesión. En proyectos no vinculados no hacen nada. Cubre también el CLI sin la confianza aceptada.
 
 **Para trabajar en un proyecto BaaS**, elige:
 
 1. **CLI o IDE** (recomendado): usan el proxy del proyecto y tu suscripción de claude.ai.
-2. **Desktop en modo gateway** («configuración de inferencia de terceros»):
+2. **Desktop en modo gateway** («configuración de inferencia de terceros»; es una configuración **para administradores**, no forma parte del primer uso):
    - Es **global** a Desktop: todas sus sesiones pasan por el proxy de **una** organización.
    - Desktop **deja de usar la suscripción de claude.ai**: necesitas una API key de **Anthropic Console**, que el proxy reenvía a Anthropic.
    - El soporte de este modo en Desktop para Linux no está confirmado.
@@ -151,14 +169,17 @@ Sin límites de extensión y con un único tope de tamaño de 500 MiB por ficher
 
 | Síntoma | Causa y solución |
 | :--- | :--- |
-| `[BAAS_KEY_MISSING]` | No hay clave en `~/baas-ai-ip/.env`: usa `set-key` en una terminal |
-| `[BAAS_APP_URL_MISSING]` | Lanza `/baas-init` indicando la URL (`--app-url https://app.<dominio>`) |
-| `[BAAS_AUTH_ERROR]` / MCP 401 | Clave revocada o mal copiada: crea otra y guárdala con `set-key`; después `/baas-init` en cada proyecto |
-| `[BAAS_NETWORK_ERROR]` | Sin red, URL incorrecta, servidor caído o límite de tasa del handshake |
-| `[BAAS_PROJECT_UNSAFE]` | `.claude/settings.local.json` está versionado (`git rm --cached …`) o no es JSON válido |
-| `/mcp` no muestra `baas` | Reinicia Claude Code. Si `/baas-init` avisó de que no encontró `claude`, ejecuta el comando que imprimió |
+| `[BAAS_APP_URL_MISSING]` (2) | No hay dirección de BaaS-AI-IP conocida: `/baas-init` la pregunta; ver [La dirección de BaaS-AI-IP](#la-dirección-de-baas-ai-ip) |
+| `[BAAS_ORG_SELECTION_REQUIRED]` (3) · `[BAAS_ORG_NOT_FOUND]` (8) | Perteneces a varias organizaciones, o la pedida no es tuya: `/baas-init` te deja elegir |
+| `[BAAS_NO_ORGANIZATIONS]` (4) | Tu cuenta no pertenece a ninguna organización: pide acceso a un administrador |
+| `[BAAS_NETWORK_ERROR]` (6) | Sin red, dirección incorrecta o servidor caído: `/baas-init` te deja reintentar o corregir la dirección |
+| `[BAAS_PROJECT_UNSAFE]` (7) | `.claude/settings.local.json` o `.claude/baas.local.json` está versionado: `/baas-init` te pide permiso para sacarlo del índice (`git rm --cached`; después hay que hacer commit) |
+| `[BAAS_APPROVAL_PENDING]` (20) · `[BAAS_APPROVAL_WAITING]` (21) | Falta aprobar en el navegador; `/baas-init` vuelve a comprobar solo y, tras unos intentos, espera a que le avises |
+| `[BAAS_APPROVAL_DENIED]` (22) · `[BAAS_APPROVAL_EXPIRED]` (23) | Cancelaste o el enlace caducó (10 minutos): `/baas-init` ofrece generar otro |
+| MCP 401 con clave revocada | `/baas-init` la descarta y pide aprobación de nuevo (con `set-key`, ver arriba, solo en CI) |
+| `/mcp` no muestra `baas` | Reinicia Claude Code. Si `/baas-init` te dijo que falta completar un paso, pásaselo a quien administra BaaS-AI-IP (es registrar el servidor `baas` con el comando `claude mcp add-json` que imprime el propio script, sin claves) |
 | `baas` conecta pero falla con 401 | No aceptaste la confianza en la carpeta: el `headersHelper` solo se ejecuta en carpetas de confianza |
-| Prompt bloqueado / `/baas-status`: «esta sesión no pasa por el proxy» | Reinicia la sesión y acepta la confianza. En la **pestaña Code de Claude Desktop** ver [Claude Desktop](#claude-desktop-pestaña-code) |
+| Prompt bloqueado / `/baas-status`: «tu sesión aún no está protegida» | Reinicia la sesión y acepta la confianza (`/baas-init` y `/baas-status` siguen funcionando). En la **pestaña Code de Claude Desktop** ver [Claude Desktop](#claude-desktop-pestaña-code) |
 | `KILL_SWITCH_ACTIVE` o 403 «Acceso bloqueado por BaaS-AI-IP» | La plataforma está detenida o tu organización bloqueada o pausada: habla con tu administrador |
 | `[BAAS_SCRIPT_HASH_MISMATCH]` | Un fichero no coincide con su hash: no se ejecutó ni se instaló. Avisa al administrador de la organización |
 | `[BAAS_SYNC_FOREIGN_DIR]` (13) | `~/.claude/skills/<organización>/` existe y no es de BaaS (no tiene `.baas-managed`): renómbralo o muévelo. No se tocó nada |
