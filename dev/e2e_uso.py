@@ -1,4 +1,4 @@
-"""Grupo «uso» (pasos 12.1–12.10) de `dev/e2e_h4.py`: la observabilidad de uso de la Fase 4 contra la pila real.
+"""Grupo «uso» (pasos 12.0–12.10) de `dev/e2e_h4.py`: la observabilidad de uso de la Fase 4 contra la pila real.
 
 Un paso por criterio de aceptación del diseño (§8) y del contrato (`contrato-fase-4-uso.md`, §11):
 

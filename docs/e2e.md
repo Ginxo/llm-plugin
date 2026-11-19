@@ -13,7 +13,7 @@ distribuyen con el plugin.
 
 ## En la CI
 
-`e2e_h4.py` (los cinco grupos) y `e9_roles.py` corren en GitHub Actions con el workflow `e2e` del repositorio
+`e2e_h4.py` (los seis grupos) y `e9_roles.py` corren en GitHub Actions con el workflow `e2e` del repositorio
 `deploy`: levanta la pila con el proveedor falso, descarga `main` de cada repositorio (o la rama que se pida con
 `plugin_ref`, `webapp_ref`, `proxy_ref` o `mcp_ref`) y sube un resumen y el diagnóstico. Se lanza a mano, de
 momento (`gh workflow run e2e.yml -R baas-ai-ip/deploy`). Cómo funciona, qué necesita y cómo repetirlo en local:
