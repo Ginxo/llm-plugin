@@ -272,3 +272,25 @@ def test_readme_admin_section_is_honest_about_personal_keys() -> None:
 def test_design_spec_guard_row_excludes_claude_desktop() -> None:
     spec = (REPO / "docs/superpowers/specs/2026-11-19-baas-init-guiado-design.md").read_text(encoding="utf-8")
     assert "excepto en Claude Desktop" in spec
+
+
+def test_init_skill_offers_another_account_without_widening_permissions() -> None:
+    text = INIT_SKILL.read_text(encoding="utf-8")
+    assert text.count("Conectar con otra cuenta") >= 4  # opciones de las filas `linked` y `unchanged`, y el apartado
+    assert "Ya estás conectado a <nombre de la organización> con la cuenta <correo>" in text
+    assert "«Cambiar de organización»" in text
+    assert "«Dejarlo así»" in text
+    assert "Antes de aprobar, entra en el navegador con la cuenta que quieres usar" in text
+    assert "No soy yo, cambiar de cuenta" in text
+    assert "--new-account" in text
+    assert "cierra la sesión y vuelve a escribir /baas-init" not in text  # no cambia de cuenta: ya no se dice
+    assert "Nunca con `--wait`" in text
+    # El flag cae bajo el permiso `init *` que ya existía: no hace falta ningún permiso nuevo.
+    assert len(_allowed_tools(INIT_SKILL)) == 3
+
+
+def test_readme_documents_the_new_account_flag() -> None:
+    text = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "--new-account" in text
+    assert "Conectar con otra cuenta" in text
+    assert "No soy yo, cambiar de cuenta" in text

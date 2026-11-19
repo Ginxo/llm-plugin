@@ -34,7 +34,7 @@ Este repositorio es a la vez el **marketplace** `baas-ai-ip` y el **plugin** `ba
 
 No hay que crear ni copiar ninguna clave: la aprobación genera una clave personal para ese equipo (la ves y la revocas en la web, en *Mis API keys*) y se guarda sola, fuera del control de versiones. **No pegues nunca una clave en el chat**: quedaría en el historial y se enviaría al modelo; si lo haces, Claude te dirá cómo cambiarla.
 
-Si no hay una dirección de BaaS-AI-IP conocida, Claude te la pregunta una vez (te la da quien administra la plataforma) y la recuerda. Si perteneces a varias organizaciones, te pregunta cuál (también puedes escribir `/baas-init <organización>`). Si algo falla, Claude te dice qué ha pasado y qué hacer; relanzar `/baas-init` es siempre seguro y no duplica nada. Para **cambiar de organización**, vuelve a lanzarlo.
+Si no hay una dirección de BaaS-AI-IP conocida, Claude te la pregunta una vez (te la da quien administra la plataforma) y la recuerda. Si perteneces a varias organizaciones, te pregunta cuál (también puedes escribir `/baas-init <organización>`). Si algo falla, Claude te dice qué ha pasado y qué hacer; relanzar `/baas-init` es siempre seguro y no duplica nada. Para **cambiar de organización**, vuelve a lanzarlo. Si Claude te dice que ya estás conectado pero con **otra cuenta** de la que querías, elige «Conectar con otra cuenta»: entra en el navegador con la cuenta correcta (o pulsa «No soy yo, cambiar de cuenta» en la pantalla de aprobación) y aprueba de nuevo. Por debajo es `init --new-account`: olvida en este equipo la conexión guardada y pide una aprobación nueva, sin revocar nada en el servidor.
 
 Los comandos también responden con su nombre completo: `/baas:baas-init`, `/baas:baas-status`, `/baas:baas-sync`.
 
@@ -176,6 +176,7 @@ Sin límites de extensión y con un único tope de tamaño de 500 MiB por ficher
 | `[BAAS_PROJECT_UNSAFE]` (7) | `.claude/settings.local.json` o `.claude/baas.local.json` está versionado: `/baas-init` te pide permiso para sacarlo del índice (`git rm --cached`; después hay que hacer commit) |
 | `[BAAS_APPROVAL_PENDING]` (20) · `[BAAS_APPROVAL_WAITING]` (21) | Falta aprobar en el navegador; `/baas-init` vuelve a comprobar solo y, tras unos intentos, espera a que le avises |
 | `[BAAS_APPROVAL_DENIED]` (22) · `[BAAS_APPROVAL_EXPIRED]` (23) | Cancelaste o el enlace caducó (10 minutos): `/baas-init` ofrece generar otro |
+| Estás conectado con una cuenta que no es la tuya | Escribe `/baas-init` y elige «Conectar con otra cuenta» (o `init --new-account`) |
 | MCP 401 (conexión revocada o caducada) | Escribe `/baas-init`: descarta la conexión anterior y te pide aprobar de nuevo en el navegador |
 | `/mcp` no muestra `baas` | Reinicia Claude Code. Si `/baas-init` te dijo que falta completar un paso, pásaselo a quien administra BaaS-AI-IP (es registrar el servidor `baas` con el comando `claude mcp add-json` que imprime el propio script, sin claves) |
 | `baas` conecta pero falla con 401 | No aceptaste la confianza en la carpeta: el `headersHelper` solo se ejecuta en carpetas de confianza |

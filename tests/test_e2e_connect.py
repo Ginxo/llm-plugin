@@ -142,6 +142,35 @@ def test_happy_path_links_without_ever_printing_the_key(
     assert_no_key(key, third)
 
 
+def test_new_account_switches_the_key_through_a_fresh_approval(
+    stack: FakeH4Stack, home: Path, project: Path, env: dict[str, str]
+) -> None:
+    key = dev_api_key(stack.device.email)
+    envfile.update_env(envfile.BaasPaths(baas_dir(home)), {"BAAS_API_KEY": key, "BAAS_APP_URL": stack.app_url})
+
+    plain = init(env, project, stack.app_url)
+    assert plain.code == 0, plain.text
+    assert stack.device.starts == 0
+    plain_again = init(env, project, stack.app_url)
+    assert "[BAAS_RESULT unchanged]" in plain_again.text
+
+    first = init(env, project, stack.app_url, "--new-account")
+    assert first.code == 20, first.text
+    assert "[BAAS_APPROVAL_PENDING]" in first.text
+    assert not has_stored_key(home)
+    assert stack.device.starts == 1
+    assert_no_key(key, first)
+
+    second = init(env, project, stack.app_url, "--wait")
+    assert second.code == 0, second.text
+    assert "[BAAS_RESULT linked]" in second.text
+    new = stored_key(home)
+    assert new != key
+    assert new in stack.device.issued_keys
+    assert_no_key(new, first, second)
+    assert_no_key(key, first, second)
+
+
 def test_wait_polls_until_the_simulated_approval_without_real_sleeping(stack: FakeH4Stack) -> None:
     """El cliente de sondeo contra el simulado: «pendiente» N-1 veces, luego la clave una sola vez (reloj inyectado)."""
     stack.device.approve_after = 4

@@ -283,7 +283,7 @@ class FakeDevice:
         self.start_calls.append((app_url, client_name))
         if self.start_error:
             raise self.start_error
-        return device.DeviceStart(DEVICE_CODE, USER_CODE, LINK, 600, 3)
+        return device.DeviceStart(DEVICE_CODE, USER_CODE, f"{app_url}/connect?code={USER_CODE}", 600, 3)
 
     def _wait(self, app_url: str, device_code: str, *, interval: int, max_seconds: int, **_: object):
         self.wait_calls.append((app_url, device_code, interval, max_seconds))
@@ -1031,3 +1031,88 @@ def test_wait_without_pending_and_with_a_rejected_key_starts_the_flow(
     code, _ = run(init(project, "--wait"), capsys)
     assert code == 20
     assert len(fake_device.start_calls) == 1
+
+
+# --- init --new-account: conectar con otra cuenta -----------------------------------------------------------
+
+
+def test_new_account_discards_the_stored_key_and_starts_a_fresh_approval(
+    home, project, server, fake_claude, fake_device, capsys
+) -> None:
+    key = save_key("analista@demo.test", server.url)
+    assert last_line(run(init(project), capsys)[1]) == "[BAAS_RESULT linked]"  # ya conectado con esa cuenta
+    fake_device.start_calls.clear()
+    code, out = run(init(project, "--new-account"), capsys)
+    assert code == 20, out
+    assert "BAAS_APPROVAL_PENDING" in out
+    assert key not in out
+    assert_plain_message(out)
+    assert "BAAS_API_KEY" not in paths_().env_file.read_text()
+    assert envfile.read_env(paths_())[0]["BAAS_APP_URL"] == server.url
+    assert paths_().pending_file.exists()
+    assert len(fake_device.start_calls) == 1
+
+
+def test_new_account_replaces_a_live_pending_flow_but_a_repeat_reuses_its_own(
+    home, project, server, fake_device, capsys
+) -> None:
+    save_key("analista@demo.test", server.url)
+    seed_pending(app_url=server.url)  # una conexión a medias de antes, con la clave de otra cuenta guardada
+    assert run(init(project, "--new-account"), capsys)[0] == 20
+    assert len(fake_device.start_calls) == 1  # no se reutiliza el enlace anterior
+    assert run(init(project, "--new-account"), capsys)[0] == 20
+    assert len(fake_device.start_calls) == 1  # ya sin clave guardada: se reutiliza el enlace de esta ejecución
+
+
+def test_new_account_then_wait_approved_binds_the_new_key(
+    home, project, server, fake_claude, fake_device, capsys
+) -> None:
+    old = save_key("analista@demo.test", server.url)
+    assert run(init(project), capsys)[0] == 0
+    assert run(init(project, "--new-account"), capsys)[0] == 20
+    new_key = dev_api_key("multi@demo.test")
+    fake_device.wait_result = device.DevicePoll("approved", new_key, "multi@demo.test")
+    code, out = run(init(project, "--wait", "--org", "demo"), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+    assert envfile.read_env(paths_())[0]["BAAS_API_KEY"] == new_key
+    settings = json.loads((project / ".claude/settings.local.json").read_text())["env"]
+    assert f"X-Baas-Api-Key: {new_key}" in settings["ANTHROPIC_CUSTOM_HEADERS"]
+    assert old not in json.dumps(settings)
+    assert new_key not in out
+    assert old not in out
+
+
+def test_new_account_failing_to_reach_the_server_keeps_the_stored_key(
+    home, project, server, fake_device, capsys
+) -> None:
+    key = save_key("analista@demo.test", server.url)
+    fake_device.start_error = NetworkError("No he podido conectar con BaaS-AI-IP.")
+    code, _ = run(init(project, "--new-account"), capsys)
+    assert code == 6
+    assert envfile.read_env(paths_())[0]["BAAS_API_KEY"] == key
+
+
+def test_new_account_combines_with_app_url(home, project, fake_device, capsys) -> None:
+    save_key("analista@demo.test", "https://otro.example.com")
+    code, out = run(init(project, "--new-account", "--app-url", APP), capsys)
+    assert code == 20, out
+    assert fake_device.start_calls[0][0] == APP
+    assert envfile.read_env(paths_())[0]["BAAS_APP_URL"] == APP
+
+
+def test_new_account_without_a_stored_key_behaves_like_a_plain_init(home, project, fake_device, capsys) -> None:
+    code, out = run(init(project, "--new-account", "--app-url", APP), capsys)
+    assert code == 20, out
+    assert LINK in out
+
+
+def test_plain_init_with_a_valid_key_is_unchanged_by_the_new_flag(
+    home, project, server, fake_claude, fake_device, capsys
+) -> None:
+    save_key("analista@demo.test", server.url)
+    run(init(project), capsys)
+    code, out = run(init(project), capsys)
+    assert code == 0
+    assert last_line(out) == "[BAAS_RESULT unchanged]"
+    assert fake_device.start_calls == []

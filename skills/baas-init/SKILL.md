@@ -29,20 +29,21 @@ Conecta este proyecto con BaaS-AI-IP. La persona que te lee **no es técnica**: 
 1. Ejecuta, sustituyendo `<organización>` y `<dirección>` solo si aplican (ver más abajo):
 
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" init --project "${CLAUDE_PROJECT_DIR}" [--org '<organización>'] [--app-url '<dirección>']
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" init --project "${CLAUDE_PROJECT_DIR}" [--org '<organización>'] [--app-url '<dirección>'] [--new-account]
    ```
 
    **Los valores van siempre entre comillas simples y solo después de comprobar que son seguros** (lo que te escribe la persona nunca se pega tal cual en un comando):
 
    - `--org`: solo si `$ARGUMENTS`, o la organización elegida, coincide **exactamente** con `^[a-z0-9][a-z0-9-]{0,63}$` (p. ej. `acme`). Si no coincide, no la pases: pregunta de nuevo con `AskUserQuestion`.
+   - `--new-account`: solo en el apartado *Conectar con otra cuenta*; ignora la conexión guardada y pide aprobar de nuevo. No lleva valor. Nunca con `--wait`.
    - `--app-url`: solo si la persona te ha dado una dirección (nunca la inventes) y coincide **exactamente** con `^https?://[A-Za-z0-9.:/_-]+$`. Si la escribió sin `https://`, antepónselo tú. Si aun así no coincide (espacios, comillas, símbolos…), no la uses: «Esa dirección no parece válida; tiene que empezar por https://», y vuelve a preguntar con `AskUserQuestion`.
 
 2. Mira el código de salida y la marca entre corchetes de la salida, y actúa según esta tabla. Al terminar cada caso, la persona debe saber **qué ha pasado y qué hacer ahora**.
 
    | Salida | Qué hacer |
    | :--- | :--- |
-   | `0` y última línea `[BAAS_RESULT linked]` | Dilo en una frase, con la cuenta (el correo sale en la línea «Usuario:» de la salida): «Conectado a <nombre de la organización> con la cuenta <correo>.» Añade: «Si no reconoces la cuenta, no sigas: entra en la web de tu organización, cierra la sesión y vuelve a escribir /baas-init.» Si hay líneas `AVISO:` cuéntalas en llano (ver el apartado *Avisos*). Cierra con: «Cierra y vuelve a abrir Claude Code en esta carpeta y acepta la confianza si te la pide.» Añade que después puede escribir /baas-status para comprobarlo y /baas-sync para traer las skills de su organización. |
-   | `0` y última línea `[BAAS_RESULT unchanged]` (ya estaba conectado) | Si la persona escribió una organización concreta, di solo «Todo sigue como estaba: este proyecto ya estaba conectado a <nombre de la organización>.» Si no, di en una línea: «Ya estás conectado a <nombre de la organización>.» y pregunta con `AskUserQuestion` si quiere **cambiar de organización** o **dejarlo como está**. Si lo deja: «Todo sigue como estaba. Si Claude te avisa de que esta sesión aún no está protegida, cierra y vuelve a abrir Claude Code en esta carpeta.» Si quiere cambiar, ver el apartado *Cambiar de organización*. Las líneas `AVISO:` se cuentan igual que arriba. |
+   | `0` y última línea `[BAAS_RESULT linked]` | Dilo en una frase, con la cuenta (el correo sale en la línea «Usuario:» de la salida): «Conectado a <nombre de la organización> con la cuenta <correo>.» Si no reconoce la cuenta, puede cambiarla: pregunta con `AskUserQuestion` «¿Es la cuenta que querías usar?» con las opciones «Sí, es esa» y «Conectar con otra cuenta». Si es la suya, sigue; si elige otra, ve al apartado *Conectar con otra cuenta* (todavía **no** le pidas reiniciar). Si hay líneas `AVISO:` cuéntalas en llano (ver el apartado *Avisos*). Cierra con: «Cierra y vuelve a abrir Claude Code en esta carpeta y acepta la confianza si te la pide.» Añade que después puede escribir /baas-status para comprobarlo y /baas-sync para traer las skills de su organización. |
+   | `0` y última línea `[BAAS_RESULT unchanged]` (ya estaba conectado) | Si la persona escribió una organización concreta, di solo «Todo sigue como estaba: este proyecto ya estaba conectado a <nombre de la organización>.» Si no, di en una línea: «Ya estás conectado a <nombre de la organización> con la cuenta <correo>.» (el correo sale en la línea «Usuario:» de la salida) y pregunta con `AskUserQuestion` qué quiere hacer, con las opciones «Conectar con otra cuenta», «Cambiar de organización» y «Dejarlo así». Si lo deja («Dejarlo así»): «Todo sigue como estaba. Si Claude te avisa de que esta sesión aún no está protegida, cierra y vuelve a abrir Claude Code en esta carpeta.» Si quiere cambiar de organización, ver el apartado *Cambiar de organización*; si quiere otra cuenta, el apartado *Conectar con otra cuenta*. Las líneas `AVISO:` se cuentan igual que arriba. |
    | `20` `[BAAS_APPROVAL_PENDING]` | Si la salida contiene «ya no es válida», empieza por: «He renovado tu conexión anterior, que ya no valía.» Saca el enlace y el código de la salida y di: «Abre este enlace para conectar este proyecto: <enlace>. El código es <código>; comprueba que es el que ves en la página. Te he abierto el navegador si he podido.» **Sin esperar respuesta**, ejecuta enseguida el mismo comando con `--wait` añadido (ver el apartado *Esperar la aprobación*). |
    | `21` `[BAAS_APPROVAL_WAITING]` | Todavía no ha aprobado. Repite `init --wait` (mismas opciones). Tras **4 repeticiones seguidas** sin éxito, deja de repetir y di: «Sigo esperando a que apruebes la conexión en el navegador; avísame cuando lo hayas hecho.» y espera su mensaje; cuando escriba, vuelve a ejecutar `init --wait`. |
    | `22` `[BAAS_APPROVAL_DENIED]` | «Has cancelado la conexión, así que no se ha cambiado nada.» Pregunta con `AskUserQuestion`: «¿Genero otro enlace?» (sí o no). Si sí, repite el paso 1 (mismas opciones). Si no, termina: «Cuando quieras conectarlo, escribe /baas-init.» |
@@ -68,6 +69,10 @@ Conecta este proyecto con BaaS-AI-IP. La persona que te lee **no es técnica**: 
 ## Cambiar de organización
 
 Solo si la persona ya estaba conectada y quiere cambiar. Para saber cuáles tiene, ejecuta el paso 1 con `--org 'cambiar'` (no es una organización: la salida `8` trae la lista de las suyas). **En este caso no digas la frase del caso `8`** («No formas parte de esa organización»): es solo un truco para obtener la lista. Si solo tiene una: «Solo formas parte de una organización, así que no hay nada que cambiar.» Si tiene varias, pregunta cuál (solo nombres; con más de 4, lista numerada como en el caso `3`) y repite el paso 1 con `--org '<identificador>'` de la elegida; al terminar, como en `0`.
+
+## Conectar con otra cuenta
+
+Solo si la persona lo elige («Conectar con otra cuenta»). Dile: «Antes de aprobar, entra en el navegador con la cuenta que quieres usar (o pulsa “No soy yo, cambiar de cuenta” en la pantalla de aprobación).» Ejecuta el paso 1 con `--new-account` (más `--org` y `--app-url` validados si ya los tenías) y sigue como en la fila `20`: enlace, código y `init --wait` **sin** `--new-account`. Al terminar con `0` y `[BAAS_RESULT linked]`, di con qué cuenta ha quedado y pídele reiniciar como siempre. No cambia nada de la cuenta anterior: sigue valiendo en sus otros proyectos; no lo menciones.
 
 ## Un fichero local está en git (código 7)
 
