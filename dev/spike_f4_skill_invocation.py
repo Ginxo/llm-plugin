@@ -92,8 +92,10 @@ def slash_re(org: str) -> re.Pattern[str]:
 def tool_re(org: str) -> re.Pattern[str]:
     """La herramienta `Skill` en la respuesta del modelo: el proxy la renderiza `[tool_use: Skill] <JSON compacto>`
     (una sola línea; `json.Compact` respeta el orden de las claves, por eso `skill` puede no ir la primera). Solo en
-    `turn.completed.response_received`. Dentro de un valor JSON las comillas van escapadas (`\\"`), así que
-    `"skill":"` sin escapar solo puede ser la clave de primer nivel."""
+    `turn.completed.response_received`. Dentro de un valor JSON de texto las comillas van escapadas (`\\"`), así que
+    `"skill":"` sin escapar es una clave: la de primer nivel o la de un objeto anidado. Con la entrada de `Skill`
+    (`{skill, args}`, `args` texto) solo puede ser la de primer nivel; si algún día llevara objetos anidados con una
+    clave `skill`, esta expresión también los contaría."""
     return re.compile(r'\[tool_use: Skill\] \{[^\n]*?"skill":"/?' + re.escape(org) + ":" + SKILL_NAME + '"')
 
 
