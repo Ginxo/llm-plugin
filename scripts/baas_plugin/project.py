@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -21,6 +22,9 @@ from .errors import ProjectSafetyError
 SETTINGS_LOCAL = ".claude/settings.local.json"
 BINDING = ".claude/baas.local.json"
 GITIGNORE_ENTRIES = (SETTINGS_LOCAL, BINDING)
+BACKUP_SUFFIX = ".bak"
+# La copia de un fichero dañado puede conservar la clave: se ignora igual que el original.
+BACKUP_ENTRIES = tuple(entry + BACKUP_SUFFIX for entry in GITIGNORE_ENTRIES)
 HEADER_NAME = "X-Baas-Api-Key"
 GITIGNORE_COMMENT = "# BaaS-AI-IP (plugin baas): configuración local con credenciales; no versionar"
 
@@ -65,6 +69,24 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ProjectSafetyError(f"{path} no contiene un objeto JSON.")
     return data
+
+
+def repair_json_file(path: Path) -> bool:
+    """Si `path` existe pero no es un objeto JSON válido, lo guarda como `<nombre>.bak` (0600) y devuelve `True`;
+    así el siguiente `write_*` lo regenera en vez de fallar. Un fichero válido o inexistente no se toca."""
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        return False
+    backup = path.with_name(path.name + BACKUP_SUFFIX)
+    os.replace(path, backup)
+    if os.name == "posix":
+        backup.chmod(0o600)
+    return True
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> bool:
@@ -134,11 +156,11 @@ def _present(lines: list[str], entry: str) -> bool:
     return any(line.strip() in variants for line in lines)
 
 
-def ensure_gitignore(project: Path) -> list[str]:
+def ensure_gitignore(project: Path, entries: Iterable[str] = GITIGNORE_ENTRIES) -> list[str]:
     path = project / ".gitignore"
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     lines = text.splitlines()
-    missing = [e for e in GITIGNORE_ENTRIES if not _present(lines, e)]
+    missing = [e for e in entries if not _present(lines, e)]
     if not missing:
         return []
     if text and not text.endswith("\n"):

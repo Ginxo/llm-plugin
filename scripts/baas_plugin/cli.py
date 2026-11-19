@@ -4,7 +4,9 @@ y `export`. Mensajes en español.
 Códigos de salida (las skills los interpretan): 0 ok · 2 configuración (falta la clave o la URL)
 · 3 hay que elegir organización · 4 sin organizaciones · 5 clave no válida · 6 red o servidor
 · 7 proyecto inseguro · 8 organización ajena · 9 hash de un fichero no coincide · 10 error del MCP
-· 11 paquete inválido (ruta insegura) · 12 sincronización incompleta · 13 directorio ajeno.
+· 11 paquete inválido (ruta insegura) · 12 sincronización incompleta · 13 directorio ajeno
+· 20 falta aprobar la conexión en el navegador (hay un enlace) · 21 sigue esperando la aprobación
+(repetir `init --wait`) · 22 la persona canceló la conexión · 23 el código de aprobación caducó.
 
 `run-script` es la excepción: devuelve **íntegro** el código de salida del script, que puede ser
 cualquiera (también 9 o 10). Sus errores propios salen, además, con una línea `BAAS_ERROR=<código>` en
@@ -15,19 +17,25 @@ código de salida es el del script.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
 import re
+import socket
 import sys
+import time
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 import baas_guard
 
-from . import __version__, desktop_config, handshake, mcp_config, project, sync
+from . import __version__, desktop_config, device, handshake, mcp_config, project, sync
 from .claude_home import ClaudePaths
 from .envfile import (
+    API_KEY_RE,
     BaasPaths,
     load_credentials,
     missing_key_error,
@@ -36,7 +44,16 @@ from .envfile import (
     update_env,
     validate_api_key,
 )
-from .errors import BaasError, ConfigError, MissingAppUrlError
+from .errors import (
+    ApprovalDeniedError,
+    ApprovalExpiredError,
+    ApprovalPendingError,
+    ApprovalWaitingError,
+    AuthError,
+    BaasError,
+    ConfigError,
+    MissingAppUrlError,
+)
 
 
 def _p(*lines: str) -> None:
@@ -102,32 +119,119 @@ def _project_dir(args: argparse.Namespace) -> Path:
     return project.resolve_project_dir(args.project or os.environ.get("CLAUDE_PROJECT_DIR"), cwd=Path.cwd())
 
 
+STALE_KEY_NOTICE = "Tu conexión anterior ya no es válida; vamos a renovarla."
+REPAIRED_NOTICE = "He reparado una configuración dañada (copia guardada)."
+WAIT_INTERVAL = 3  # segundos entre consultas (el del contrato)
+WAIT_SECONDS = 90  # lo que espera una sola llamada de `init --wait`
+
+
+def _resolve_app_url(explicit: str | None, values: dict[str, str]) -> str:
+    """La dirección de la webapp (explícita > entorno > guardada > por defecto), normalizada y con mensajes llanos."""
+    raw = device.resolve_app_url(explicit, dict(os.environ), values.get("BAAS_APP_URL"))
+    if raw is None:
+        raise MissingAppUrlError(
+            "No sé a qué dirección de BaaS-AI-IP conectarme.",
+            hint="Pide a quien administra BaaS-AI-IP la dirección de la aplicación y vuelve a empezar indicándola.",
+        )
+    try:
+        return normalize_app_url(raw)
+    except ConfigError:  # el mensaje técnico incluye la URL tal cual la escribió la persona: no se repite
+        raise ConfigError(
+            "La dirección de BaaS-AI-IP no es válida o no es segura.",
+            hint="Comprueba con quien administra BaaS-AI-IP cuál es la dirección correcta y vuelve a empezar.",
+        ) from None
+
+
+def _client_name(proj: Path) -> str:
+    return f"{proj.name or 'proyecto'} en {socket.gethostname()}"[:100]
+
+
+def _open_browser(url: str) -> None:
+    with contextlib.suppress(Exception):  # abrir el navegador es un extra: el enlace siempre se muestra
+        webbrowser.open(url)
+
+
+def _start_flow(paths: BaasPaths, proj: Path, app_url: str) -> NoReturn:
+    """Pide un código de aprobación, lo deja pendiente y termina con el enlace (código 20)."""
+    flow = device.start(app_url, _client_name(proj))  # NetworkError (código 6): la URL aún no se guarda
+    update_env(paths, {"BAAS_APP_URL": app_url})
+    device.save_pending(
+        paths,
+        device.PendingFlow(
+            app_url, flow.device_code, flow.user_code, flow.verification_url, time.time() + flow.expires_in
+        ),
+    )
+    _open_browser(flow.verification_url)
+    raise ApprovalPendingError(
+        verification_url=flow.verification_url,
+        user_code=flow.user_code,
+        hint="Cuando hayas aprobado la conexión en el navegador, dímelo y sigo.",
+    )
+
+
+def _await_approval(paths: BaasPaths, app_url: str) -> str | None:
+    """`init --wait`: espera la aprobación pendiente. Devuelve la clave nueva (ya guardada), o `None` si no hay
+    nada pendiente (o es de otro servidor o caducó) y hay que empezar de cero."""
+    pending = device.load_pending(paths, now=time.time())
+    if pending is None or normalize_app_url(pending.app_url) != app_url:
+        return None
+    result = device.wait(pending.app_url, pending.device_code, interval=WAIT_INTERVAL, max_seconds=WAIT_SECONDS)
+    if result.status == "approved" and result.api_key:
+        update_env(paths, {"BAAS_API_KEY": result.api_key, "BAAS_APP_URL": app_url})
+        device.clear_pending(paths)
+        return result.api_key
+    if result.status == "denied":
+        device.clear_pending(paths)
+        raise ApprovalDeniedError
+    if result.status == "expired":
+        device.clear_pending(paths)
+        raise ApprovalExpiredError
+    raise ApprovalWaitingError
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     paths = BaasPaths.default()
-    if args.app_url:
-        update_env(paths, {"BAAS_APP_URL": normalize_app_url(args.app_url)})
-    if not paths.env_file.exists():
-        raise missing_key_error(paths)
-    creds = load_credentials(paths)
-    if not creds.app_url:
-        raise MissingAppUrlError(
-            "Falta la URL de la webapp de BaaS-AI-IP (BAAS_APP_URL en ~/baas-ai-ip/.env).",
-            hint="Lanza de nuevo init con --app-url https://app.<dominio> (no es un secreto).",
-        )
+    values, _ = read_env(paths)
+    app_url = _resolve_app_url(args.app_url, values)
     proj = _project_dir(args)
     project.check_not_tracked(proj)
-    hs = handshake.perform_handshake(creds.app_url, creds.api_key)
+
+    hs = None
+    api_key: str | None = None
+    if args.wait:
+        api_key = _await_approval(paths, app_url)
+    else:
+        stored = values.get("BAAS_API_KEY", "").strip()
+        if stored:
+            api_key = stored if API_KEY_RE.match(stored) else None
+            if api_key:
+                try:
+                    hs = handshake.perform_handshake(app_url, api_key)
+                except AuthError:  # revocada, de otra base de datos o caducada: no es un fallo, se renueva
+                    api_key = None
+            if api_key is None:
+                _p(STALE_KEY_NOTICE)
+            elif args.app_url or not values.get("BAAS_APP_URL"):
+                update_env(paths, {"BAAS_APP_URL": app_url})  # solo tras contactar con éxito
+    if api_key is None:
+        _start_flow(paths, proj, app_url)
+    if hs is None:
+        hs = handshake.perform_handshake(app_url, api_key)
+
+    repaired = [project.repair_json_file(proj / name) for name in project.GITIGNORE_ENTRIES]
+    if any(repaired):
+        _p(REPAIRED_NOTICE)
     current = (project.read_binding(proj) or {}).get("org")
     org = handshake.select_organization(hs, requested=args.org, current=current)
 
-    project.write_settings_local(proj, org.proxy_anthropic_url, creds.api_key)
+    project.write_settings_local(proj, org.proxy_anthropic_url, api_key)
     project.write_binding(
         proj,
         {
             "org": org.slug,
             "org_name": org.name,
             "user_email": hs.email,
-            "app_url": creds.app_url,
+            "app_url": app_url,
             "mcp_url": org.mcp_url,
             "proxy_anthropic_url": org.proxy_anthropic_url,
             "proxy_openai_url": org.proxy_openai_url,
@@ -137,7 +241,9 @@ def cmd_init(args: argparse.Namespace) -> int:
             "plugin_version": __version__,
         },
     )
-    added = project.ensure_gitignore(proj)
+    added = project.ensure_gitignore(
+        proj, project.GITIGNORE_ENTRIES + (project.BACKUP_ENTRIES if any(repaired) else ())
+    )
     helper = mcp_config.install_headers_helper(paths)
     reg = mcp_config.register_mcp_server(proj, org.mcp_url, mcp_config.helper_command(helper))
 
@@ -331,6 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", help="Raíz del proyecto (por defecto CLAUDE_PROJECT_DIR o la raíz git)")
     p.add_argument("--org", help="Slug de la organización (obligatorio si perteneces a varias)")
     p.add_argument("--app-url", help="URL de la webapp (se guarda en ~/baas-ai-ip/.env)")
+    p.add_argument("--wait", action="store_true", help="Espera (hasta 90 s) la aprobación en el navegador y termina")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("status", help="Usuario, organización, roles, kill switch, AI-IP y skills sincronizadas")

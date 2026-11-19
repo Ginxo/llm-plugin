@@ -5,13 +5,15 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fake_baas import FakeBaasServer, dev_api_key
 
-from baas_plugin import cli, envfile
+from baas_plugin import cli, device, envfile
+from baas_plugin.errors import NetworkError
 from conftest import mode_of
 
 FAKE_CLAUDE = """#!{python}
@@ -64,6 +66,22 @@ def init(project: Path, *extra: str) -> list[str]:
     return ["init", "--project", str(project), *extra]
 
 
+@pytest.fixture(autouse=True)
+def opened_urls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Nunca se abre un navegador de verdad; se anota qué enlaces se habrían abierto."""
+    urls: list[str] = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url, *a, **k: urls.append(url) or True)
+    return urls
+
+
+FORBIDDEN_IN_MESSAGES = ("~/", ".env", "baas.py", "ANTHROPIC_BASE_URL", "pending.json", "exit code", "Traceback")
+
+
+def assert_plain_message(out: str) -> None:
+    for fragment in FORBIDDEN_IN_MESSAGES:
+        assert fragment not in out, fragment
+
+
 # --- /baas-init --------------------------------------------------------------------------
 
 
@@ -110,12 +128,12 @@ def test_init_is_idempotent(home, project, server, fake_claude, capsys) -> None:
     assert {p: (project / p).read_bytes() for p in snapshot} == snapshot
 
 
-def test_init_without_key_does_not_touch_project(home, project, server, fake_claude, capsys) -> None:
+def test_init_without_key_and_without_any_url_asks_for_it(home, project, server, fake_claude, capsys) -> None:
     code, out = run(init(project), capsys)
     assert code == 2
-    assert "BAAS_KEY_MISSING" in out
-    assert "set-key" in out
+    assert "BAAS_APP_URL_MISSING" in out
     assert list(project.iterdir()) == []
+    assert_plain_message(out)
 
 
 def test_init_without_app_url_asks_for_it(home, project, server, fake_claude, capsys) -> None:
@@ -162,13 +180,6 @@ def test_init_zero_orgs_warns(home, project, server, fake_claude, capsys) -> Non
     assert code == 4
     assert "ninguna organización" in out
     assert not (project / ".claude").exists()
-
-
-def test_init_invalid_key(home, project, server, fake_claude, capsys) -> None:
-    save_key("nadie@demo.test", server.url)
-    code, out = run(init(project), capsys)
-    assert code == 5
-    assert "no es válida" in out
 
 
 def test_init_without_network(home, project, fake_claude, capsys) -> None:
@@ -219,6 +230,305 @@ def test_init_reports_mcp_registration_failure(home, project, server, fake_claud
     code, out = run(init(project), capsys)
     assert code == 0  # el proxy queda configurado; el paso del MCP se explica
     assert "claude mcp add-json baas" in out
+
+
+# --- /baas-init guiado: aprobación en el navegador ---------------------------------------------
+
+APP = "https://app.example.com"
+DEVICE_CODE = "dev-code-secret-123"
+USER_CODE = "KQRT-7MWB"
+LINK = f"{APP}/connect?code={USER_CODE}"
+
+
+class FakeDevice:
+    """Sustituye a `device.start/poll/wait`: ninguna prueba de init toca la red del flujo de dispositivo."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.start_calls: list[tuple[str, str]] = []
+        self.wait_calls: list[tuple[str, str, int, int]] = []
+        self.start_error: Exception | None = None
+        self.wait_result: device.DevicePoll = device.DevicePoll("pending")
+        self.wait_error: Exception | None = None
+        self.api_key: str | None = None
+        monkeypatch.setattr(cli.device, "start", self._start)
+        monkeypatch.setattr(cli.device, "wait", self._wait)
+
+    def _start(self, app_url: str, client_name: str, **_: object) -> device.DeviceStart:
+        self.start_calls.append((app_url, client_name))
+        if self.start_error:
+            raise self.start_error
+        return device.DeviceStart(DEVICE_CODE, USER_CODE, LINK, 600, 3)
+
+    def _wait(self, app_url: str, device_code: str, *, interval: int, max_seconds: int, **_: object):
+        self.wait_calls.append((app_url, device_code, interval, max_seconds))
+        if self.wait_error:
+            raise self.wait_error
+        return self.wait_result
+
+
+@pytest.fixture
+def fake_device(monkeypatch: pytest.MonkeyPatch) -> FakeDevice:
+    return FakeDevice(monkeypatch)
+
+
+def paths_() -> envfile.BaasPaths:
+    return envfile.BaasPaths.default()
+
+
+def seed_pending(expires_at: float | None = None, app_url: str = APP) -> None:
+    """Lo que deja una primera llamada de `init`: la URL recordada y la conexión pendiente."""
+    envfile.update_env(paths_(), {"BAAS_APP_URL": app_url})
+    device.save_pending(
+        paths_(),
+        device.PendingFlow(
+            app_url,
+            DEVICE_CODE,
+            USER_CODE,
+            f"{app_url}/connect?code={USER_CODE}",
+            time.time() + 600 if expires_at is None else expires_at,
+        ),
+    )
+
+
+def test_init_without_key_starts_device_flow_exit_20(home, project, fake_device, opened_urls, capsys) -> None:
+    code, out = run(init(project, "--app-url", APP), capsys)
+    assert code == 20, out
+    assert "BAAS_APPROVAL_PENDING" in out
+    assert LINK in out
+    assert USER_CODE in out
+    assert_plain_message(out)
+    assert DEVICE_CODE not in out
+    assert opened_urls == [LINK]
+    (url, client_name) = fake_device.start_calls[0]
+    assert url == APP
+    assert client_name.startswith(f"{project.name} en ")
+
+    pending = paths_().pending_file
+    if os.name == "posix":
+        assert mode_of(pending) == 0o600
+    data = json.loads(pending.read_text())
+    assert data["device_code"] == DEVICE_CODE
+    assert "api_key" not in data
+    assert envfile.read_env(paths_())[0]["BAAS_APP_URL"] == APP  # la URL se guarda tras contactar con éxito
+    assert list(project.iterdir()) == []  # el proyecto no se toca hasta que se aprueba
+
+
+def test_init_uses_url_from_environment(home, project, fake_device, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("BAAS_APP_URL", APP + "/")
+    assert run(init(project), capsys)[0] == 20
+    assert fake_device.start_calls[0][0] == APP
+
+
+def test_init_browser_failure_is_ignored(home, project, fake_device, monkeypatch, capsys) -> None:
+    def boom(*a: object, **k: object) -> bool:
+        raise RuntimeError("sin navegador")
+
+    monkeypatch.setattr(cli.webbrowser, "open", boom)
+    code, out = run(init(project, "--app-url", APP), capsys)
+    assert code == 20
+    assert LINK in out
+
+
+def test_init_client_name_is_limited_to_100_chars(home, tmp_path, fake_device, capsys) -> None:
+    long_project = tmp_path / ("p" * 150)
+    long_project.mkdir()
+    assert run(init(long_project, "--app-url", APP), capsys)[0] == 20
+    assert 1 <= len(fake_device.start_calls[0][1]) <= 100
+
+
+def test_init_invalid_app_url_is_explained_in_plain_spanish(home, project, fake_device, capsys) -> None:
+    for bad in ("esto no es una url", "http://app.example.com"):
+        code, out = run(init(project, "--app-url", bad), capsys)
+        assert code == 2
+        assert "BAAS_CONFIG_ERROR" in out
+        assert_plain_message(out)
+        assert "HTTP" not in out
+    assert fake_device.start_calls == []
+    assert not paths_().env_file.exists()
+
+
+def test_init_revoked_key_restarts_flow_with_friendly_notice(home, project, server, fake_device, capsys) -> None:
+    old = save_key("nadie@demo.test", server.url)  # la clave no existe en el servidor: el handshake la rechaza
+    code, out = run(init(project), capsys)
+    assert code == 20, out
+    assert "Tu conexión anterior ya no es válida; vamos a renovarla" in out
+    assert old not in out
+    assert_plain_message(out)
+    assert fake_device.start_calls[0][0] == server.url
+    assert paths_().pending_file.exists()
+    assert list(project.iterdir()) == []
+
+
+def test_init_malformed_stored_key_is_treated_as_stale(home, project, fake_device, capsys) -> None:
+    envfile.update_env(paths_(), {"BAAS_API_KEY": "no-es-una-clave", "BAAS_APP_URL": APP})
+    code, out = run(init(project), capsys)
+    assert code == 20
+    assert "Tu conexión anterior ya no es válida; vamos a renovarla" in out
+    assert "no-es-una-clave" not in out
+
+
+def test_init_wait_pending_exit_21(home, project, fake_device, capsys) -> None:
+    seed_pending()
+    code, out = run(init(project, "--wait", "--app-url", APP), capsys)
+    assert code == 21, out
+    assert "BAAS_APPROVAL_WAITING" in out
+    assert_plain_message(out)
+    assert fake_device.wait_calls == [(APP, DEVICE_CODE, 3, 90)]
+    assert fake_device.start_calls == []
+    assert paths_().pending_file.exists()  # se puede volver a esperar
+
+
+def test_init_wait_approved_writes_key_and_binds(home, project, server, fake_claude, fake_device, capsys) -> None:
+    seed_pending(app_url=server.url)
+    new_key = dev_api_key("analista@demo.test")
+    fake_device.wait_result = device.DevicePoll("approved", new_key, "analista@demo.test")
+    code, out = run(init(project, "--wait"), capsys)
+    assert code == 0, out
+    assert new_key not in out
+    assert not paths_().pending_file.exists()
+    values = envfile.read_env(paths_())[0]
+    assert values["BAAS_API_KEY"] == new_key
+    assert values["BAAS_APP_URL"] == server.url
+    if os.name == "posix":
+        assert mode_of(paths_().env_file) == 0o600
+    env = json.loads((project / ".claude/settings.local.json").read_text())["env"]
+    assert env["ANTHROPIC_BASE_URL"] == f"{server.url}/proxy/org/demo/anthropic"
+    assert env["ANTHROPIC_CUSTOM_HEADERS"] == f"X-Baas-Api-Key: {new_key}"
+    assert json.loads((project / ".claude/baas.local.json").read_text())["org"] == "demo"
+    assert fake_device.start_calls == []
+
+
+def test_init_wait_approved_with_many_orgs_keeps_key_and_asks_for_org(
+    home, project, server, fake_claude, fake_device, capsys
+) -> None:
+    seed_pending(app_url=server.url)
+    new_key = dev_api_key("multi@demo.test")
+    fake_device.wait_result = device.DevicePoll("approved", new_key, "multi@demo.test")
+    code, _ = run(init(project, "--wait"), capsys)
+    assert code == 3
+    assert envfile.read_env(paths_())[0]["BAAS_API_KEY"] == new_key
+    assert not paths_().pending_file.exists()
+    assert run(init(project, "--org", "otra"), capsys)[0] == 0  # sigue por el camino de siempre
+
+
+def test_init_wait_approved_without_orgs_exit_4(home, project, server, fake_claude, fake_device, capsys) -> None:
+    seed_pending(app_url=server.url)
+    fake_device.wait_result = device.DevicePoll("approved", dev_api_key("sinorg@demo.test"), "sinorg@demo.test")
+    code, _ = run(init(project, "--wait"), capsys)
+    assert code == 4
+
+
+def test_init_wait_denied_exit_22(home, project, fake_device, capsys) -> None:
+    seed_pending()
+    fake_device.wait_result = device.DevicePoll("denied")
+    code, out = run(init(project, "--wait", "--app-url", APP), capsys)
+    assert code == 22
+    assert "BAAS_APPROVAL_DENIED" in out
+    assert_plain_message(out)
+    assert not paths_().pending_file.exists()
+    assert list(project.iterdir()) == []
+
+
+def test_init_wait_expired_exit_23(home, project, fake_device, capsys) -> None:
+    seed_pending()
+    fake_device.wait_result = device.DevicePoll("expired")
+    code, out = run(init(project, "--wait", "--app-url", APP), capsys)
+    assert code == 23
+    assert "BAAS_APPROVAL_EXPIRED" in out
+    assert_plain_message(out)
+    assert not paths_().pending_file.exists()
+
+
+def test_init_wait_network_failure_keeps_pending(home, project, fake_device, capsys) -> None:
+    seed_pending()
+    fake_device.wait_error = NetworkError("No he podido conectar con BaaS-AI-IP.")
+    code, _ = run(init(project, "--wait", "--app-url", APP), capsys)
+    assert code == 6
+    assert paths_().pending_file.exists()
+
+
+def test_init_wait_ignores_the_stored_key(home, project, server, fake_device, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    seed_pending(app_url=server.url)
+    server.state.handshake_status = 500  # si --wait hiciera handshake con la clave de antes, fallaría con 6
+    code, _ = run(init(project, "--wait"), capsys)
+    assert code == 21
+
+
+def test_init_expired_pending_starts_over(home, project, fake_device, capsys) -> None:
+    seed_pending(expires_at=time.time() - 5)
+    code, out = run(init(project, "--wait", "--app-url", APP), capsys)
+    assert code == 20, out
+    assert fake_device.wait_calls == []
+    assert len(fake_device.start_calls) == 1
+    assert json.loads(paths_().pending_file.read_text())["expires_at"] > time.time()
+
+
+def test_init_wait_without_pending_starts_the_flow(home, project, fake_device, capsys) -> None:
+    code, out = run(init(project, "--wait", "--app-url", APP), capsys)
+    assert code == 20
+    assert LINK in out
+
+
+def test_init_wait_for_another_server_starts_over(home, project, fake_device, capsys) -> None:
+    seed_pending(app_url="https://otra.example.com")
+    code, _ = run(init(project, "--wait", "--app-url", APP), capsys)
+    assert code == 20
+    assert fake_device.wait_calls == []
+    assert fake_device.start_calls[0][0] == APP
+
+
+def test_init_unreachable_url_not_saved_exit_6(home, project, fake_device, capsys) -> None:
+    fake_device.start_error = NetworkError("No he podido conectar con BaaS-AI-IP.", hint="Inténtalo más tarde.")
+    code, out = run(init(project, "--app-url", "https://no-existe.example.com"), capsys)
+    assert code == 6
+    assert "BAAS_NETWORK_ERROR" in out
+    assert_plain_message(out)
+    assert not paths_().env_file.exists()
+    assert not paths_().pending_file.exists()
+
+
+def test_init_unreachable_url_keeps_the_saved_one(home, project, fake_device, capsys) -> None:
+    envfile.update_env(paths_(), {"BAAS_APP_URL": APP})
+    fake_device.start_error = NetworkError("No he podido conectar con BaaS-AI-IP.")
+    code, _ = run(init(project, "--app-url", "https://no-existe.example.com"), capsys)
+    assert code == 6
+    assert envfile.read_env(paths_())[0]["BAAS_APP_URL"] == APP
+
+
+def test_init_existing_valid_key_keeps_old_behaviour(home, project, server, fake_claude, fake_device, capsys) -> None:
+    key = save_key("analista@demo.test", server.url)
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert key not in out
+    assert fake_device.start_calls == []
+    assert fake_device.wait_calls == []
+    assert not paths_().pending_file.exists()
+
+
+def test_init_repairs_corrupt_settings_local(home, project, server, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    (project / ".claude").mkdir()
+    (project / ".claude/settings.local.json").write_text('{"env": {"viejo": ')
+    (project / ".claude/baas.local.json").write_text("no es json")
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert "He reparado una configuración dañada (copia guardada)" in out
+    assert (project / ".claude/settings.local.json.bak").read_text() == '{"env": {"viejo": '
+    assert (project / ".claude/baas.local.json.bak").read_text() == "no es json"
+    assert "ANTHROPIC_BASE_URL" in json.loads((project / ".claude/settings.local.json").read_text())["env"]
+    assert json.loads((project / ".claude/baas.local.json").read_text())["org"] == "demo"
+    gitignore = (project / ".gitignore").read_text()
+    assert ".claude/settings.local.json.bak" in gitignore  # la copia podía contener la clave
+
+
+def test_init_valid_config_is_not_reported_as_repaired(home, project, server, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(init(project), capsys)[0] == 0
+    code, out = run(init(project), capsys)
+    assert code == 0
+    assert "reparado" not in out
+    assert not (project / ".claude/settings.local.json.bak").exists()
 
 
 # --- set-key ----------------------------------------------------------------------------------

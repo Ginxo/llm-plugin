@@ -129,3 +129,48 @@ def test_binding_roundtrip_has_no_secrets(project: Path, analista_key: str) -> N
     assert pc.read_binding(project) == binding
     assert analista_key not in (project / ".claude" / "baas.local.json").read_text()
     assert pc.read_binding(project.parent) is None
+
+
+# --- reparación de ficheros dañados -----------------------------------------------------------
+
+
+def test_repair_moves_invalid_json_to_bak(project: Path) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "settings.local.json"
+    path.write_text('{"env": {"X-Baas-Api-Key": "secreto", ')
+    assert pc.repair_json_file(path) is True
+    assert not path.exists()
+    bak = project / ".claude" / "settings.local.json.bak"
+    assert bak.read_text() == '{"env": {"X-Baas-Api-Key": "secreto", '
+    if os.name == "posix":
+        assert mode_of(bak) == 0o600
+
+
+@pytest.mark.parametrize("content", ["[]", '"texto"', "   ", "no es json", "\xff\xfe"])
+def test_repair_treats_non_objects_and_garbage_as_damaged(project: Path, content: str) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "baas.local.json"
+    path.write_bytes(content.encode("latin-1"))
+    assert pc.repair_json_file(path) is True
+    assert (project / ".claude" / "baas.local.json.bak").exists()
+
+
+@pytest.mark.parametrize("content", ["{}", '{"env": {}}', ""])
+def test_repair_leaves_valid_files_alone(project: Path, content: str) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "settings.local.json"
+    path.write_text(content)
+    assert pc.repair_json_file(path) is False
+    assert path.read_text() == content
+    assert not (project / ".claude" / "settings.local.json.bak").exists()
+
+
+def test_repair_missing_file_is_noop(project: Path) -> None:
+    assert pc.repair_json_file(project / ".claude" / "settings.local.json") is False
+
+
+def test_gitignore_can_cover_the_backups(project: Path) -> None:
+    added = pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES)
+    assert ".claude/settings.local.json.bak" in added
+    assert ".claude/baas.local.json.bak" in added
+    assert pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES) == []
