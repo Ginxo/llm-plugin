@@ -9,6 +9,10 @@ renueva sola una clave revocada) · 6 red o servidor
 · 20 falta aprobar la conexión en el navegador (hay un enlace) · 21 sigue esperando la aprobación
 (repetir `init --wait`) · 22 la persona canceló la conexión · 23 el código de aprobación caducó.
 
+`init` termina con una marca para la skill: en una salida 0, `[BAAS_RESULT linked]` (vinculación nueva, clave
+renovada o conexión aprobada en esta ejecución) o `[BAAS_RESULT unchanged]` (ya estaba vinculado, nada que
+cambiar); en una salida 6, `[BAAS_APP_URL <dirección>]` con la dirección probada (nunca con credenciales).
+
 `run-script` es la excepción: devuelve **íntegro** el código de salida del script, que puede ser
 cualquiera (también 9 o 10). Sus errores propios salen, además, con una línea `BAAS_ERROR=<código>` en
 stderr (p. ej. `SCRIPT_HASH_MISMATCH`, `AUTHORIZATION_DENIED`, `KILL_SWITCH_ACTIVE`): sin esa línea, el
@@ -32,6 +36,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
+from urllib.parse import urlsplit
 
 import baas_guard
 
@@ -65,6 +70,20 @@ from .errors import (
 def _p(*lines: str) -> None:
     for line in lines:
         print(line)
+
+
+def _public_url(url: str) -> str | None:
+    """La dirección sin credenciales, consulta ni fragmento (es lo único que `[BAAS_APP_URL …]` puede llevar)."""
+    parts = urlsplit(url)
+    if not parts.hostname:
+        return None
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    try:
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return None
+    public = f"{parts.scheme}://{host}{port}{parts.path.rstrip('/')}"
+    return public if "@" not in public and not any(c.isspace() for c in public) else None
 
 
 def key_prefix(key: str) -> str:
@@ -233,13 +252,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     paths = BaasPaths.default()
     values, _ = read_env(paths)
     app_url = _resolve_app_url(args.app_url, values)
+    try:
+        return _init(args, paths, values, app_url)
+    except NetworkError as exc:
+        exc.app_url = _public_url(app_url)  # la skill la ofrece ya escrita al pedir otra dirección
+        raise
+
+
+def _init(args: argparse.Namespace, paths: BaasPaths, values: dict[str, str], app_url: str) -> int:
     proj = _project_dir(args)
     project.check_not_tracked(proj)
 
     hs = None
     api_key: str | None = None
+    via_approval = False
     if args.wait:
         api_key = _await_approval(paths, app_url)
+        via_approval = api_key is not None
     else:
         stored = values.get("BAAS_API_KEY", "").strip()
         if stored:
@@ -297,6 +326,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     reg = mcp_config.register_mcp_server(proj, org.mcp_url, mcp_config.helper_command(helper))
 
     action = "vinculado" if current != org.slug else "actualizado"
+    # `unchanged` solo si nada cambia para la persona: misma organización, clave que ya valía y nada reparado.
+    unchanged = current == org.slug and not via_approval and not any(repaired)
     _p(
         f"Proyecto {proj} {action}: organización {org.describe()}.",
         f"Usuario: {hs.email} ({hs.platform_role}).",
@@ -320,6 +351,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         " para cargar el MCP `baas` y el proxy; comprueba con /baas-status.",
         "Después, /baas-sync trae las skills de tu organización (también se sincronizan solas al iniciar y"
         " cerrar la sesión).",
+        f"[BAAS_RESULT {'unchanged' if unchanged else 'linked'}]",
     )
     return 0
 
@@ -522,6 +554,9 @@ def main(argv: list[str] | None = None) -> int:
             # Un script puede salir con cualquier código (también 9 o 10): esta línea marca un error del plugin.
             print(f"BAAS_ERROR={exc.error_code}", file=sys.stderr)
         print(exc.render(), file=sys.stderr)
+        tried = getattr(exc, "app_url", None)
+        if tried:  # solo con la dirección que se probó, sin credenciales (ver `_public_url`)
+            print(f"[BAAS_APP_URL {tried}]", file=sys.stderr)
         return exc.exit_code
     except KeyboardInterrupt:
         print("Cancelado.", file=sys.stderr)

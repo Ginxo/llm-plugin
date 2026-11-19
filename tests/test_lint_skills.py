@@ -84,10 +84,25 @@ def _shown_texts(path: Path) -> list[str]:
 
 
 def _allowed_tools(path: Path) -> list[str]:
+    """Las entradas de `allowed-tools` (lista YAML o texto separado por espacios; los paréntesis agrupan)."""
     raw = _frontmatter(path).get("allowed-tools", [])
     if isinstance(raw, list):
         return [str(item) for item in raw]
-    return re.findall(r"Bash\(.*?\)(?=\s+Bash\(|\s*$)", str(raw))
+    entries: list[str] = []
+    depth, current = 0, ""
+    for char in str(raw):
+        if char.isspace() and depth == 0:
+            if current:
+                entries.append(current)
+            current = ""
+            continue
+        depth += char == "("
+        depth -= char == ")"
+        current += char
+    if current:
+        entries.append(current)
+    assert depth == 0, f"paréntesis sin cerrar en allowed-tools de {path}"
+    return entries
 
 
 def test_init_skill_covers_every_approval_and_error_code() -> None:
@@ -128,22 +143,67 @@ def test_init_skill_has_narrow_allowed_tools() -> None:
     assert tools[0] == 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/baas.py" init *)'
     # Lo único más que puede ejecutar: sacar del índice de git los dos ficheros locales, uno a uno.
     assert sorted(tools[1:]) == [
-        "Bash(git rm --cached .claude/baas.local.json)",
-        "Bash(git rm --cached .claude/settings.local.json)",
+        'Bash(git -C "${CLAUDE_PROJECT_DIR}" rm --cached .claude/baas.local.json)',
+        'Bash(git -C "${CLAUDE_PROJECT_DIR}" rm --cached .claude/settings.local.json)',
     ]
+    assert len(tools) == 3
     assert _frontmatter(INIT_SKILL)["disable-model-invocation"] is True
     assert "argument-hint" in _frontmatter(INIT_SKILL)
 
 
 @pytest.mark.parametrize("skill", sorted((REPO / "skills").glob("*/SKILL.md")), ids=lambda p: p.parent.name)
 def test_no_skill_allows_a_bare_or_wildcard_tool(skill: Path) -> None:
-    for tool in _allowed_tools(skill):
+    tools = _allowed_tools(skill)
+    if "allowed-tools" not in _frontmatter(skill):
+        assert tools == []  # sin permisos propios (p. ej. baas-brain, que solo orienta)
+        return
+    assert tools, "si declara `allowed-tools`, el lint tiene que entender sus entradas"
+    for tool in tools:
+        if tool.startswith("mcp__"):
+            assert tool.startswith("mcp__baas__baas_"), tool  # solo las tools del propio MCP, una a una
+            assert "*" not in tool, tool
+            continue
         assert tool.startswith("Bash("), tool
         assert tool.endswith(")"), tool
-        command = tool[len("Bash(") : -1]
-        assert command.strip("* :") != "", tool
-        assert command.split()[0] in {"python3", "git"}, tool
-        assert "*" not in command.removesuffix(" *"), tool  # el comodín, solo al final
+        command = tool[len("Bash(") : -1].split()
+        assert command[0] in {"python3", "git"}, tool
+        assert len(command) > 2, tool  # nunca `Bash(python3 *)` ni `Bash(*)`
+        if command[0] == "python3":
+            assert command[1] == '"${CLAUDE_PLUGIN_ROOT}/scripts/baas.py"', tool
+        for word in command:
+            assert "*" not in word or word == "*", tool  # el comodín, solo como palabra suelta
+        assert command[2] != "*", tool  # el subcomando nunca es un comodín
+
+
+def test_init_skill_never_mentions_local_secret_files() -> None:
+    text = INIT_SKILL.read_text(encoding="utf-8")
+    assert ".env" not in text
+    assert "~/baas-ai-ip" not in text
+
+
+def test_init_skill_validates_and_single_quotes_what_it_passes_to_the_shell() -> None:
+    text = INIT_SKILL.read_text(encoding="utf-8")
+    assert "^https?://[A-Za-z0-9.:/_-]+$" in text
+    assert "^[a-z0-9][a-z0-9-]{0,63}$" in text
+    # Todo valor que sigue a --org o --app-url en un comando va entre comillas simples.
+    for match in re.finditer(r"--(?:org|app-url)[ \t]+(\S)", text):
+        assert match.group(1) == "'", text[match.start() : match.end() + 20]
+    assert 'init --project "${CLAUDE_PROJECT_DIR}" [--org' in text
+    # Los comandos de git se ejecutan desde la raíz del proyecto.
+    for match in re.finditer(r"`git [^`]*`", text):
+        assert match.group(0).startswith('`git -C "${CLAUDE_PROJECT_DIR}" rm --cached'), match.group(0)
+
+
+def test_init_skill_keys_on_result_markers_and_covers_new_rows() -> None:
+    text = INIT_SKILL.read_text(encoding="utf-8")
+    for needle in (
+        "[BAAS_RESULT linked]", "[BAAS_RESULT unchanged]", "[BAAS_APP_URL", "BAAS_CONFIG_ERROR",
+        "ya no es válida", "He renovado tu conexión anterior", "Hay demasiados intentos seguidos",
+        "No he podido hacerlo; pide ayuda a quien administra BaaS-AI-IP", "no digas la frase del caso",
+        "Esa dirección no parece válida; tiene que empezar por https://",
+    ):  # fmt: skip
+        assert needle in text, needle
+    assert "primera línea con" not in text  # ya no se deduce de «vinculado»/«actualizado»
 
 
 def test_status_skill_is_plain_and_points_to_init() -> None:
@@ -160,3 +220,5 @@ def test_readme_documents_first_use_and_server_address() -> None:
     first_use = re.split(r"\n#{2,3} ", text.split("## Primer uso", 1)[1], maxsplit=1)[0]
     assert "/baas-init" in first_use
     assert "set-key" not in first_use  # el primer uso son tres pasos, sin claves ni terminales
+    troubleshooting = text.split("## Solución de problemas", 1)[1].split("\n## ", 1)[0]
+    assert "set-key" not in troubleshooting  # `set-key` es solo para administradores y CI

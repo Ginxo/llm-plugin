@@ -188,6 +188,7 @@ def test_init_zero_orgs_warns(home, project, server, fake_claude, capsys) -> Non
 
 def assert_plain_network_error(out: str) -> None:
     assert "BAAS_NETWORK_ERROR" in out
+    out = "\n".join(line for line in out.splitlines() if not line.startswith("[BAAS_APP_URL "))  # marca para la skill
     assert_plain_message(out)
     for fragment in ("127.0.0.1", "http", "handshake", "HTTP", "Traceback"):
         assert fragment not in out, fragment
@@ -794,3 +795,89 @@ def test_status_checks_mcp(home, project, server, fake_claude, capsys) -> None:
     server.state.global_kill_switch = True
     code, out = run(["status", "--project", str(project)], capsys)
     assert "KILL_SWITCH_ACTIVE" in out
+
+
+# --- marcas de resultado y de dirección (las lee la skill /baas-init) ---------------------------------------
+
+
+def last_line(out: str) -> str:
+    return [line for line in out.splitlines() if line.strip()][-1]
+
+
+def test_init_new_binding_ends_with_result_linked(home, project, server, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+    assert out.count("[BAAS_RESULT") == 1
+
+
+def test_init_rerun_on_a_bound_project_ends_with_result_unchanged(home, project, server, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert last_line(run(init(project), capsys)[1]) == "[BAAS_RESULT linked]"
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT unchanged]"
+
+
+def test_init_switching_organisation_is_linked(home, project, server, fake_claude, capsys) -> None:
+    save_key("multi@demo.test", server.url)
+    assert last_line(run(init(project, "--org", "demo"), capsys)[1]) == "[BAAS_RESULT linked]"
+    code, out = run(init(project), capsys)  # conserva la organización: nada que cambiar
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT unchanged]"
+    code, out = run(init(project, "--org", "otra"), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+
+
+def test_init_renewed_key_via_wait_is_linked_even_if_already_bound(
+    home, project, server, fake_claude, fake_device, capsys
+) -> None:
+    save_key("analista@demo.test", server.url)
+    assert last_line(run(init(project), capsys)[1]) == "[BAAS_RESULT linked]"
+    envfile.remove_env_keys(paths_(), ["BAAS_API_KEY"])  # la clave se revocó: la aprobación trae otra
+    seed_pending(app_url=server.url)
+    new_key = dev_api_key("analista@demo.test")
+    fake_device.wait_result = device.DevicePoll("approved", new_key, "analista@demo.test")
+    code, out = run(init(project, "--wait"), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"  # el proyecto ya estaba vinculado, pero la clave es nueva
+
+
+def test_failed_init_prints_no_result_marker(home, project, fake_device, capsys) -> None:
+    code, out = run(init(project, "--app-url", APP), capsys)
+    assert code == 20
+    assert "BAAS_RESULT" not in out
+
+
+def test_network_error_prints_the_address_that_was_tried(home, project, fake_device, capsys) -> None:
+    fake_device.start_error = NetworkError("No he podido conectar con BaaS-AI-IP.")
+    code, out = run(init(project, "--app-url", "https://no-existe.example.com/"), capsys)
+    assert code == 6
+    assert last_line(out) == "[BAAS_APP_URL https://no-existe.example.com]"
+    assert_plain_message(out.replace("[BAAS_APP_URL https://no-existe.example.com]", ""))
+
+
+def test_address_marker_never_carries_credentials(home, project, fake_device, capsys) -> None:
+    fake_device.start_error = NetworkError("No he podido conectar con BaaS-AI-IP.")
+    code, out = run(init(project, "--app-url", "https://usuario:secreto@no-existe.example.com:8443/base"), capsys)
+    assert code == 6
+    marker = last_line(out)
+    assert marker == "[BAAS_APP_URL https://no-existe.example.com:8443/base]"
+    assert "@" not in marker
+    assert "secreto" not in out
+    assert "usuario" not in out
+
+
+def test_missing_address_prints_no_address_marker(home, project, fake_device, capsys) -> None:
+    code, out = run(init(project), capsys)
+    assert code == 2
+    assert "BAAS_APP_URL_MISSING" in out
+    assert "[BAAS_APP_URL " not in out
+
+
+def test_invalid_address_prints_no_address_marker(home, project, fake_device, capsys) -> None:
+    code, out = run(init(project, "--app-url", "esto no es una url"), capsys)
+    assert code == 2
+    assert "[BAAS_APP_URL " not in out

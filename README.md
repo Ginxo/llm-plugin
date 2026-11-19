@@ -176,7 +176,7 @@ Sin límites de extensión y con un único tope de tamaño de 500 MiB por ficher
 | `[BAAS_PROJECT_UNSAFE]` (7) | `.claude/settings.local.json` o `.claude/baas.local.json` está versionado: `/baas-init` te pide permiso para sacarlo del índice (`git rm --cached`; después hay que hacer commit) |
 | `[BAAS_APPROVAL_PENDING]` (20) · `[BAAS_APPROVAL_WAITING]` (21) | Falta aprobar en el navegador; `/baas-init` vuelve a comprobar solo y, tras unos intentos, espera a que le avises |
 | `[BAAS_APPROVAL_DENIED]` (22) · `[BAAS_APPROVAL_EXPIRED]` (23) | Cancelaste o el enlace caducó (10 minutos): `/baas-init` ofrece generar otro |
-| MCP 401 con clave revocada | `/baas-init` la descarta y pide aprobación de nuevo (con `set-key`, ver arriba, solo en CI) |
+| MCP 401 (conexión revocada o caducada) | Escribe `/baas-init`: descarta la conexión anterior y te pide aprobar de nuevo en el navegador |
 | `/mcp` no muestra `baas` | Reinicia Claude Code. Si `/baas-init` te dijo que falta completar un paso, pásaselo a quien administra BaaS-AI-IP (es registrar el servidor `baas` con el comando `claude mcp add-json` que imprime el propio script, sin claves) |
 | `baas` conecta pero falla con 401 | No aceptaste la confianza en la carpeta: el `headersHelper` solo se ejecuta en carpetas de confianza |
 | Prompt bloqueado / `/baas-status`: «tu sesión aún no está protegida» | Reinicia la sesión y acepta la confianza (`/baas-init` y `/baas-status` siguen funcionando). En la **pestaña Code de Claude Desktop** ver [Claude Desktop](#claude-desktop-pestaña-code) |
