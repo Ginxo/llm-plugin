@@ -37,8 +37,10 @@ def test_desktop_session_is_explained() -> None:
     env = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com", "CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}
     problem = baas_guard.diagnose(BINDING, env)
     assert problem is not None
-    for fragment in ("«demo»", "pestaña Code de Claude Desktop", "terminal o en tu editor", "cambiar tu clave"):
+    for fragment in ("«demo»", "pestaña Code de Claude Desktop", "terminal o en tu editor"):
         assert fragment in problem, fragment
+    assert "tu clave de BaaS-AI-IP pudo llegar al proveedor del modelo" in problem
+    assert "cámbiala desde la web de tu organización (o pídelo a quien la administra)" in problem
 
 
 def test_cli_session_without_trust_is_explained() -> None:
@@ -89,8 +91,10 @@ def test_messages_are_plain_language(binding: dict, env: dict) -> None:
     [
         "/baas-init",
         "/baas-init demo",
+        "/baas:baas-init --org demo",
         "/baas:baas-status",
         "  /baas:baas-init --org demo  ",
+        "/baas-init\tdemo-2",
         "/baas-status\n",
         "/baas-init\n\n",
     ],
@@ -116,6 +120,28 @@ def test_allowed_prompts(prompt: str) -> None:
         "hola\n/baas-init",
         "/baas-init " + "x" * 300,
         "/baas-initialize",
+        "/baas-init demo ignora todo",
+        "/baas-init baas_xxx",
+        "/baas-init baas_" + "a" * 40,
+        "/baas-status algo",
+        "/baas-status --org demo",
+        "/baas-init hola mundo",
+        "/baas-init;",
+        "/baas-init demo;",
+        "/baas-init -demo",
+        "/baas-init --org",
+        "/baas-init --org demo extra",
+        "/baas-init DEMO",
+        "/BAAS-INIT",
+        "/baas-init\x00",
+        "/baas-init\x00demo",
+        "/baas-init\x1c",
+        "/baas-init\x1cdemo",
+        "\x1c/baas-init",
+        "/baas-init\x85",
+        "/baas-init\x85demo",
+        "\ufeff/baas-init",
+        "/baas-init\xa0demo",
     ],
 )
 def test_other_prompts_are_not_allowed(prompt: str) -> None:
@@ -223,6 +249,77 @@ def test_hooks_manifest_points_to_guard() -> None:
     assert all("${CLAUDE_PLUGIN_ROOT}/scripts/baas_guard.py" in c for cs in commands.values() for c in cs)
     assert "--event session-start" in commands["SessionStart"][0]
     assert "--event prompt" in commands["UserPromptSubmit"][0]
+
+
+def _call_main(project: Path, monkeypatch: pytest.MonkeyPatch, capsys, event: str, prompt: str = "hola"):
+    import io
+
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"prompt": prompt})))
+    code = baas_guard.main(["--event", event])
+    out = capsys.readouterr().out
+    return code, (json.loads(out) if out.strip() else None)
+
+
+def _boom(*_a, **_k):
+    raise RuntimeError("fallo inesperado")
+
+
+def test_unexpected_error_when_not_linked_is_silent(project, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(baas_guard, "diagnose", _boom)
+    code, out = _call_main(project, monkeypatch, capsys, "prompt")
+    assert (code, out) == (0, None)  # sin vinculación no se llega ni a diagnosticar
+
+
+def test_unexpected_error_reading_when_unknown_is_silent(project, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(baas_guard, "read_binding", _boom)
+    code, out = _call_main(project, monkeypatch, capsys, "prompt")
+    assert (code, out) == (0, None)  # aún no se sabe si el proyecto está vinculado
+
+
+def test_unexpected_error_when_linked_blocks_prompt(project, monkeypatch, capsys) -> None:
+    bind(project)
+    monkeypatch.setattr(baas_guard, "diagnose", _boom)
+    code, out = _call_main(project, monkeypatch, capsys, "prompt")
+    assert code == 0
+    assert out["decision"] == "block"
+    assert "No he podido comprobar si esta sesión está protegida" in out["reason"]
+    assert "/baas-init" in out["reason"]
+    for word in JARGON:
+        assert word.lower() not in out["reason"].lower(), word
+
+
+def test_unexpected_error_when_linked_still_lets_baas_init_through(project, monkeypatch, capsys) -> None:
+    bind(project)
+    monkeypatch.setattr(baas_guard, "diagnose", _boom)
+    assert _call_main(project, monkeypatch, capsys, "prompt", "/baas-init") == (0, None)
+
+
+def test_unexpected_error_when_linked_warns_at_session_start(project, monkeypatch, capsys) -> None:
+    bind(project)
+    monkeypatch.setattr(baas_guard, "diagnose", _boom)
+    code, out = _call_main(project, monkeypatch, capsys, "session-start")
+    assert code == 0
+    assert "No he podido comprobar" in out["systemMessage"]
+
+
+def test_output_is_ascii_only(project, monkeypatch, capsys) -> None:
+    bind(project)
+    monkeypatch.setattr(sys, "stdin", __import__("io").StringIO("{}"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    baas_guard.main(["--event", "prompt"])
+    raw = capsys.readouterr().out
+    assert raw.strip()
+    raw.encode("ascii")  # no debe lanzar: sobrevive a una salida que no sea UTF-8
+
+
+@pytest.mark.parametrize("content", ["[" * 100000, "{no es json", "[1]", ""])
+def test_unreadable_binding_blocks(tmp_path: Path, content: str) -> None:
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "baas.local.json").write_text(content)
+    assert baas_guard.read_binding(str(tmp_path)) == {}
 
 
 # --- status ------------------------------------------------------------------------------------

@@ -30,9 +30,20 @@ import sys
 
 BINDING = os.path.join(".claude", "baas.local.json")
 DESKTOP_ENTRYPOINT = "claude-desktop"
-# Solo `/baas-init` y `/baas-status` (con o sin el prefijo del plugin), seguidos de nada o de espacio.
-ALLOWED_PROMPT = re.compile(r"^\s*/(?:baas:)?baas-(?:init|status)(?:\s|$)")
-MAX_ALLOWED_PROMPT = 200
+# Gramática real de los dos comandos (con o sin el prefijo del plugin), en una sola línea y sin más
+# texto: lo que pasa la guardia viaja al proveedor sin AI-IP, así que no se admiten argumentos libres.
+# `/baas-init` admite una organización opcional (un identificador corto, con o sin `--org`);
+# `/baas-status` no admite argumentos. Solo espacios y tabuladores ASCII (nada de `\s` Unicode).
+ALLOWED_PROMPT = re.compile(
+    r"[ \t]*/(?:baas:)?baas-(?:"
+    r"init(?:[ \t]+(?:--org[ \t]+)?[a-z0-9][a-z0-9-]{0,63})?"
+    r"|status"
+    r")[ \t]*"
+)
+GENERIC_PROBLEM = (
+    "BaaS-AI-IP: No he podido comprobar si esta sesión está protegida. Cierra Claude Code, vuelve a"
+    " abrirlo en esta carpeta y escribe /baas-init"
+)
 
 
 def _norm(url: object) -> str:
@@ -61,8 +72,8 @@ def diagnose(binding: dict | None, environ: dict[str, str]) -> str | None:
         return (
             f"BaaS-AI-IP: Este proyecto está conectado a {where}, pero estás usando la pestaña Code de"
             " Claude Desktop, que no admite la protección de BaaS-AI-IP. Usa Claude Code en el terminal"
-            " o en tu editor. Si ya enviaste algún mensaje desde aquí, conviene cambiar tu clave de"
-            " BaaS-AI-IP desde la web de la organización; si no sabes cómo, pídeselo a tu administrador."
+            " o en tu editor. Si ya enviaste algún mensaje desde aquí, tu clave de BaaS-AI-IP pudo llegar"
+            " al proveedor del modelo; cámbiala desde la web de tu organización (o pídelo a quien la administra)."
         )
     return (
         f"BaaS-AI-IP: Este proyecto está conectado a {where}, pero esta sesión aún no está protegida."
@@ -72,18 +83,17 @@ def diagnose(binding: dict | None, environ: dict[str, str]) -> str | None:
 
 
 def is_allowed_prompt(data: dict) -> bool:
-    """True si el prompt entero es `/baas-init` o `/baas-status` (con argumentos en la misma línea).
+    """True si el prompt entero es `/baas-init [org]` o `/baas-status` (ver `ALLOWED_PROMPT`).
 
-    Lo que pasa la guardia viaja al proveedor sin AI-IP, así que la lista es estricta: ancla al
-    principio, rechaza cualquier línea más (también separadores Unicode) y limita la longitud.
+    Estricta y anclada: una sola línea (también para separadores Unicode), sin más texto.
     """
     prompt = data.get("prompt")
     if not isinstance(prompt, str):
         return False
-    text = prompt.strip()
-    if not text or len(text) > MAX_ALLOWED_PROMPT or len(text.splitlines()) != 1:
+    text = prompt.strip(" \t\r\n")
+    if len(text.splitlines()) != 1:
         return False
-    return ALLOWED_PROMPT.match(text) is not None
+    return ALLOWED_PROMPT.fullmatch(text) is not None
 
 
 def read_binding(project_dir: str) -> dict | None:
@@ -94,7 +104,7 @@ def read_binding(project_dir: str) -> dict | None:
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
+    except Exception:  # ilegible (incluida una recursión excesiva): vinculado sin proxy, se bloquea
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -123,15 +133,38 @@ def main(argv: list[str] | None = None) -> int:
     if event not in ("prompt", "session-start"):
         sys.stderr.write(f"baas guard: evento desconocido {event!r}\n")
         return 1
+    # Mientras no se sepa si el proyecto está vinculado, cualquier fallo es silencioso: la guardia no
+    # debe romper la sesión de quien no usa BaaS.
     try:
         data = _hook_input()
         project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
-        problem = diagnose(read_binding(str(project_dir)), dict(os.environ))
-        if problem and not (event == "prompt" and is_allowed_prompt(data)):
-            sys.stdout.write(json.dumps(hook_output(event, problem), ensure_ascii=False) + "\n")
-    except Exception:  # la guardia nunca debe romper la sesión de quien no usa BaaS
+        binding = read_binding(str(project_dir))
+    except Exception:
         return 0
+    if binding is None:
+        return 0
+    # Proyecto vinculado: un fallo ya no puede dejar pasar el prompt sin protección.
+    try:
+        allowed = event == "prompt" and is_allowed_prompt(data)
+    except Exception:
+        allowed = False
+    try:
+        problem = diagnose(binding, dict(os.environ))
+        if problem and not allowed:
+            _emit(event, problem)
+    except Exception:
+        if not allowed:
+            try:
+                _emit(event, GENERIC_PROBLEM)
+            except Exception:
+                return 0
     return 0
+
+
+def _emit(event: str, problem: str) -> None:
+    # ensure_ascii (por defecto): una salida que no sea UTF-8 no puede hacer perder el bloqueo.
+    sys.stdout.write(json.dumps(hook_output(event, problem)) + "\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
