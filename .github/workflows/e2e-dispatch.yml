@@ -1,0 +1,28 @@
+# Lanza la prueba de punta a punta de la pila integrada (workflow e2e de baas-ai-ip/deploy) con cada push
+# a main. La prueba construye main de todos los repositorios, así que no depende de qué repositorio la lance.
+# En deploy solo corre una a la vez: si llegan varias mientras hay una en marcha, GitHub conserva únicamente
+# la última en espera (concurrency: e2e, cancel-in-progress: false). Ver deploy/docs/e2e.md.
+#
+# DEPLOY_DISPATCH_TOKEN: token de grano fino con solo «Actions: write» sobre baas-ai-ip/deploy (el mismo
+# que usa el despliegue; contratos §9). Si caduca, este job falla en rojo.
+name: e2e
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: Lanzar el e2e en deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Lanzar el workflow e2e de baas-ai-ip/deploy
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_DISPATCH_TOKEN }}
+        run: gh workflow run e2e.yml --repo baas-ai-ip/deploy --ref main
