@@ -67,27 +67,40 @@ def _json_object(resp: httpclient.Response) -> dict[str, Any]:
     return body
 
 
+def _has_unsafe_chars(url: str) -> bool:
+    """Barras invertidas, espacios o caracteres de control: `urlsplit` y los navegadores los interpretan distinto."""
+    return any(ch == "\\" or ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url)
+
+
 def _origin(url: str) -> tuple[str, str, int] | None:
-    """(esquema, host, puerto efectivo) de una URL, o `None` si no se puede interpretar."""
+    """(esquema, host, puerto efectivo) de una URL sin credenciales, o `None` si no es válida."""
+    if _has_unsafe_chars(url):
+        return None
     try:
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
-        port = parts.port or (443 if parts.scheme == "https" else 80)
+        port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+        has_userinfo = parts.username is not None or parts.password is not None or "@" in parts.netloc
     except ValueError:
         return None
-    return (parts.scheme, host, port) if host and parts.scheme in ("http", "https") else None
+    if not host or has_userinfo or parts.scheme not in ("http", "https"):
+        return None
+    return parts.scheme, host, port
 
 
 def is_trusted_link(verification_url: str, app_url: str) -> bool:
-    """El enlace de aprobación debe apuntar al mismo esquema, host y puerto que la webapp, y ser https
-    salvo en desarrollo local (misma regla que `normalize_app_url`). Evita que un servidor engañado o
-    comprometido dirija a la persona a otra página."""
+    """El enlace de aprobación debe apuntar al mismo esquema, host y puerto que la webapp, sin credenciales ni
+    caracteres ambiguos, y ser https salvo en desarrollo local (misma regla que `normalize_app_url`). Evita que
+    un servidor engañado o comprometido dirija a la persona a otra página."""
+    link = _origin(verification_url)
+    if link is None or _origin(app_url) is None:
+        return False
     try:
         normalize_app_url(verification_url)
         app = _origin(normalize_app_url(app_url))
     except ConfigError:
         return False
-    return app is not None and _origin(verification_url) == app
+    return app is not None and link == app
 
 
 def _nonempty_str(value: Any) -> str | None:

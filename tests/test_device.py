@@ -157,11 +157,16 @@ def test_start_rejects_responses_outside_the_contract(server: FakeDeviceServer, 
         "http://user@evil.example.com:{port}/connect",
         "//127.0.0.1:{port}/connect",
         "javascript:alert(1)",
+        "https://evil.com\\@{host}/connect",
+        "http://evil.com@127.0.0.1:{port}/connect",
     ],
 )
 def test_start_rejects_verification_url_of_another_origin(server: FakeDeviceServer, url: str) -> None:
     port = server.url.rsplit(":", 1)[1]
-    server.start_response = (200, {**CONTRACT_START, "verification_url": url.format(port=port)})
+    server.start_response = (
+        200,
+        {**CONTRACT_START, "verification_url": url.format(port=port, host=server.url.split("//")[1])},
+    )
     with pytest.raises(NetworkError) as exc:
         device.start(server.url, "x")
     assert "no es la esperada" in exc.value.message
@@ -179,6 +184,23 @@ def test_is_trusted_link_rules() -> None:
     assert not ok("http://app.example.com/connect", "http://app.example.com")  # http fuera de local
     assert not ok("http://localhost:8000/connect", "http://127.0.0.1:8000")
     assert not ok("https://app.example.com/connect", "no es una url")
+    # Fix ronda 2: ambigüedades que los navegadores interpretan distinto que urlsplit
+    app = "https://app.example.com"
+    assert not ok("https://evil.com\\@app.example.com/connect", app)
+    assert not ok("https://evil.com@app.example.com/x", app)
+    assert not ok("https://app.example.com@evil.com/x", app)
+    assert not ok("https://user:pass@app.example.com/x", app)
+    assert not ok("https://app.example.com/con nect", app)
+    assert not ok("https://app.example.com/con\tnect", app)
+    assert not ok("https://app.example.com/con\x00nect", app)
+    assert not ok(" https://app.example.com/connect", app)
+    assert not ok("https://app.example.com./connect", app)  # punto final
+    assert not ok("https://bücher.example/connect", "https://xn--bcher-kva.example")  # IDN vs punycode
+    assert not ok("https://xn--bcher-kva.example/connect", "https://bücher.example")
+    assert ok("https://app.example.com:443/c", app)
+    assert not ok("https://app.example.com:443/c", "https://app.example.com:80")
+    assert not ok("https://app.example.com:0/c", app)
+    assert ok("https://APP.EXAMPLE.COM/c", app)
     assert not ok("https://app.example.com:abc/connect", "https://app.example.com")
 
 
@@ -420,6 +442,8 @@ def test_pending_damaged_returns_none_and_deletes(paths: BaasPaths, content: str
         ("https://app.example.com", "http://app.example.com/connect"),
         ("http://app.example.com", "http://app.example.com/connect"),
         ("no es una url", "https://app.example.com/connect"),
+        ("https://app.example.com", "https://evil.com\\@app.example.com/connect"),
+        ("https://app.example.com", "https://evil.com@app.example.com/connect"),
     ],
 )
 def test_pending_with_untrusted_urls_is_treated_as_corrupt(paths: BaasPaths, app_url: str, link: str) -> None:
