@@ -416,6 +416,28 @@ class FollowUpTest(unittest.TestCase):
             e2e_uso.tool_result_for(json.dumps({"content": [{"type": "text", "text": "x"}]}).encode(), "y")
 
 
+class SecondTurnTest(unittest.TestCase):
+    """12.2: el segundo turno de la herramienta tiene que traer, al principio de su `request_original`, el
+    `[tool_use: Skill]` y el `tool_result` «Launching skill:»; si no, «no hay doble recuento» no prueba nada."""
+
+    GOOD = '[tool_use: Skill] {"skill":"uso-a-sk:informes"}\n\n[tool_result] Launching skill: uso-a-sk:informes'
+
+    def test_the_expected_text_passes(self) -> None:
+        self.assertEqual(e2e_uso.second_turn_problems("uso-a-sk", "informes", self.GOOD), [])
+        segments = [{"text": self.GOOD[:20]}, {"text": self.GOOD[20:]}]
+        self.assertEqual(e2e_uso.second_turn_problems("uso-a-sk", "informes", segments), [], "también en segmentos")
+
+    def test_missing_pieces_are_reported(self) -> None:
+        only_result = "[tool_result] Launching skill: uso-a-sk:informes"
+        problems = e2e_uso.second_turn_problems("uso-a-sk", "informes", only_result)
+        self.assertTrue(problems and "tool_use: Skill" in problems[0], problems)
+        only_use = '[tool_use: Skill] {"skill":"uso-a-sk:informes"}'
+        problems = e2e_uso.second_turn_problems("uso-a-sk", "informes", only_use)
+        self.assertTrue(any("Launching skill" in p for p in problems), problems)
+        self.assertTrue(e2e_uso.second_turn_problems("uso-a-sk", "informes", None))
+        self.assertTrue(e2e_uso.second_turn_problems("uso-b-sk", "informes", self.GOOD), "otra organización")
+
+
 class SpikeRegexTest(unittest.TestCase):
     """Las expresiones del spike T0 son las del contrato §7 (con las que cuenta la webapp)."""
 
@@ -427,6 +449,13 @@ class SpikeRegexTest(unittest.TestCase):
         text = "<command-name>/ginxo:Informe.v2</command-name>"
         self.assertEqual(spike.slash_re("ginxo").findall(text), ["Informe.v2"])
         self.assertEqual(spike.slash_re("ginxo").findall("<command-name>/ginxo:" + "a" * 129 + "</command-name>"), [])
+
+    def test_the_notes_carry_the_contract_expressions(self) -> None:
+        import spike_f4_skill_invocation as spike
+
+        for key, expression in (("regex_slash", spike.slash_re), ("regex_tool", spike.tool_re)):
+            self.assertEqual(spike.NOTES[key].split("  (")[0], expression("ORG").pattern.replace("ORG", "{org}"))
+        self.assertNotIn("[a-z0-9][a-z0-9_-]*", json.dumps(spike.NOTES))
 
 
 class RestartTest(unittest.TestCase):
@@ -464,6 +493,61 @@ class RestartTest(unittest.TestCase):
         org = e2e_uso.UsoOrg("uso-x-pr", ORG_ID, ZoneInfo("Europe/Madrid"))
         group.restart(org, ["webapp-api"], failed=True)  # no lanza: el error del paso es el que cuenta
         self.assertEqual(waited, ["webapp"])
+
+
+class PurgeTest(unittest.TestCase):
+    """12.8: la retención se restaura siempre (también con Ctrl-C) y la webapp se vuelve a arrancar si falló."""
+
+    class Inspector:
+        def __init__(self, start_failures: int) -> None:
+            self.start_failures, self.calls = start_failures, []
+
+        def service_control(self, service: str, action: str) -> None:
+            self.calls.append((service, action))
+            if action == "start" and self.start_failures:
+                self.start_failures -= 1
+                raise e2e_h4.StepError("no arranca")
+
+    def group(self, start_failures: int = 0) -> tuple[e2e_uso.UsoGroup, list[object]]:
+        e2e = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), inspector=self.Inspector(start_failures))  # type: ignore[arg-type]
+        group = e2e_uso.UsoGroup(e2e)
+        puts: list[object] = []
+
+        def webapp(method: str, path: str, who: str, payload: object = None) -> e2e_h4.Http:
+            puts.append((method, path, payload))
+            return e2e_h4.Http(200, [], b"{}")
+
+        e2e.webapp = webapp  # type: ignore[method-assign]
+        group.wait_webapp = lambda: None  # type: ignore[method-assign]
+        return group, puts
+
+    def months(self, puts: list[object]) -> list[int]:
+        return [p[2]["months"] for p in puts if p[0] == "PUT"]  # type: ignore[index]
+
+    def test_happy_path_sets_and_restores(self) -> None:
+        group, puts = self.group()
+        self.assertEqual(group.purge_with_retention(60, 13, lambda: None), [])
+        self.assertEqual(self.months(puts), [60, 13])
+        self.assertEqual(group.inspector().calls, [("webapp-api", "stop"), ("webapp-api", "start")])
+
+    def test_a_failed_start_is_retried_and_reported(self) -> None:
+        group, puts = self.group(start_failures=1)
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            group.purge_with_retention(60, 13, lambda: None)
+        self.assertIn("no arranca", str(ctx.exception))
+        self.assertIn("se volvió a arrancar", str(ctx.exception))
+        self.assertEqual(group.inspector().calls[-1], ("webapp-api", "start"))
+        self.assertEqual(self.months(puts), [60, 13])
+
+    def test_an_interrupt_still_restores_the_retention(self) -> None:
+        group, puts = self.group()
+
+        def interrupted() -> None:
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            group.purge_with_retention(60, 13, interrupted)
+        self.assertEqual(self.months(puts), [60, 13])
 
 
 class GroupTest(unittest.TestCase):

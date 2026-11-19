@@ -296,6 +296,23 @@ def tool_result_for(response: bytes, text: str) -> list[dict[str, Any]]:
     return [{"type": "tool_result", "tool_use_id": uses[0].get("id"), "content": text}]
 
 
+def second_turn_problems(org_slug: str, skill: str, request_original: Any) -> list[str]:
+    """12.2: lo que le falta al `request_original` del segundo turno de la herramienta (texto o segmentos de la vista
+    del turno) para que «no hay doble recuento» pruebe algo: empezar por el `[tool_use: Skill]` de la respuesta anterior
+    y traer el `tool_result` «Launching skill: <org>:<skill>»."""
+    if isinstance(request_original, list):
+        text = "".join(str(s.get("text") or s.get("token") or "") for s in request_original if isinstance(s, dict))
+    else:
+        text = request_original if isinstance(request_original, str) else ""
+    name = f"{org_slug}:{skill}"
+    problems = []
+    if f'[tool_use: Skill] {{"skill":"{name}"}}' not in text:
+        problems.append(f'el request_original del segundo turno no trae «[tool_use: Skill] {{"skill":"{name}"}}»')
+    if f"Launching skill: {name}" not in text:
+        problems.append(f"el request_original del segundo turno no trae «Launching skill: {name}»")
+    return problems
+
+
 def counts_by_key(series: Any) -> dict[str, dict[str, int]]:
     """`{key: {source: n}}` de las series de `usage/content`, solo con los recuentos distintos de cero."""
     out: dict[str, dict[str, int]] = {}
@@ -709,23 +726,37 @@ class UsoGroup:
         check(res.status == 200, f"Messages en «{org.slug}» → HTTP {res.status}: {h3.snippet(res.body)}")
         return res
 
-    def conversation_turns(self, org: UsoOrg) -> dict[str, int]:
-        """Modelo → número de turnos de las conversaciones de la organización (lo que ve su ORG_ADMIN)."""
+    def conversations(self, org: UsoOrg) -> dict[str, dict[str, Any]]:
+        """Modelo → conversación de la organización (lo que ve su ORG_ADMIN)."""
         res = self.e.webapp("GET", f"/api/v1/conversations?org={org.slug}&limit=200", self.org_admin)
         check(res.status == 200, f"GET /api/v1/conversations?org={org.slug} → {describe(res)}")
         items = [i for i in (res.json() or {}).get("items") or [] if isinstance(i, dict)]
-        return {str(i.get("model")): int(i.get("turn_count") or 0) for i in items}
+        return {str(i.get("model")): i for i in items}
+
+    def last_request_original(self, conversation_id: str) -> Any:
+        """El `request_original` del último turno, como lo ve el dueño (el USER que lo envió)."""
+        indexes = self.e.turn_indexes(self.user, conversation_id)
+        res = self.e.turn(self.user, conversation_id, indexes[-1])
+        check(res.status == 200, f"GET …/{conversation_id}/turns/{indexes[-1]} ({self.user}) → {describe(res)}")
+        return (res.json() or {}).get("request_original")
 
     def invocations(self) -> str:
-        """12.2. Cada invocación es una conversación de **dos turnos**, como en Claude Code: el `request_original` de un
-        turno empieza por la respuesta anterior del modelo (contrato §7), así que el segundo turno repite el
-        `[tool_use: Skill] …` y trae el `[tool_result] Launching skill: …`, y el historial vuelve a llevar el
-        `<command-name>`. Un extractor que mirara también ahí contaría dos veces."""
+        """12.2. Cada invocación es una conversación de **dos turnos**, como en Claude Code. El `request_original` de un
+        turno es solo lo nuevo, pero empieza por la respuesta anterior del modelo (contrato §7): en el segundo turno de
+        la herramienta se repite el `[tool_use: Skill] …` y llega el `[tool_result] Launching skill: …` (se comprueba
+        leyendo el turno antes de dar por buena la ausencia de doble recuento). En el de `/<org>:facturacion`, el
+        `<command-name>` va en el **historial del cuerpo** que envía el cliente, no en el `request_original` del
+        segundo turno (que es la respuesta anterior y la pregunta nueva). Un extractor que contara la herramienta
+        también en `request_original`, o el comando en todo el historial, contaría dos veces.
+
+        Usa la organización `demo` de la semilla de desarrollo: se invoca `demo:cosa-<ejecución>` desde la organización
+        de la prueba y se comprueba que el informe de `demo` (como PLATFORM_ADMIN, agregado) no la cuenta."""
         other = f"cosa-{self.nonce}"  # skill de «demo» que no debe aparecer en «demo»
         with self.org("sk", {self.org_admin: "ORG_ADMIN", self.user: "USER"}) as org:
             slug = org.slug
             # /<org>:facturacion: el envoltorio de Claude Code en un bloque y la petición del usuario en otro (el eco
-            # del proveedor falso repite solo el último bloque, como un modelo que no repite el comando)
+            # del proveedor falso repite solo el último bloque, como un modelo que no repite el comando); el segundo
+            # turno lleva el comando en el historial del cuerpo
             command = (
                 f"<command-message>{slug}:facturacion</command-message>\n"
                 f"<command-name>/{slug}:facturacion</command-name>\n<command-args>importe 100</command-args>"
@@ -755,13 +786,19 @@ class UsoGroup:
             total = 4 + len(ignored)
             self.wait_requests(org, total)  # todas las trazas consumidas, también los segundos turnos
             problems = []
-            turns = self.conversation_turns(org)
+            convs = self.conversations(org)
             for model in (slash_model, tool_model):
-                if turns.get(model) != 2:
+                turns = (convs.get(model) or {}).get("turn_count")
+                if turns != 2:
                     problems.append(
-                        f"el segundo turno no se correlacionó: la conversación {model} tiene {turns.get(model)!r} "
+                        f"el segundo turno no se correlacionó: la conversación {model} tiene {turns!r} "
                         "turno(s) (se esperaba 2; sin correlación el paso no prueba el doble recuento)"
                     )
+            check(not problems, "\n".join(problems))
+            # precondición: el texto que un extractor equivocado contaría dos veces está de verdad en el 2.º turno
+            original = self.last_request_original(str(convs[tool_model]["id"]))
+            missing = second_turn_problems(slug, "informes", original)
+            check(not missing, "\n".join(missing) + " (sin eso, que INVOKED siga en 1 no prueba nada)")
             by_skill = counts_by_key(self.content(org, "skill").get("series"))
             by_source = self.content(org, "source").get("totals") or {}
             want = {"facturacion": {"INVOKED": 1}, "informes": {"INVOKED": 1}}
@@ -1170,20 +1207,10 @@ class UsoGroup:
             check(res.status == 200, f"borrar la conversación {cid} → {describe(res)}")
             gone = self.e.webapp("GET", f"/api/v1/conversations/{cid}", self.org_admin)
             check(gone.status == 404, f"la conversación borrada → HTTP {gone.status} (se esperaba 404)")
-            res = self.e.webapp(
-                "PUT",
-                "/api/v1/platform/settings/metrics-retention",
-                self.admin,
-                {"months": TEST_RETENTION, "reason": REASON},
-            )
-            check(res.status == 200, f"PUT …/metrics-retention {{months: {TEST_RETENTION}}} → {describe(res)}")
-            try:
-                # purge_metrics se ejecuta al arrancar (y cada hora); `restart` no vale con podman-compose (las
-                # dependencias ya terminadas, migrate y seed, cuentan como «no arrancadas»): parar y arrancar
-                insp.service_control(CONSUMER, "stop")
-                insp.service_control(CONSUMER, "start")
-                self.wait_webapp()
-                self.wait(
+            problems += self.purge_with_retention(
+                TEST_RETENTION,
+                previous,
+                lambda: self.wait(
                     lambda: (
                         []
                         if insp.tagged_rows(old) == {"traffic": 0, "content": 0, "snapshots": 0}
@@ -1191,14 +1218,8 @@ class UsoGroup:
                     ),
                     self.a.usage_timeout,
                     "la purga no borró las métricas más antiguas que la retención",
-                )
-            except Exception as exc:
-                restored = self.restore_retention(previous)
-                extra = f"\nademás, {restored}" if restored else ""
-                raise StepError(f"{exc}{extra}") from None
-            restored = self.restore_retention(previous)
-            if restored:
-                problems.append(restored)
+                ),
+            )
             kept = insp.tagged_rows(recent)
             if kept != {"traffic": 1, "content": 1, "snapshots": 1}:
                 problems.append(f"la purga borró también las de hace {TEST_RETENTION - 1} meses: {kept}")
@@ -1222,6 +1243,51 @@ class UsoGroup:
             "la conversación borrada sigue contando (1 petición); eliminar "
             f"«{org.slug}» deja 0 filas suyas ({before} antes); retención restaurada a {previous}"
         )
+
+    def purge_with_retention(self, months: int, previous: int, purged: Callable[[], None]) -> list[str]:
+        """Pone la retención de métricas en `months`, vuelve a arrancar la webapp (`purge_metrics` se ejecuta al
+        arrancar; `restart` no vale con podman-compose: las dependencias ya terminadas, migrate y seed, cuentan como «no
+        arrancadas») y espera con `purged`. En el `finally` (también con Ctrl-C): si la webapp quedó parada, se intenta
+        arrancar otra vez, y la retención vuelve siempre a `previous`. Si algo de eso falla, lo dice el error del paso
+        o, si el paso fue bien, los problemas que devuelve."""
+        insp = self.inspector()
+        notes: list[str] = []
+        changed = stopped = started = False
+        try:
+            res = self.e.webapp(
+                "PUT", "/api/v1/platform/settings/metrics-retention", self.admin, {"months": months, "reason": REASON}
+            )
+            check(res.status == 200, f"PUT …/metrics-retention {{months: {months}}} → {describe(res)}")
+            changed = True
+            stopped = True  # antes de `stop`: si falla a medias, también se intenta arrancar
+            insp.service_control(CONSUMER, "stop")
+            insp.service_control(CONSUMER, "start")
+            started = True
+            self.wait_webapp()
+            purged()
+        except Exception as exc:
+            raise StepError(f"{exc}{self._purge_cleanup(stopped, started, changed, previous, notes)}") from None
+        except BaseException:
+            extra = self._purge_cleanup(stopped, started, changed, previous, notes)
+            if extra:
+                print(f"          ({extra.strip()})")
+            raise
+        self._purge_cleanup(stopped, started, changed, previous, notes)
+        return notes
+
+    def _purge_cleanup(self, stopped: bool, started: bool, changed: bool, previous: int, notes: list[str]) -> str:
+        insp = self.inspector()
+        if stopped and not started:
+            try:
+                insp.service_control(CONSUMER, "start")
+                notes.append(f"{CONSUMER} no arrancó a la primera tras pararlo; se volvió a arrancar")
+            except Exception as exc:
+                notes.append(f"{CONSUMER} sigue parado: tampoco arrancó al reintentarlo ({exc}); arráncalo a mano")
+        if changed:
+            restored = self.restore_retention(previous)
+            if restored:
+                notes.append(restored)
+        return "".join(f"\nademás, {n}" for n in notes)
 
     def restore_retention(self, months: int) -> str | None:
         """Vuelve a poner la retención de métricas (esperando a la webapp si se está arrancando); `None` si se pudo."""
