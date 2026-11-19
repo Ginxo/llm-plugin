@@ -146,29 +146,40 @@ def test_new_account_switches_the_key_through_a_fresh_approval(
     stack: FakeH4Stack, home: Path, project: Path, env: dict[str, str]
 ) -> None:
     key = dev_api_key(stack.device.email)
-    envfile.update_env(envfile.BaasPaths(baas_dir(home)), {"BAAS_API_KEY": key, "BAAS_APP_URL": stack.app_url})
+    paths = envfile.BaasPaths(baas_dir(home))
+    envfile.update_env(
+        paths, {"BAAS_API_KEY": key, "BAAS_APP_URL": stack.app_url, "ANTHROPIC_API_KEY": "sk-conservada"}
+    )
 
     plain = init(env, project, stack.app_url)
     assert plain.code == 0, plain.text
     assert stack.device.starts == 0
-    plain_again = init(env, project, stack.app_url)
-    assert "[BAAS_RESULT unchanged]" in plain_again.text
+    old_binding = json.loads((project / ".claude" / "baas.local.json").read_text())
+    assert old_binding["user_email"] == "analista@demo.test"
+    assert "[BAAS_RESULT unchanged]" in init(env, project, stack.app_url).text
 
     first = init(env, project, stack.app_url, "--new-account")
     assert first.code == 20, first.text
     assert "[BAAS_APPROVAL_PENDING]" in first.text
-    assert not has_stored_key(home)
+    assert stored_key(home) == key  # hasta que se apruebe, la conexión de siempre sigue en su sitio
     assert stack.device.starts == 1
     assert_no_key(key, first)
 
+    stack.device.email = "orgadmin@demo.test"  # quien aprueba ahora es otra cuenta
     second = init(env, project, stack.app_url, "--wait")
     assert second.code == 0, second.text
     assert "[BAAS_RESULT linked]" in second.text
     new = stored_key(home)
     assert new != key
     assert new in stack.device.issued_keys
+    assert envfile.read_env(paths)[0]["ANTHROPIC_API_KEY"] == "sk-conservada"
     assert_no_key(new, first, second)
     assert_no_key(key, first, second)
+
+    settings_text = (project / ".claude" / "settings.local.json").read_text()
+    assert key not in settings_text
+    assert new in settings_text
+    assert json.loads((project / ".claude" / "baas.local.json").read_text())["user_email"] == "orgadmin@demo.test"
 
 
 def test_wait_polls_until_the_simulated_approval_without_real_sleeping(stack: FakeH4Stack) -> None:

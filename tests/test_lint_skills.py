@@ -133,7 +133,7 @@ def test_text_shown_to_the_user_is_plain(path: Path) -> None:
     shown = _shown_texts(path)
     assert shown, "la skill debe dar a Claude frases literales para la persona"
     for sentence in shown:
-        low = sentence.lower()
+        low = sentence.replace("“API keys”", "").lower()  # el nombre de la sección de la web, tal como la ve la persona
         for word in FORBIDDEN_IN_SHOWN:
             assert word not in low, f"{path.parent.name}: «{sentence}» contiene {word!r}"
 
@@ -256,7 +256,7 @@ def test_init_skill_handles_more_than_four_organisations_and_names_the_account()
     assert "más de 4" in text
     assert "lista numerada" in text
     assert "Conectado a <nombre de la organización> con la cuenta <correo>" in text
-    assert "no reconoce la cuenta" in text.lower() or "no reconoces la cuenta" in text.lower()
+    assert "¿Es la cuenta que querías usar?" in text
 
 
 def test_readme_admin_section_is_honest_about_personal_keys() -> None:
@@ -285,6 +285,18 @@ def test_init_skill_offers_another_account_without_widening_permissions() -> Non
     assert "--new-account" in text
     assert "cierra la sesión y vuelve a escribir /baas-init" not in text  # no cambia de cuenta: ya no se dice
     assert "Nunca con `--wait`" in text
+    # Tras una aprobación nueva no se pregunta (ni hay bucle); solo si `linked` llegó sin ella.
+    assert "no le hagas ninguna pregunta" in text
+    assert "Solo si `linked` llegó sin una aprobación nueva" in text
+    assert "no hay bucle" in text
+    assert "Si no es la cuenta que querías, escribe /baas-init y elige" in text
+    # El `--wait` nunca lleva `--new-account`; tras denegar o caducar, repetir el cambio sí lo lleva.
+    assert len(re.findall(r"sin(?:\*\*)? `--new-account`", text)) >= 3  # filas 20 y 21 y el apartado
+    assert "incluido `--new-account` si era un cambio de cuenta" in text
+    # Consecuencia real del cambio, dicha con claridad.
+    assert "En tus otros proyectos tendrás que escribir /baas-init de nuevo" in text
+    assert "puedes revocarla desde la web" in text
+    assert "no lo menciones" not in text
     # El flag cae bajo el permiso `init *` que ya existía: no hace falta ningún permiso nuevo.
     assert len(_allowed_tools(INIT_SKILL)) == 3
 
@@ -294,3 +306,6 @@ def test_readme_documents_the_new_account_flag() -> None:
     assert "--new-account" in text
     assert "Conectar con otra cuenta" in text
     assert "No soy yo, cambiar de cuenta" in text
+    assert "solo cuando la apruebas" in text
+    assert "los demás proyectos" in text
+    assert "olvida en este equipo" not in text

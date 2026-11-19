@@ -1036,7 +1036,7 @@ def test_wait_without_pending_and_with_a_rejected_key_starts_the_flow(
 # --- init --new-account: conectar con otra cuenta -----------------------------------------------------------
 
 
-def test_new_account_discards_the_stored_key_and_starts_a_fresh_approval(
+def test_new_account_keeps_the_stored_key_until_the_new_approval_succeeds(
     home, project, server, fake_claude, fake_device, capsys
 ) -> None:
     key = save_key("analista@demo.test", server.url)
@@ -1047,24 +1047,26 @@ def test_new_account_discards_the_stored_key_and_starts_a_fresh_approval(
     assert "BAAS_APPROVAL_PENDING" in out
     assert key not in out
     assert_plain_message(out)
-    assert "BAAS_API_KEY" not in paths_().env_file.read_text()
-    assert envfile.read_env(paths_())[0]["BAAS_APP_URL"] == server.url
+    assert envfile.read_env(paths_())[0]["BAAS_API_KEY"] == key  # el MCP y /baas-sync siguen funcionando
     assert paths_().pending_file.exists()
     assert len(fake_device.start_calls) == 1
 
 
-def test_new_account_replaces_a_live_pending_flow_but_a_repeat_reuses_its_own(
+def test_new_account_always_starts_a_new_flow_even_with_a_live_pending_one(
     home, project, server, fake_device, capsys
 ) -> None:
     save_key("analista@demo.test", server.url)
-    seed_pending(app_url=server.url)  # una conexión a medias de antes, con la clave de otra cuenta guardada
+    seed_pending(app_url=server.url)  # una conexión a medias de antes
+    before = device.load_pending(paths_(), now=time.time())
     assert run(init(project, "--new-account"), capsys)[0] == 20
     assert len(fake_device.start_calls) == 1  # no se reutiliza el enlace anterior
     assert run(init(project, "--new-account"), capsys)[0] == 20
-    assert len(fake_device.start_calls) == 1  # ya sin clave guardada: se reutiliza el enlace de esta ejecución
+    assert len(fake_device.start_calls) == 2  # tampoco el de la ejecución anterior
+    assert device.load_pending(paths_(), now=time.time()) is not None
+    assert before is not None
 
 
-def test_new_account_then_wait_approved_binds_the_new_key(
+def test_new_account_then_wait_approved_binds_the_new_account(
     home, project, server, fake_claude, fake_device, capsys
 ) -> None:
     old = save_key("analista@demo.test", server.url)
@@ -1079,8 +1081,25 @@ def test_new_account_then_wait_approved_binds_the_new_key(
     settings = json.loads((project / ".claude/settings.local.json").read_text())["env"]
     assert f"X-Baas-Api-Key: {new_key}" in settings["ANTHROPIC_CUSTOM_HEADERS"]
     assert old not in json.dumps(settings)
+    assert json.loads((project / ".claude/baas.local.json").read_text())["user_email"] == "multi@demo.test"
     assert new_key not in out
     assert old not in out
+
+
+@pytest.mark.parametrize(("outcome", "code"), [("denied", 22), ("expired", 23)])
+def test_abandoned_new_account_leaves_the_old_key_and_a_plain_init_is_unchanged(
+    home, project, server, fake_claude, fake_device, capsys, outcome, code
+) -> None:
+    key = save_key("analista@demo.test", server.url)
+    assert last_line(run(init(project), capsys)[1]) == "[BAAS_RESULT linked]"
+    assert run(init(project, "--new-account"), capsys)[0] == 20
+    fake_device.wait_result = device.DevicePoll(outcome)
+    assert run(init(project, "--wait"), capsys)[0] == code
+    assert envfile.read_env(paths_())[0]["BAAS_API_KEY"] == key
+    assert not paths_().pending_file.exists()
+    again_code, out = run(init(project), capsys)
+    assert again_code == 0, out
+    assert last_line(out) == "[BAAS_RESULT unchanged]"
 
 
 def test_new_account_failing_to_reach_the_server_keeps_the_stored_key(

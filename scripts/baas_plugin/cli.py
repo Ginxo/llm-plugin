@@ -216,18 +216,15 @@ def _pending_notice(flow: device.PendingFlow) -> NoReturn:
     )
 
 
-def _start_flow(paths: BaasPaths, proj: Path, app_url: str, *, discard_key: bool = False) -> NoReturn:
+def _start_flow(paths: BaasPaths, proj: Path, app_url: str, *, fresh: bool = False) -> NoReturn:
     """Termina con el enlace de aprobación (código 20): el de la conexión pendiente si sigue viva y es de este
-    servidor (mismo enlace y código, sin abrir otra pestaña); si no, pide uno nuevo. Con `discard_key` (otra cuenta)
-    no se reutiliza ningún enlace anterior y, solo cuando el servidor ha respondido, se olvida la clave guardada."""
-    if not discard_key:
+    servidor (mismo enlace y código, sin abrir otra pestaña); si no, pide uno nuevo. Con `fresh` (otra cuenta) nunca
+    se reutiliza un enlace anterior: se pide uno nuevo y sustituye al pendiente. La clave guardada no se toca aquí."""
+    if not fresh:
         live = device.load_pending(paths, now=time.time())
         if live is not None and normalize_app_url(live.app_url) == app_url:
             _pending_notice(live)
-    flow = device.start(app_url, _client_name(proj))  # NetworkError (código 6): nada se guarda ni se olvida
-    if discard_key:
-        remove_env_keys(paths, ["BAAS_API_KEY"])  # solo local: la clave anterior sigue valiendo para otros proyectos
-        device.clear_pending(paths)
+    flow = device.start(app_url, _client_name(proj))  # NetworkError (código 6): nada se guarda
     update_env(paths, {"BAAS_APP_URL": app_url})
     pending = device.PendingFlow(
         app_url, flow.device_code, flow.user_code, flow.verification_url, time.time() + flow.expires_in, flow.interval
@@ -280,11 +277,11 @@ def _init(args: argparse.Namespace, paths: BaasPaths, values: dict[str, str], ap
     hs = None
     api_key: str | None = None
     via_approval = False
-    if args.new_account and not args.wait and values.get("BAAS_API_KEY", "").strip():
-        # Otra cuenta: se ignora la clave guardada y se pide una aprobación nueva. Sin clave guardada (p. ej. ya se
-        # descartó en una ejecución anterior y el enlace sigue vivo) es un `init` normal y se reutiliza ese enlace.
-        values = {k: v for k, v in values.items() if k != "BAAS_API_KEY"}
-        _start_flow(paths, proj, app_url, discard_key=True)
+    if args.new_account and not args.wait:
+        # Otra cuenta: se ignora la clave guardada y se pide una aprobación nueva (siempre un enlace nuevo). La clave
+        # de siempre NO se borra: la usan el MCP, la sincronización y los demás proyectos, y si la persona abandona,
+        # un `init` normal sigue diciendo «ya conectado». Solo una aprobación correcta la sustituye (`--wait`).
+        _start_flow(paths, proj, app_url, fresh=True)
     if args.wait:
         api_key = _await_approval(paths, app_url)
         via_approval = api_key is not None
@@ -565,7 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--new-account",
         action="store_true",
-        help="Ignora la clave guardada y pide aprobar la conexión de nuevo (para conectar con otra cuenta)",
+        help="Pide aprobar la conexión de nuevo con otra cuenta; la clave guardada solo se sustituye si se aprueba",
     )
     p.add_argument("--wait", action="store_true", help="Espera (hasta 90 s) la aprobación en el navegador y termina")
     p.set_defaults(func=cmd_init)
