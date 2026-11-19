@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import stat
@@ -26,7 +27,7 @@ API_KEY = "baas_" + "A" * 43
 CONTRACT_START = {
     "device_code": "dev-code-123",
     "user_code": "KQRT-7MWB",
-    "verification_url": "http://localhost/connect?code=KQRT-7MWB",
+    "verification_url": "",  # lo fija FakeDeviceServer con su propia URL
     "expires_in": 600,
     "interval": 3,
 }
@@ -37,7 +38,7 @@ class FakeDeviceServer:
 
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
-        self.start_response: tuple[int, Any] = (200, dict(CONTRACT_START))
+        self.start_response: tuple[int, Any] = (200, dict(CONTRACT_START))  # se completa abajo con la URL
         self.poll_responses: list[tuple[int, Any, dict[str, str]]] = []
         outer = self
 
@@ -69,6 +70,7 @@ class FakeDeviceServer:
 
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self._httpd.server_address[1]}"
+        self.start_response = (200, {**CONTRACT_START, "verification_url": f"{self.url}/connect?code=KQRT-7MWB"})
         self._thread = threading.Thread(target=self._httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
 
     def __enter__(self) -> FakeDeviceServer:
@@ -86,6 +88,16 @@ def server() -> Iterator[FakeDeviceServer]:
         yield srv
 
 
+FORBIDDEN = ("~/", ".env", "baas.py", "ANTHROPIC_BASE_URL", "BAAS_APP_URL", "HTTP ", "proxy", "hook", "JSON", "exit")
+
+
+def assert_plain(err: BaasError) -> None:
+    text = err.render()
+    for word in FORBIDDEN:
+        assert word not in text, (word, text)
+    assert err.message.strip()
+
+
 # --- start -------------------------------------------------------------------------------------
 
 
@@ -94,7 +106,7 @@ def test_start_parses_contract(server: FakeDeviceServer) -> None:
     assert flow == device.DeviceStart(
         device_code="dev-code-123",
         user_code="KQRT-7MWB",
-        verification_url="http://localhost/connect?code=KQRT-7MWB",
+        verification_url=f"{server.url}/connect?code=KQRT-7MWB",
         expires_in=600,
         interval=3,
     )
@@ -104,16 +116,15 @@ def test_start_parses_contract(server: FakeDeviceServer) -> None:
 def test_start_without_server_is_network_error_in_plain_spanish() -> None:
     with pytest.raises(NetworkError) as exc:
         device.start("http://127.0.0.1:9", "x", timeout=2)
-    text = exc.value.render()
-    for forbidden in ("~/", ".env", "baas.py", "ANTHROPIC_BASE_URL", "BAAS_APP_URL"):
-        assert forbidden not in text
+    assert_plain(exc.value)
 
 
 @pytest.mark.parametrize("status", [429, 500, 503])
 def test_start_server_errors_are_network_errors(server: FakeDeviceServer, status: int) -> None:
     server.start_response = (status, {})
-    with pytest.raises(NetworkError):
+    with pytest.raises(NetworkError) as exc:
         device.start(server.url, "x")
+    assert_plain(exc.value)
 
 
 @pytest.mark.parametrize(
@@ -122,6 +133,7 @@ def test_start_server_errors_are_network_errors(server: FakeDeviceServer, status
         {"device_code": "d"},
         {**CONTRACT_START, "expires_in": "diez"},
         {**CONTRACT_START, "verification_url": "ftp://x/connect"},
+        {**CONTRACT_START, "verification_url": ""},
         {**CONTRACT_START, "device_code": ""},
         ["no", "es", "un", "objeto"],
         b"<html>no es json</html>",
@@ -129,8 +141,45 @@ def test_start_server_errors_are_network_errors(server: FakeDeviceServer, status
 )
 def test_start_rejects_responses_outside_the_contract(server: FakeDeviceServer, payload: Any) -> None:
     server.start_response = (200, payload)
-    with pytest.raises(NetworkError):
+    with pytest.raises(NetworkError) as exc:
         device.start(server.url, "x")
+    assert_plain(exc.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example.com/connect?code=KQRT-7MWB",  # otro host
+        "http://localhost:{port}/connect",  # localhost no es 127.0.0.1
+        "http://127.0.0.1:1/connect",  # otro puerto
+        "https://127.0.0.1:{port}/connect",  # otro esquema
+        "http://127.0.0.1.evil.test:{port}/connect",
+        "http://user@evil.example.com:{port}/connect",
+        "//127.0.0.1:{port}/connect",
+        "javascript:alert(1)",
+    ],
+)
+def test_start_rejects_verification_url_of_another_origin(server: FakeDeviceServer, url: str) -> None:
+    port = server.url.rsplit(":", 1)[1]
+    server.start_response = (200, {**CONTRACT_START, "verification_url": url.format(port=port)})
+    with pytest.raises(NetworkError) as exc:
+        device.start(server.url, "x")
+    assert "no es la esperada" in exc.value.message
+    assert "evil" not in exc.value.render()
+    assert_plain(exc.value)
+
+
+def test_is_trusted_link_rules() -> None:
+    ok = device.is_trusted_link
+    assert ok("https://app.example.com/connect?code=A", "https://app.example.com")
+    assert ok("https://APP.example.com:443/connect", "https://app.example.com/")
+    assert ok("http://localhost:8000/connect", "http://localhost:8000")
+    assert ok("http://127.0.0.1:8000/connect", "http://127.0.0.1:8000")
+    assert not ok("https://app.example.com:8443/connect", "https://app.example.com")
+    assert not ok("http://app.example.com/connect", "http://app.example.com")  # http fuera de local
+    assert not ok("http://localhost:8000/connect", "http://127.0.0.1:8000")
+    assert not ok("https://app.example.com/connect", "no es una url")
+    assert not ok("https://app.example.com:abc/connect", "https://app.example.com")
 
 
 # --- poll --------------------------------------------------------------------------------------
@@ -175,6 +224,19 @@ def test_poll_unexpected_responses_are_network_errors(
     with pytest.raises(NetworkError) as exc:
         device.poll(server.url, "c")
     assert API_KEY not in exc.value.render()
+    assert_plain(exc.value)
+
+
+@pytest.mark.parametrize("error", [http.client.IncompleteRead(b"abc"), http.client.BadStatusLine("x")])
+def test_http_protocol_errors_are_plain_network_errors(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(device.httpclient, "post_json", boom)
+    for call in (lambda: device.start("http://127.0.0.1:9", "x"), lambda: device.poll("http://127.0.0.1:9", "c")):
+        with pytest.raises(NetworkError) as exc:
+            call()
+        assert_plain(exc.value)
 
 
 def test_poll_without_server_is_network_error() -> None:
@@ -217,6 +279,63 @@ def test_wait_returns_pending_when_time_runs_out(server: FakeDeviceServer) -> No
     assert result.status == "pending"
     assert sum(clock.sleeps) <= 10
     assert len(server.requests) >= 2
+
+
+def test_wait_survives_a_transient_failure(server: FakeDeviceServer) -> None:
+    server.poll_responses = [
+        (500, {}, {}),
+        (200, {"status": "pending"}, {}),
+        (200, {"status": "approved", "api_key": API_KEY, "email": "ana@demo.test"}, {}),
+    ]
+    clock = Clock()
+    result = device.wait(server.url, "c", interval=3, max_seconds=60, sleep=clock.sleep, now=clock.now)
+    assert result.status == "approved"
+    assert clock.sleeps == [3, 3]
+
+
+def test_wait_gives_up_after_three_consecutive_failures(server: FakeDeviceServer) -> None:
+    server.poll_responses = [(502, {}, {})] * 3 + [(200, {"status": "denied"}, {})]
+    clock = Clock()
+    with pytest.raises(NetworkError) as exc:
+        device.wait(server.url, "c", interval=3, max_seconds=600, sleep=clock.sleep, now=clock.now)
+    assert_plain(exc.value)
+    assert len(server.requests) == 3
+
+
+def test_wait_failures_reset_after_a_successful_poll(server: FakeDeviceServer) -> None:
+    server.poll_responses = [
+        (500, {}, {}),
+        (500, {}, {}),
+        (200, {"status": "pending"}, {}),
+        (500, {}, {}),
+        (500, {}, {}),
+        (200, {"status": "denied"}, {}),
+    ]
+    clock = Clock()
+    assert (
+        device.wait(server.url, "c", interval=1, max_seconds=600, sleep=clock.sleep, now=clock.now).status == "denied"
+    )
+
+
+def test_wait_raises_last_error_if_time_runs_out_without_any_answer(server: FakeDeviceServer) -> None:
+    server.poll_responses = [(500, {}, {})] * 2
+    clock = Clock()
+    with pytest.raises(NetworkError):
+        device.wait(server.url, "c", interval=5, max_seconds=5, sleep=clock.sleep, now=clock.now)
+
+
+def test_wait_returns_pending_if_time_runs_out_after_a_failure(server: FakeDeviceServer) -> None:
+    server.poll_responses = [(200, {"status": "pending"}, {}), (500, {}, {})]
+    clock = Clock()
+    result = device.wait(server.url, "c", interval=3, max_seconds=5, sleep=clock.sleep, now=clock.now)
+    assert result.status == "pending"
+
+
+def test_wait_clamps_interval_to_one_second(server: FakeDeviceServer) -> None:
+    server.poll_responses = [(200, {"status": "pending"}, {}), (200, {"status": "denied"}, {})]
+    clock = Clock()
+    device.wait(server.url, "c", interval=0, max_seconds=60, sleep=clock.sleep, now=clock.now)
+    assert clock.sleeps == [1]
 
 
 @pytest.mark.parametrize("status", ["denied", "expired"])
@@ -265,6 +384,7 @@ def test_pending_roundtrip_is_private(paths: BaasPaths) -> None:
     assert paths.pending_file == pending_file
     if os.name == "posix":
         assert stat.S_IMODE(pending_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(paths.root.stat().st_mode) == 0o700
     assert device.load_pending(paths, now=999.0) == _flow()
     assert list(paths.root.glob(".pending.json.*")) == []  # sin temporales
 
@@ -291,6 +411,32 @@ def test_pending_damaged_returns_none_and_deletes(paths: BaasPaths, content: str
     paths.pending_file.write_text(content, encoding="utf-8")
     assert device.load_pending(paths, now=0.0) is None
     assert not paths.pending_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("app_url", "link"),
+    [
+        ("https://app.example.com", "https://evil.example.com/connect?code=KQRT-7MWB"),
+        ("https://app.example.com", "http://app.example.com/connect"),
+        ("http://app.example.com", "http://app.example.com/connect"),
+        ("no es una url", "https://app.example.com/connect"),
+    ],
+)
+def test_pending_with_untrusted_urls_is_treated_as_corrupt(paths: BaasPaths, app_url: str, link: str) -> None:
+    device.save_pending(paths, device.PendingFlow(app_url, "dev", "KQRT-7MWB", link, 1000.0))
+    assert device.load_pending(paths, now=0.0) is None
+    assert not paths.pending_file.exists()
+
+
+def test_clear_pending_swallows_os_errors(paths: BaasPaths, monkeypatch: pytest.MonkeyPatch) -> None:
+    device.save_pending(paths, _flow())
+
+    def refuse(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError("no")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    device.clear_pending(paths)  # no lanza
+    assert device.load_pending(paths, now=2000.0) is None  # caducado: tampoco lanza
 
 
 def test_load_pending_without_file_is_none(paths: BaasPaths) -> None:

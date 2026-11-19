@@ -5,17 +5,19 @@ La API key solo viaja en la respuesta del último `poll`; aquí nunca se escribe
 
 from __future__ import annotations
 
+import contextlib
+import http.client
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from . import defaults, httpclient
 from .envfile import BaasPaths, atomic_write, ensure_private_dir, normalize_app_url
-from .errors import NetworkError
+from .errors import ConfigError, NetworkError
 
 START_PATH = "/api/v1/plugin/device/start"
 POLL_PATH = "/api/v1/plugin/device/poll"
@@ -25,6 +27,7 @@ _UNREACHABLE = "No he podido conectar con BaaS-AI-IP."
 _UNREACHABLE_HINT = "Comprueba tu conexión a internet e inténtalo de nuevo en unos minutos."
 _UNEXPECTED = "BaaS-AI-IP ha respondido algo que no esperaba."
 _UNEXPECTED_HINT = "Inténtalo de nuevo en unos minutos; si sigue pasando, avisa a quien administra BaaS-AI-IP."
+MAX_CONSECUTIVE_FAILURES = 3  # fallos de red seguidos que `wait` tolera antes de rendirse
 
 
 @dataclass(frozen=True)
@@ -50,7 +53,7 @@ def _unexpected() -> NetworkError:
 def _post(url: str, payload: dict[str, Any], timeout: float) -> httpclient.Response:
     try:
         return httpclient.post_json(url, payload, timeout=timeout)
-    except NetworkError as exc:
+    except (NetworkError, http.client.HTTPException) as exc:
         raise NetworkError(_UNREACHABLE, hint=_UNREACHABLE_HINT) from exc
 
 
@@ -64,6 +67,29 @@ def _json_object(resp: httpclient.Response) -> dict[str, Any]:
     return body
 
 
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """(esquema, host, puerto efectivo) de una URL, o `None` si no se puede interpretar."""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None
+    return (parts.scheme, host, port) if host and parts.scheme in ("http", "https") else None
+
+
+def is_trusted_link(verification_url: str, app_url: str) -> bool:
+    """El enlace de aprobación debe apuntar al mismo esquema, host y puerto que la webapp, y ser https
+    salvo en desarrollo local (misma regla que `normalize_app_url`). Evita que un servidor engañado o
+    comprometido dirija a la persona a otra página."""
+    try:
+        normalize_app_url(verification_url)
+        app = _origin(normalize_app_url(app_url))
+    except ConfigError:
+        return False
+    return app is not None and _origin(verification_url) == app
+
+
 def _nonempty_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -74,7 +100,8 @@ def _positive_int(value: Any) -> int | None:
 
 def start(app_url: str, client_name: str, *, timeout: float = 15) -> DeviceStart:
     """Pide un código de aprobación. `NetworkError` si no hay servidor o la respuesta no es del contrato."""
-    resp = _post(normalize_app_url(app_url) + START_PATH, {"client_name": client_name}, timeout)
+    base = normalize_app_url(app_url)
+    resp = _post(base + START_PATH, {"client_name": client_name}, timeout)
     if resp.status == 429:
         raise NetworkError(
             "Se han pedido demasiadas conexiones seguidas a BaaS-AI-IP.", hint="Espera un minuto e inténtalo de nuevo."
@@ -87,11 +114,13 @@ def start(app_url: str, client_name: str, *, timeout: float = 15) -> DeviceStart
     url = _nonempty_str(body.get("verification_url"))
     expires_in = _positive_int(body.get("expires_in"))
     interval = _positive_int(body.get("interval"))
-    if not (device_code and user_code and url and expires_in and interval) or urlsplit(url).scheme not in (
-        "http",
-        "https",
-    ):
+    if not (device_code and user_code and url and expires_in and interval):
         raise _unexpected()
+    if not is_trusted_link(url, base):
+        raise NetworkError(
+            "La dirección de aprobación que ha enviado el servidor no es la esperada, así que no la abro.",
+            hint="Avisa a quien administra BaaS-AI-IP.",
+        )
     return DeviceStart(device_code, user_code, url, expires_in, interval)
 
 
@@ -138,13 +167,28 @@ def wait(
 ) -> DevicePoll:
     """Sondea hasta que el estado deje de ser `pending`; si se agota `max_seconds` devuelve `pending`."""
     started = now()
+    failures = 0
+    answered = False
+    last_error: NetworkError | None = None
     while True:
-        result, retry_after = _poll(app_url, device_code, 15)
-        if result.status != "pending":
-            return result
-        delay = max(float(interval), retry_after)
+        retry_after = 0.0
+        try:
+            result, retry_after = _poll(app_url, device_code, 15)
+        except NetworkError as exc:  # un fallo puntual (paquete perdido, 502) no debe tirar la espera
+            failures += 1
+            last_error = exc
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                raise
+        else:
+            failures = 0
+            answered = True
+            if result.status != "pending":
+                return result
+        delay = max(float(max(interval, 1)), retry_after)
         if now() - started + delay > max_seconds:
-            return result
+            if not answered and last_error is not None:
+                raise last_error
+            return DevicePoll("pending")
         sleep(delay)
 
 
@@ -162,11 +206,12 @@ class PendingFlow:
 
 def save_pending(paths: BaasPaths, flow: PendingFlow) -> None:
     ensure_private_dir(paths.root)
-    atomic_write(paths.pending_file, json.dumps(flow.__dict__, ensure_ascii=False) + "\n")
+    atomic_write(paths.pending_file, json.dumps(asdict(flow), ensure_ascii=False) + "\n")
 
 
 def clear_pending(paths: BaasPaths) -> None:
-    paths.pending_file.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):  # mejor esfuerzo: un fichero que no se puede borrar no rompe el flujo
+        paths.pending_file.unlink(missing_ok=True)
 
 
 def _parse_pending(raw: str) -> PendingFlow | None:
@@ -195,7 +240,11 @@ def load_pending(paths: BaasPaths, *, now: float) -> PendingFlow | None:
         clear_pending(paths)
         return None
     flow = _parse_pending(raw)
-    if flow is None or flow.expires_at <= now:
+    if (
+        flow is None
+        or flow.expires_at <= now
+        or not is_trusted_link(flow.verification_url, flow.app_url)  # también valida app_url
+    ):
         clear_pending(paths)
         return None
     return flow
