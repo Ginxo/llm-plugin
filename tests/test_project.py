@@ -171,6 +171,39 @@ def test_repair_missing_file_is_noop(project: Path) -> None:
 
 def test_gitignore_can_cover_the_backups(project: Path) -> None:
     added = pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES)
-    assert ".claude/settings.local.json.bak" in added
-    assert ".claude/baas.local.json.bak" in added
+    assert ".claude/settings.local.json.bak*" in added
+    assert ".claude/baas.local.json.bak*" in added
     assert pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES) == []
+
+
+def test_repair_never_overwrites_an_earlier_backup(project: Path) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "settings.local.json"
+    for content in ("uno roto", "dos roto", "tres roto"):
+        path.write_text(content)
+        assert pc.repair_json_file(path) is True
+    names = {p.name: p.read_text() for p in (project / ".claude").iterdir()}
+    assert names == {
+        "settings.local.json.bak": "uno roto",
+        "settings.local.json.bak.1": "dos roto",
+        "settings.local.json.bak.2": "tres roto",
+    }
+
+
+def test_backups_exist_detects_any_numbered_copy(project: Path) -> None:
+    assert pc.backups_exist(project) is False
+    (project / ".claude").mkdir()
+    assert pc.backups_exist(project) is False
+    (project / ".claude" / "baas.local.json.bak.3").write_text("x")
+    assert pc.backups_exist(project) is True
+    assert pc.backups_exist(project / "no-existe") is False
+
+
+def test_backup_pattern_ignores_numbered_copies(project: Path) -> None:
+    _git(project, "init", "-q")
+    pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES)
+    (project / ".claude").mkdir()
+    for name in ("settings.local.json.bak", "settings.local.json.bak.1", "baas.local.json.bak.2"):
+        (project / ".claude" / name).write_text("clave")
+    res = subprocess.run(["git", "-C", str(project), "status", "--porcelain", "-uall"], capture_output=True, text=True)
+    assert ".claude" not in res.stdout

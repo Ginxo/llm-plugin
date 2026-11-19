@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -68,8 +69,11 @@ def init(project: Path, *extra: str) -> list[str]:
 
 @pytest.fixture(autouse=True)
 def opened_urls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Nunca se abre un navegador de verdad; se anota qué enlaces se habrían abierto."""
+    """Nunca se abre un navegador de verdad; se anota qué enlaces se habrían abierto (con pantalla simulada)."""
     urls: list[str] = []
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.setattr(cli.webbrowser, "open", lambda url, *a, **k: urls.append(url) or True)
     return urls
 
@@ -182,10 +186,30 @@ def test_init_zero_orgs_warns(home, project, server, fake_claude, capsys) -> Non
     assert not (project / ".claude").exists()
 
 
+def assert_plain_network_error(out: str) -> None:
+    assert "BAAS_NETWORK_ERROR" in out
+    assert_plain_message(out)
+    for fragment in ("127.0.0.1", "http", "handshake", "HTTP", "Traceback"):
+        assert fragment not in out, fragment
+
+
 def test_init_without_network(home, project, fake_claude, capsys) -> None:
     save_key("analista@demo.test", "http://127.0.0.1:9")
-    code, _ = run(init(project), capsys)
+    code, out = run(init(project), capsys)
     assert code == 6
+    assert_plain_network_error(out)
+    assert list(project.iterdir()) == []
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_init_handshake_server_errors_are_plain(home, project, server, fake_claude, capsys, status) -> None:
+    save_key("analista@demo.test", server.url)
+    server.state.handshake_status = status
+    code, out = run(init(project), capsys)
+    assert code == 6
+    assert_plain_network_error(out)
+    assert list(project.iterdir()) == []
+    assert envfile.read_env(paths_())[0].get("BAAS_API_KEY")  # una caída del servidor no descarta la clave
 
 
 @pytest.mark.parametrize(
@@ -529,6 +553,151 @@ def test_init_valid_config_is_not_reported_as_repaired(home, project, server, fa
     assert code == 0
     assert "reparado" not in out
     assert not (project / ".claude/settings.local.json.bak").exists()
+
+
+# --- reparaciones y copias --------------------------------------------------------------------
+
+
+def test_init_org_selection_exit_leaves_damaged_files_untouched(home, project, server, fake_claude, capsys) -> None:
+    save_key("multi@demo.test", server.url)
+    (project / ".claude").mkdir()
+    (project / ".claude/settings.local.json").write_text("{roto")
+    (project / ".claude/baas.local.json").write_text("también roto")
+    code, out = run(init(project), capsys)
+    assert code == 3
+    assert "reparado" not in out
+    assert (project / ".claude/settings.local.json").read_text() == "{roto"
+    assert (project / ".claude/baas.local.json").read_text() == "también roto"
+    assert sorted(p.name for p in (project / ".claude").iterdir()) == ["baas.local.json", "settings.local.json"]
+    assert not (project / ".gitignore").exists()
+    # elegida la organización, ya sí se repara y se ignoran las copias
+    assert run(init(project, "--org", "otra"), capsys)[0] == 0
+    assert (project / ".claude/settings.local.json.bak").read_text() == "{roto"
+    assert ".claude/settings.local.json.bak*" in (project / ".gitignore").read_text()
+
+
+def test_init_no_organizations_exit_leaves_damaged_files_untouched(home, project, server, fake_claude, capsys) -> None:
+    save_key("sinorg@demo.test", server.url)
+    (project / ".claude").mkdir()
+    (project / ".claude/settings.local.json").write_text("{roto")
+    code, _ = run(init(project), capsys)
+    assert code == 4
+    assert (project / ".claude/settings.local.json").read_text() == "{roto"
+    assert not (project / ".claude/settings.local.json.bak").exists()
+
+
+def test_init_ignores_preexisting_backups_on_next_run(home, project, server, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    (project / ".claude").mkdir()
+    (project / ".claude/settings.local.json.bak").write_text("copia con clave")
+    (project / ".gitignore").write_text("node_modules/\n")
+    assert run(init(project), capsys)[0] == 0
+    gitignore = (project / ".gitignore").read_text()
+    assert ".claude/settings.local.json.bak*" in gitignore
+    assert ".claude/baas.local.json.bak*" in gitignore
+    assert "node_modules/" in gitignore
+
+
+def test_init_without_backups_does_not_add_backup_patterns(home, project, server, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(init(project), capsys)[0] == 0
+    assert ".bak" not in (project / ".gitignore").read_text()
+
+
+def test_init_keeps_earlier_backups_on_second_repair(home, project, server, fake_claude, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    (project / ".claude").mkdir()
+    (project / ".claude/settings.local.json").write_text("primero roto")
+    assert run(init(project), capsys)[0] == 0
+    (project / ".claude/settings.local.json").write_text("segundo roto")
+    assert run(init(project), capsys)[0] == 0
+    assert (project / ".claude/settings.local.json.bak").read_text() == "primero roto"
+    assert (project / ".claude/settings.local.json.bak.1").read_text() == "segundo roto"
+
+
+# --- enlace pendiente, navegador y clave revocada ---------------------------------------------
+
+
+def test_second_init_reuses_the_live_pending_link(home, project, fake_device, opened_urls, capsys) -> None:
+    code, _ = run(init(project, "--app-url", APP), capsys)
+    assert code == 20
+    assert len(fake_device.start_calls) == 1
+    assert opened_urls == [LINK]
+
+    code, second = run(init(project), capsys)
+    assert code == 20
+    assert "BAAS_APPROVAL_PENDING" in second
+    assert LINK in second
+    assert USER_CODE in second
+    assert len(fake_device.start_calls) == 1  # no se pidió otro código
+    assert opened_urls == [LINK]  # y no se abrió otra pestaña
+
+
+def test_init_with_another_url_does_not_reuse_the_pending_link(home, project, fake_device, capsys) -> None:
+    seed_pending(app_url="https://otra.example.com")
+    code, _ = run(init(project, "--app-url", APP), capsys)
+    assert code == 20
+    assert len(fake_device.start_calls) == 1
+    assert json.loads(paths_().pending_file.read_text())["app_url"] == APP
+
+
+def test_init_with_expired_pending_requests_a_new_link(home, project, fake_device, capsys) -> None:
+    seed_pending(expires_at=time.time() - 1)
+    assert run(init(project), capsys)[0] == 20
+    assert len(fake_device.start_calls) == 1
+
+
+def test_browser_is_not_opened_on_linux_without_a_display(home, project, fake_device, opened_urls, monkeypatch, capsys):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    code, out = run(init(project, "--app-url", APP), capsys)
+    assert code == 20
+    assert LINK in out  # el enlace se muestra igualmente
+    assert opened_urls == []
+
+
+@pytest.mark.parametrize("variable", ["DISPLAY", "WAYLAND_DISPLAY"])
+def test_browser_is_opened_on_linux_with_a_display(
+    home, project, fake_device, opened_urls, monkeypatch, capsys, variable
+):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setenv(variable, "wayland-0")
+    assert run(init(project, "--app-url", APP), capsys)[0] == 20
+    assert opened_urls == [LINK]
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_browser_is_opened_on_desktop_platforms_without_display_variables(
+    home, project, fake_device, opened_urls, monkeypatch, capsys, platform
+):
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(cli.sys, "platform", platform)
+    assert run(init(project, "--app-url", APP), capsys)[0] == 20
+    assert opened_urls == [LINK]
+
+
+def test_a_hanging_browser_does_not_block_the_flow(home, project, fake_device, monkeypatch, capsys) -> None:
+    release = threading.Event()
+    monkeypatch.setattr(cli, "BROWSER_GRACE", 0.05)
+    monkeypatch.setattr(cli.webbrowser, "open", lambda *a, **k: release.wait(5))
+    started = time.monotonic()
+    code, out = run(init(project, "--app-url", APP), capsys)
+    release.set()
+    assert code == 20
+    assert LINK in out
+    assert time.monotonic() - started < 2
+
+
+def test_revoked_key_line_is_removed_from_env(home, project, server, fake_device, capsys) -> None:
+    old = save_key("nadie@demo.test", server.url)
+    with paths_().env_file.open("a") as fh:
+        fh.write("OTRA=valor\n")
+    assert run(init(project), capsys)[0] == 20
+    text = paths_().env_file.read_text()
+    assert "BAAS_API_KEY" not in text
+    assert old not in text
+    assert "OTRA=valor" in text
+    assert f"BAAS_APP_URL={server.url}" in text
 
 
 # --- set-key ----------------------------------------------------------------------------------

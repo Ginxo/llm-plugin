@@ -46,6 +46,11 @@ class DevicePoll:
     email: str | None = None
 
 
+def unreachable() -> NetworkError:
+    """El error llano de «no hay conexión con el servidor»: sin URLs, rutas ni jerga."""
+    return NetworkError(_UNREACHABLE, hint=_UNREACHABLE_HINT)
+
+
 def _unexpected() -> NetworkError:
     return NetworkError(_UNEXPECTED, hint=_UNEXPECTED_HINT)
 

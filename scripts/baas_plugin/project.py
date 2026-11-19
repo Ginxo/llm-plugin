@@ -24,7 +24,8 @@ BINDING = ".claude/baas.local.json"
 GITIGNORE_ENTRIES = (SETTINGS_LOCAL, BINDING)
 BACKUP_SUFFIX = ".bak"
 # La copia de un fichero dañado puede conservar la clave: se ignora igual que el original.
-BACKUP_ENTRIES = tuple(entry + BACKUP_SUFFIX for entry in GITIGNORE_ENTRIES)
+# (`.bak`, `.bak.1`, `.bak.2`…): el patrón con `*` las cubre todas.
+BACKUP_ENTRIES = tuple(entry + BACKUP_SUFFIX + "*" for entry in GITIGNORE_ENTRIES)
 HEADER_NAME = "X-Baas-Api-Key"
 GITIGNORE_COMMENT = "# BaaS-AI-IP (plugin baas): configuración local con credenciales; no versionar"
 
@@ -71,8 +72,18 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _free_backup(path: Path) -> Path:
+    """`<nombre>.bak`, o `.bak.1`, `.bak.2`… si ya hay una copia: nunca se pisa una copia anterior."""
+    base = path.with_name(path.name + BACKUP_SUFFIX)
+    candidate, n = base, 0
+    while candidate.exists():
+        n += 1
+        candidate = path.with_name(f"{base.name}.{n}")
+    return candidate
+
+
 def repair_json_file(path: Path) -> bool:
-    """Si `path` existe pero no es un objeto JSON válido, lo guarda como `<nombre>.bak` (0600) y devuelve `True`;
+    """Si `path` existe pero no es un objeto JSON válido, lo guarda como copia `.bak` (0600) y devuelve `True`;
     así el siguiente `write_*` lo regenera en vez de fallar. Un fichero válido o inexistente no se toca."""
     if not path.exists():
         return False
@@ -82,11 +93,18 @@ def repair_json_file(path: Path) -> bool:
         data = None
     if isinstance(data, dict):
         return False
-    backup = path.with_name(path.name + BACKUP_SUFFIX)
+    backup = _free_backup(path)
     os.replace(path, backup)
     if os.name == "posix":
         backup.chmod(0o600)
     return True
+
+
+def backups_exist(project: Path) -> bool:
+    """¿Hay copias de ficheros dañados en `.claude/`? (pueden conservar la clave: hay que ignorarlas en git)."""
+    return any(
+        any((project / entry).parent.glob(Path(entry).name + BACKUP_SUFFIX + "*")) for entry in GITIGNORE_ENTRIES
+    )
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> bool:

@@ -2,7 +2,8 @@
 y `export`. Mensajes en español.
 
 Códigos de salida (las skills los interpretan): 0 ok · 2 configuración (falta la clave o la URL)
-· 3 hay que elegir organización · 4 sin organizaciones · 5 clave no válida · 6 red o servidor
+· 3 hay que elegir organización · 4 sin organizaciones · 5 clave no válida (`init` ya no lo produce:
+renueva sola una clave revocada) · 6 red o servidor
 · 7 proyecto inseguro · 8 organización ajena · 9 hash de un fichero no coincide · 10 error del MCP
 · 11 paquete inválido (ruta insegura) · 12 sincronización incompleta · 13 directorio ajeno
 · 20 falta aprobar la conexión en el navegador (hay un enlace) · 21 sigue esperando la aprobación
@@ -19,11 +20,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
+import http.client
 import json
 import os
 import re
 import socket
 import sys
+import threading
 import time
 import webbrowser
 from datetime import datetime, timezone
@@ -41,6 +44,7 @@ from .envfile import (
     missing_key_error,
     normalize_app_url,
     read_env,
+    remove_env_keys,
     update_env,
     validate_api_key,
 )
@@ -53,6 +57,8 @@ from .errors import (
     BaasError,
     ConfigError,
     MissingAppUrlError,
+    NetworkError,
+    ProjectSafetyError,
 )
 
 
@@ -146,27 +152,61 @@ def _client_name(proj: Path) -> str:
     return f"{proj.name or 'proyecto'} en {socket.gethostname()}"[:100]
 
 
-def _open_browser(url: str) -> None:
-    with contextlib.suppress(Exception):  # abrir el navegador es un extra: el enlace siempre se muestra
-        webbrowser.open(url)
-
-
-def _start_flow(paths: BaasPaths, proj: Path, app_url: str) -> NoReturn:
-    """Pide un código de aprobación, lo deja pendiente y termina con el enlace (código 20)."""
-    flow = device.start(app_url, _client_name(proj))  # NetworkError (código 6): la URL aún no se guarda
-    update_env(paths, {"BAAS_APP_URL": app_url})
-    device.save_pending(
-        paths,
-        device.PendingFlow(
-            app_url, flow.device_code, flow.user_code, flow.verification_url, time.time() + flow.expires_in
-        ),
+def _graphical_session() -> bool:
+    """¿Es plausible que haya un navegador de escritorio? En Linux sin pantalla, `webbrowser` puede lanzar uno de
+    consola y bloquear la terminal."""
+    return sys.platform in ("darwin", "win32", "cygwin") or bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
     )
-    _open_browser(flow.verification_url)
+
+
+BROWSER_GRACE = 2.0  # segundos que se le dan al navegador para arrancar antes de seguir sin esperarlo
+
+
+def _open_browser(url: str) -> None:
+    """Intenta abrir el enlace sin bloquear el flujo: hilo aparte, fallos ignorados. El enlace siempre se muestra."""
+    if not _graphical_session():
+        return
+
+    def _open() -> None:
+        with contextlib.suppress(Exception):  # abrir el navegador es un extra
+            webbrowser.open(url)
+
+    thread = threading.Thread(target=_open, daemon=True)
+    thread.start()
+    thread.join(BROWSER_GRACE)  # solo para que el proceso no termine antes de lanzarlo; nunca bloquea más
+
+
+def _handshake(app_url: str, api_key: str) -> handshake.Handshake:
+    """Handshake con los fallos de red en llano (sin URLs ni rutas); una clave revocada sigue siendo `AuthError`."""
+    try:
+        return handshake.perform_handshake(app_url, api_key)
+    except (NetworkError, http.client.HTTPException):
+        raise device.unreachable() from None
+
+
+def _pending_notice(flow: device.PendingFlow) -> NoReturn:
     raise ApprovalPendingError(
         verification_url=flow.verification_url,
         user_code=flow.user_code,
         hint="Cuando hayas aprobado la conexión en el navegador, dímelo y sigo.",
     )
+
+
+def _start_flow(paths: BaasPaths, proj: Path, app_url: str) -> NoReturn:
+    """Termina con el enlace de aprobación (código 20): el de la conexión pendiente si sigue viva y es de este
+    servidor (mismo enlace y código, sin abrir otra pestaña); si no, pide uno nuevo."""
+    live = device.load_pending(paths, now=time.time())
+    if live is not None and normalize_app_url(live.app_url) == app_url:
+        _pending_notice(live)
+    flow = device.start(app_url, _client_name(proj))  # NetworkError (código 6): la URL aún no se guarda
+    update_env(paths, {"BAAS_APP_URL": app_url})
+    pending = device.PendingFlow(
+        app_url, flow.device_code, flow.user_code, flow.verification_url, time.time() + flow.expires_in
+    )
+    device.save_pending(paths, pending)
+    _open_browser(flow.verification_url)
+    _pending_notice(pending)
 
 
 def _await_approval(paths: BaasPaths, app_url: str) -> str | None:
@@ -206,23 +246,35 @@ def cmd_init(args: argparse.Namespace) -> int:
             api_key = stored if API_KEY_RE.match(stored) else None
             if api_key:
                 try:
-                    hs = handshake.perform_handshake(app_url, api_key)
+                    hs = _handshake(app_url, api_key)
                 except AuthError:  # revocada, de otra base de datos o caducada: no es un fallo, se renueva
                     api_key = None
             if api_key is None:
+                remove_env_keys(paths, ["BAAS_API_KEY"])  # para que ni init ni status la vuelvan a probar
                 _p(STALE_KEY_NOTICE)
             elif args.app_url or not values.get("BAAS_APP_URL"):
                 update_env(paths, {"BAAS_APP_URL": app_url})  # solo tras contactar con éxito
     if api_key is None:
         _start_flow(paths, proj, app_url)
     if hs is None:
-        hs = handshake.perform_handshake(app_url, api_key)
+        hs = _handshake(app_url, api_key)
 
+    try:
+        previous = project.read_binding(proj) or {}
+    except ProjectSafetyError:  # dañado: se repara más abajo, ya con la organización elegida
+        previous = {}
+    current = previous.get("org")
+    org = handshake.select_organization(hs, requested=args.org, current=current)
+
+    # Solo ahora se toca el proyecto: una salida 3 o 4 no cambia nada. Las copias de lo dañado pueden llevar la
+    # clave, así que se ignoran en git antes de escribir nada y siempre que existan.
     repaired = [project.repair_json_file(proj / name) for name in project.GITIGNORE_ENTRIES]
     if any(repaired):
         _p(REPAIRED_NOTICE)
-    current = (project.read_binding(proj) or {}).get("org")
-    org = handshake.select_organization(hs, requested=args.org, current=current)
+    ignore = project.GITIGNORE_ENTRIES + (
+        project.BACKUP_ENTRIES if any(repaired) or project.backups_exist(proj) else ()
+    )
+    added = project.ensure_gitignore(proj, ignore)
 
     project.write_settings_local(proj, org.proxy_anthropic_url, api_key)
     project.write_binding(
@@ -237,12 +289,9 @@ def cmd_init(args: argparse.Namespace) -> int:
             "proxy_openai_url": org.proxy_openai_url,
             "bound_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if current != org.slug
-            else (project.read_binding(proj) or {}).get("bound_at"),
+            else previous.get("bound_at"),
             "plugin_version": __version__,
         },
-    )
-    added = project.ensure_gitignore(
-        proj, project.GITIGNORE_ENTRIES + (project.BACKUP_ENTRIES if any(repaired) else ())
     )
     helper = mcp_config.install_headers_helper(paths)
     reg = mcp_config.register_mcp_server(proj, org.mcp_url, mcp_config.helper_command(helper))
@@ -436,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("init", help="Handshake y vinculación del proyecto a una organización")
     p.add_argument("--project", help="Raíz del proyecto (por defecto CLAUDE_PROJECT_DIR o la raíz git)")
     p.add_argument("--org", help="Slug de la organización (obligatorio si perteneces a varias)")
-    p.add_argument("--app-url", help="URL de la webapp (se guarda en ~/baas-ai-ip/.env)")
+    p.add_argument("--app-url", help="URL de la webapp (se recuerda cuando el servidor responde)")
     p.add_argument("--wait", action="store_true", help="Espera (hasta 90 s) la aprobación en el navegador y termina")
     p.set_defaults(func=cmd_init)
 
