@@ -40,6 +40,7 @@ ignore = [
 "tests/test_e2e_h3.py" = ["PT009", "PT027"]
 "tests/test_e2e_h4.py" = ["PT009", "PT027"]
 "tests/test_e2e_uso.py" = ["PT009", "PT027"]
+"tests/test_e2e_acl.py" = ["PT009", "PT027"]
 "dev/**" = ["S603", "S607", "T201"]
 "tools/**" = ["T201"]
 

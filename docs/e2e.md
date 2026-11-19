@@ -291,9 +291,9 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--orgadmin-email` | `orgadmin@demo.test` | ORG_ADMIN de otra organización: debe recibir `404` al cambiar el interruptor y es el primer miembro de la organización que se elimina |
 | `--bypass-org` · `--bypass-email` | `demo` · `analista@demo.test` | Organización con AI-IP apagado |
 | `--anon-org` · `--anon-email` | `privada` · `analista@privada.test` | Organización con AI-IP y anonimizador **encendidos** (la de H3) y su usuario: el tercer modo del grupo `originales` |
-| `--only` | `observacion,interruptor,eliminar,originales,huerfanos,uso` | Partes que se ejecutan (separadas por comas). `huerfanos` crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y los activa por la API: **necesita `BAAS_DEV_SKIP_TOTP=1`**. `uso` (Fase 4) necesita la pila con la observabilidad de uso y `env/dev/mcp-server.env` de `deploy` (ventana de 5 s, foto de disco cada 30 s) |
+| `--only` | `observacion,interruptor,eliminar,originales,huerfanos,uso,acl` | Partes que se ejecutan (separadas por comas). `huerfanos` crea sus propias organizaciones y usuarios (`huerf-<ejecución>-…`) y los activa por la API: **necesita `BAAS_DEV_SKIP_TOTP=1`**. `uso` (Fase 4) necesita la pila con la observabilidad de uso y `env/dev/mcp-server.env` de `deploy` (ventana de 5 s, foto de disco cada 30 s). `acl` (H4-05) necesita la pila con la ACL de Redis de `deploy` y `--inspect` |
 | `--apis` | `messages,chat,responses` | APIs que se prueban |
-| `--inspect` | `auto` | `podman`, `docker` o `auto` (el primero que vea el proyecto) para mirar el vault, las dos instancias de Redis (claves y disco) y la cuarentena del MCP; `none` omite esos pasos (9.1b, 9.8, todo el grupo `originales` y 12.4, 12.5, 12.7, 12.8 y 12.9), que no se registran (con `--only originales` o `uso` lo dice en una nota) |
+| `--inspect` | `auto` | `podman`, `docker` o `auto` (el primero que vea el proyecto) para mirar el vault, las dos instancias de Redis (claves y disco) y la cuarentena del MCP; `none` omite esos pasos (9.1b, 9.8, todo el grupo `originales`, 12.4, 12.5, 12.7, 12.8 y 12.9 y todo el grupo `acl`), que no se registran (con `--only originales`, `uso` o `acl` lo dice en una nota) |
 | `--compose-project` | `$COMPOSE_PROJECT_NAME` o `baas-dev` | Proyecto de compose de la pila |
 | `--mcp-data-dir` | `/data` | `BAAS_DATA_DIR` del contenedor del MCP |
 | `--trace-timeout` | `30` | Segundos de espera de cada traza o de lo que se propaga (bloqueo, eliminación, cuarentena) |
@@ -414,9 +414,25 @@ su organización `uso-<ejecución>-<paso>` con usuarios de la semilla como miemb
 | 12.9 | Con la webapp en pausa se leen un `content.usage` y un `turn.completed` reales; tras consumirlos, se reinyectan con `XADD` (mismo `event_id`) y no cambian nada; lo mismo con un `storage.snapshot` propio inyectado dos veces |
 | 12.10 | 200 pares intercalados de ~2 KB (Messages, bypass) directos al proveedor falso y por el proxy con conexión persistente: el p95 del sobrecoste debe quedar por debajo de 10 ms (objetivo de `fase-1-h4-mediciones.md`). Es un **control grueso**: el proveedor falso añade ~40 ms en muchas respuestas con conexión persistente (Nagle y ACK retardado). Que el proxy **no empeora respecto a la referencia** lo comprueban sus pruebas de sobrecoste en proceso, que no forman parte de este e2e: en `llm-interceptor-proxy`, `GO_IN_CONTAINER=1 scripts/go.sh go test -count=1 -run 'TestBypassOverheadP95\|TestAIIPOverheadP95\|TestObserveOverheadP95' -v ./internal/proxy/` |
 
+**ACL de Redis** (grupo `acl`, H4-05; `dev/e2e_acl.py`, diseño `fase-1-h4-acl-redis-diseno.md` §4 y §8). Con las credenciales
+reales de cada usuario (`redis-cli --user <usuario>` dentro del contenedor de Redis, con `$BAAS_REDIS_<USUARIO>_PASSWORD` de su
+entorno) se intenta lo que la matriz prohíbe y Redis debe responder `NOPERM`. Necesita `--inspect` y la pila con la ACL de `deploy`;
+sin `--inspect` el grupo se omite con una nota. Cada intento va por una conexión llamada `e2e-acl` (`CLIENT SETNAME` antes de la
+orden): así `deploy/scripts/e2e-ci.sh` ignora en `ACL LOG` los rechazos que provoca a propósito este grupo y falla con cualquier
+otro de `webapp`, `proxy`, `mcp` o `monitor`. Los intentos que Redis acepta (un fallo del paso) dejan escrita la clave de prueba
+(`baas:key:e2e-acl`, `baas:member:e2e-acl:demo`…): bórrala como `default`.
+
+| Paso | Qué comprueba |
+| :--- | :--- |
+| 13.1 | `CLIENT LIST` de las dos instancias (sin contar las conexiones desde `127.0.0.1`/`::1`: el *healthcheck* y el `redis-cli` del e2e entran como `default` dentro del contenedor): la persistente tiene conexiones de `webapp`, `proxy` y `mcp`; la efímera, de `webapp` y `proxy`; ninguna como `default` |
+| 13.2 | Como `mcp` en la persistente: `HSET baas:policy:org:demo blocked 0`, `HSET baas:key:e2e-acl user_id x`, `HSET baas:member:e2e-acl:demo governance_role ORG_ADMIN`, `SET baas:platform:status x` y `PUBLISH baas:control x` → todos `NOPERM` |
+| 13.3 | Los mismos cinco intentos como `proxy` → `NOPERM` |
+| 13.4 | `XADD baas:traces * data x` como `webapp` en la efímera → `NOPERM` (solo el proxy escribe trazas); `ACL GETUSER mcp` como `default` en la efímera → vacío (el MCP no tiene usuario allí) |
+| 13.5 | Como `monitor`: `GET baas:platform:status` y `HGETALL baas:policy:org:demo` → `NOPERM` (solo escribe su informe) |
+
 Con podman, `podman start` de `webapp-api` vuelve a ejecutar sus dependencias ya terminadas (`webapp-migrate` y
 `webapp-seed`, idempotentes); `podman restart` no sirve con `podman-compose` (las da por «no arrancadas»). Si una ejecución se corta en el grupo `uso`, puede quedar una organización `uso-<ejecución>-<paso>` (se bloquea y elimina igual desde W3), un servicio en pausa o parado (`podman unpause`/`podman start` de `webapp-api` o `mcp-server`) y, si se corta en 12.8, la retención de métricas en 60 meses (la siguiente ejecución de 12.8 lo avisa; se restaura en Plataforma → Uso). La pila
-simulada (`dev/fake_h4_stack.py`) no simula este grupo: sus utilidades e inspector se prueban en `tests/test_e2e_uso.py`.
+simulada (`dev/fake_h4_stack.py`) no simula este grupo: sus utilidades e inspector se prueban en `tests/test_e2e_uso.py` (y las del grupo `acl`, en `tests/test_e2e_acl.py`).
 
 Los pasos que dependen de uno fallido quedan `SALTADO` (y cuentan como fallo). El bloqueo, la eliminación y la
 cuarentena se esperan hasta `--trace-timeout` s porque llegan a proxy y MCP por Pub/Sub; igual la revocación de claves y

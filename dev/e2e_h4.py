@@ -69,6 +69,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import e2e_acl
 import e2e_h3 as h3
 import e2e_uso
 from e2e_h2 import DEV_PASSWORD, DEV_TOTP_SECRET, Http, Runner, StepError, check, dev_api_key
@@ -79,7 +80,7 @@ from baas_plugin.mcp_client import McpClient
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
 APIS, API_NAMES = h3.APIS, h3.API_NAMES
-GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso")
+GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl")
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
@@ -509,6 +510,9 @@ class Inspector(Protocol):
     def service_control(self, service: str, action: str) -> None: ...
     def service_logs(self, service: str, since: str) -> str: ...
     def mcp_files(self, slug: str) -> list[tuple[str, int]]: ...
+    # Fase 1 H4-05 (grupo «acl»)
+    def redis_as(self, service: str, user: str, command: str) -> str: ...
+    def redis_admin(self, service: str, *args: str) -> str: ...
 
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -608,6 +612,27 @@ class ContainerInspector:
     def _redis_cli(self, service: str, *args: str, check_rc: bool = True) -> str:
         """`redis-cli` dentro del contenedor: se autentica con SU `$BAAS_REDIS_PASSWORD`; `args` son argumentos."""
         return self._exec(service, "sh", "-c", _REDIS_CLI, "sh", *args, check_rc=check_rc)
+
+    def redis_admin(self, service: str, *args: str) -> str:
+        """Como `default` (administrador): `ACL GETUSER`, `CLIENT LIST`… del grupo «acl»."""
+        return self._redis_cli(self._service(service), *args)
+
+    def redis_as(self, service: str, user: str, command: str) -> str:
+        """Ejecuta `command` en Redis como `user` con SU contraseña (la del entorno del contenedor) y devuelve su
+        respuesta. La conexión se llama `e2e-acl` antes de la orden: así el rechazo queda en ACL LOG con ese nombre."""
+        e2e_acl.safe_command(user, command)
+        auth = f'REDISCLI_AUTH="$BAAS_REDIS_{user.upper()}_PASSWORD"'
+        script = (f"printf '%s\\n%s\\n' 'CLIENT SETNAME {e2e_acl.CLIENT_NAME}' \"$1\""
+                  f" | {auth} redis-cli --raw --user {user} 2>&1")  # fmt: skip
+        out = self._exec(self._service(service), "sh", "-c", script, "sh", command, check_rc=False)
+        first, _, rest = out.strip().partition("\n")
+        if first.strip() != "OK":
+            # sin el OK de SETNAME el intento no se hizo (contraseña, conexión o SETNAME denegado): no es un rechazo
+            # de la orden, y sin nombre de cliente `e2e-ci.sh` vería el rechazo como ajeno
+            raise StepError(
+                f"{user} en {service}: CLIENT SETNAME no respondió OK, el intento no se hizo: {first.strip()[:150]!r}"
+            )
+        return rest.strip()
 
     @staticmethod
     def _slug(slug: str) -> str:
@@ -951,6 +976,7 @@ class MissingInspector:
     force_aof_rewrite = disk_contains = redis_set_temp = redis_delete = mcp_org_dirs = mcp_quarantine = _fail
     usage_rows = tagged_rows = usage_dump = source_status = insert_old_usage = snapshot_count = key_exists = _fail
     stream_group = stream_entries = stream_add = stream_has = service_control = service_logs = mcp_files = _fail
+    redis_as = redis_admin = _fail
 
 
 def build_inspector(args: argparse.Namespace) -> Inspector | None:
@@ -2913,12 +2939,14 @@ class E2EH4:
                  self.orph_cleanup, needs=[react_a, visible, react_g, keep])  # fmt: skip
         if uso is not None:
             uso.register(runner, [s0, s1, s3])
+        if "acl" in groups and self.inspector is not None:
+            e2e_acl.register(runner, self, [s0])
 
 
 def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> int:
     args = parse_args(argv)
     runner = Runner()
-    wants_containers = bool({"eliminar", "originales", "uso"} & set(args.only))
+    wants_containers = bool({"eliminar", "originales", "uso", "acl"} & set(args.only))
     inspector = inspector if inspector is not None else build_inspector(args) if wants_containers else None
     e2e = E2EH4(args, inspector)
     print(f"Prueba de punta a punta H4 · webapp {args.app_url} · proveedor falso {args.fake_url}"
@@ -2927,6 +2955,8 @@ def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> i
         print("NOTA: el grupo «originales» mira dentro de los contenedores (--inspect podman|docker): se omite")
     if "uso" in args.only and inspector is None:
         print("NOTA: sin --inspect, el grupo «uso» omite 12.4, 12.5, 12.7, 12.8 y 12.9 (miran o paran contenedores)")
+    if "acl" in args.only and inspector is None:
+        print("NOTA: el grupo «acl» entra en Redis con las credenciales de cada servicio (--inspect): se omite")
     e2e.run(runner)
     report = {**runner.report(), "app_url": args.app_url, "fake_url": args.fake_url, "nonce": e2e.nonce,
               "only": args.only, "apis": args.apis,
