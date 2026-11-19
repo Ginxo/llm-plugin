@@ -3,7 +3,8 @@
 
 Lo lanza un envoltorio que fija `FAKE_ENGINE_STATE` (un JSON con lo que «hay» en la pila y el registro de llamadas).
 Lo que no es Redis ni PostgreSQL **se ejecuta de verdad**: el script de búsqueda de `disk_contains` y `find` corren con
-el `sh` del equipo sobre un directorio temporal que hace de `/data` del contenedor, de modo que los tests prueban el
+el `sh` del equipo sobre un directorio temporal que hace de `/data` del contenedor, y el `python3 -c` de
+`caddy_requests` (`exec -i`, con su entrada estándar) con el intérprete del equipo, de modo que los tests prueban el
 script que se manda a los contenedores y no un resultado enlatado.
 
 Estado (`FAKE_ENGINE_STATE`):
@@ -60,13 +61,19 @@ def _redis_cli(state: dict[str, Any], service: str, args: list[str]) -> tuple[in
     return 1, f"(error) ERR comando no simulado: {args}\n"
 
 
-def handle(state: dict[str, Any], argv: list[str]) -> tuple[int, str]:
+def handle(state: dict[str, Any], argv: list[str], stdin: str | None = None) -> tuple[int, str]:
     if argv[0] == "ps":
         service = next(a for a in argv if a.startswith("label=com.docker.compose.service=")).split("=")[-1]
         return 0, f"cid-{service}\n" if service in state["containers"] else ""
+    if argv[:2] == ["exec", "-i"]:
+        argv = ["exec", *argv[2:]]
     service, rest = argv[1].removeprefix("cid-"), argv[2:]
     if service not in state["containers"]:
         return 1, f"no such container {argv[1]}\n"
+    if rest[:2] == ["python3", "-c"]:  # el script de caddy_requests: se ejecuta de verdad, con su entrada estándar
+        done = subprocess.run([sys.executable, "-I", "-c", rest[2]], input=stdin, capture_output=True, text=True,
+                              check=False)  # fmt: skip
+        return done.returncode, done.stdout + done.stderr if done.returncode else done.stdout
     if rest[0] == "psql":
         return 0, state.get("psql", "")
     if rest[:2] == ["sh", "-c"] and "redis-cli" in rest[2]:
@@ -87,7 +94,8 @@ def main() -> int:
     path = Path(os.environ["FAKE_ENGINE_STATE"])
     state = json.loads(path.read_text())
     state.setdefault("calls", []).append(sys.argv[1:])
-    code, text = handle(state, sys.argv[1:])
+    stdin = sys.stdin.read() if sys.argv[1:3] == ["exec", "-i"] else None
+    code, text = handle(state, sys.argv[1:], stdin)
     path.write_text(json.dumps(state))
     sys.stdout.write(text)
     return code

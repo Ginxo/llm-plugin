@@ -8,7 +8,9 @@ prueba tiene que detectar. Con `unittest` (se ejecutan con `pytest` en la CI y c
 from __future__ import annotations
 
 import contextlib
+import http.server
 import io
+import ipaddress
 import json
 import os
 import re
@@ -18,6 +20,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
@@ -304,7 +307,10 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(ns.fake_url, "http://127.0.0.1:48090")
         self.assertEqual((ns.org, ns.email), ("observacion", "observador@observacion.test"))
         self.assertEqual((ns.admin_email, ns.orgadmin_email), ("admin@baas.test", "orgadmin@demo.test"))
-        self.assertEqual(ns.only, ["observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl"])
+        self.assertEqual(
+            ns.only, ["observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite"]
+        )
+        self.assertEqual((ns.auth_fail_burst, ns.auth_fail_per_minute), (30, 10.0), "los valores del contrato §7.5")
         self.assertEqual((ns.anon_org, ns.anon_email), ("privada", "analista@privada.test"))
         self.assertEqual(ns.flush_wait, 2.0, "Redis con appendfsync everysec puede retrasar la escritura hasta 2 s")
         self.assertEqual(ns.apis, ["messages", "chat", "responses"])
@@ -320,10 +326,122 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual((ns.propagation_wait, ns.trace_timeout), (0.2, 5.0))
 
     def test_invalid_choice_exits_two(self) -> None:
-        for argv in (["--apis", "gemini"], ["--only", "nada"], ["--inspect", "lxc"]):
+        bad_limits = (["--auth-fail-burst", "0"], ["--auth-fail-per-minute", "0"], ["--auth-fail-per-minute", "-1"])
+        for argv in (["--apis", "gemini"], ["--only", "nada"], ["--inspect", "lxc"], *bad_limits):
             with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as ctx:
                 e2e_h4.parse_args(argv)
             self.assertEqual(ctx.exception.code, 2)
+
+
+# --- límite de claves no válidas por IP (H4-13, grupo «limite») -------------------------------------------
+
+
+def limit_reply(status: int, body: object = None, retry_after: str | None = None) -> e2e_h4.Http:
+    headers = [("Content-Type", "application/json")] + ([("Retry-After", retry_after)] if retry_after else [])
+    return e2e_h4.Http(status, headers, json.dumps(body).encode())
+
+
+def proxy_401() -> e2e_h4.Http:
+    return limit_reply(
+        401, {"error": {"type": "invalid_request_error", "code": "baas_invalid_api_key", "message": "x"}}
+    )
+
+
+def proxy_429(seconds: int = 6, *, api: str = "chat") -> e2e_h4.Http:
+    message = f"BaaS-AI-IP: demasiadas API keys no válidas desde tu red; vuelve a intentarlo en {seconds} s"
+    if api == "messages":
+        return limit_reply(
+            429, {"type": "error", "error": {"type": "rate_limit_error", "message": message}}, str(seconds)
+        )
+    error = {"type": "requests", "code": "baas_auth_rate_limited", "message": message, "param": None}
+    return limit_reply(429, {"error": error}, str(seconds))
+
+
+def mcp_401() -> e2e_h4.Http:
+    return limit_reply(401, {"error": "UNAUTHENTICATED", "message": "La API key no es válida o ha sido revocada."})
+
+
+def mcp_429(seconds: int = 6) -> e2e_h4.Http:
+    message = f"Demasiadas API keys no válidas desde tu red; vuelve a intentarlo en {seconds} s."
+    return limit_reply(429, {"error": "RATE_LIMITED", "message": message}, str(seconds))
+
+
+class LimitUtilitiesTest(unittest.TestCase):
+    def test_unknown_keys_are_well_formed_and_distinct(self) -> None:
+        keys = [e2e_h4.unknown_key() for _ in range(50)]
+        for key in keys:
+            self.assertRegex(key, r"^baas_[A-Za-z0-9_-]{43}$", "la forma de una clave de verdad (proxy y MCP)")
+        self.assertEqual(len(set(keys)), 50)
+
+    def test_spoofed_ips_are_distinct_addresses(self) -> None:
+        ips = e2e_h4.spoofed_ips(31)
+        self.assertEqual(len(set(ips)), 31)
+        for ip in ips:
+            self.assertEqual(ipaddress.ip_address(ip).version, 4)
+
+    def test_leading_counts_from_the_first(self) -> None:
+        replies = [proxy_401(), proxy_401(), proxy_429(), proxy_401()]
+        self.assertEqual(e2e_h4.leading(replies, 401), 2)
+        self.assertEqual(e2e_h4.leading(replies, 429), 0)
+        self.assertEqual(e2e_h4.leading([proxy_401()] * 3, 401), 3)
+        self.assertEqual(e2e_h4.leading([], 401), 0)
+
+    def test_limited_problems_by_kind(self) -> None:
+        self.assertEqual(e2e_h4.limited_problems(proxy_429(6), "chat"), [])
+        self.assertEqual(e2e_h4.limited_problems(proxy_429(1, api="messages"), "messages"), [])
+        self.assertEqual(e2e_h4.limited_problems(mcp_429(12), "mcp"), [])
+        self.assertIn("se esperaba 429", e2e_h4.limited_problems(proxy_401(), "chat")[0])
+        # sin Retry-After, con un valor que no es un entero ≥ 1, o con otra espera en el mensaje
+        no_header = e2e_h4.Http(429, [], proxy_429(6).body)
+        self.assertIn("Retry-After", " ".join(e2e_h4.limited_problems(no_header, "chat")))
+        for value in ("0", "-3", "6.5", "pronto"):
+            bad = e2e_h4.Http(429, [("Retry-After", value)], proxy_429(6).body)
+            self.assertIn("Retry-After", " ".join(e2e_h4.limited_problems(bad, "chat")), value)
+        other_wait = e2e_h4.Http(429, [("Retry-After", "7")], proxy_429(6).body)
+        self.assertIn("vuelve a intentarlo en 7 s", " ".join(e2e_h4.limited_problems(other_wait, "chat")))
+        # la forma de cada proveedor: el código de OpenAI y el tipo de Anthropic
+        self.assertIn("baas_auth_rate_limited", " ".join(e2e_h4.limited_problems(mcp_429(6), "chat")))
+        self.assertIn("rate_limit_error", " ".join(e2e_h4.limited_problems(proxy_429(6), "messages")))
+        self.assertIn("RATE_LIMITED", " ".join(e2e_h4.limited_problems(proxy_429(6), "mcp")))
+        no_wait = e2e_h4.Http(429, [("Retry-After", "6")], b'{"error": "RATE_LIMITED", "message": "espera"}')
+        self.assertIn("la espera", " ".join(e2e_h4.limited_problems(no_wait, "mcp")))
+
+    def test_rejected_problems_by_kind(self) -> None:
+        self.assertEqual(e2e_h4.rejected_problems(proxy_401(), "chat"), [])
+        self.assertEqual(e2e_h4.rejected_problems(mcp_401(), "mcp"), [])
+        self.assertIn("baas_invalid_api_key", " ".join(e2e_h4.rejected_problems(limit_reply(401, {}), "chat")))
+        self.assertIn("HTTP 429", " ".join(e2e_h4.rejected_problems(mcp_429(), "mcp")))
+        self.assertIn("HTTP 200", " ".join(e2e_h4.rejected_problems(limit_reply(200, {}), "chat")))
+
+    def test_burst_problems(self) -> None:
+        burst = 30
+        self.assertEqual(e2e_h4.burst_problems([proxy_401()] * burst + [proxy_429()], burst=burst, kind="chat"), [])
+        self.assertEqual(e2e_h4.burst_problems([mcp_401()] * burst + [mcp_429()], burst=burst, kind="mcp"), [])
+        no_limit = " ".join(e2e_h4.burst_problems([proxy_401()] * (burst + 1), burst=burst, kind="chat"))
+        self.assertIn("ninguna 429", no_limit)
+        self.assertIn("X-Forwarded-For", no_limit)
+        early = " ".join(e2e_h4.burst_problems([proxy_401()] * 9 + [proxy_429()] * 22, burst=burst, kind="chat"))
+        self.assertIn("la 10.ª", early)
+        self.assertIn("429", early)
+        wrong = e2e_h4.burst_problems([proxy_401()] * burst + [mcp_429()], burst=burst, kind="chat")
+        self.assertIn("la 31.ª", " ".join(wrong))
+        self.assertIn("faltan", " ".join(e2e_h4.burst_problems([proxy_401()] * burst, burst=burst, kind="chat")))
+
+    def test_refill_reason(self) -> None:
+        burst, rate = 30, 10.0
+        full = [proxy_401()] * burst + [proxy_429()]
+        self.assertIsNone(e2e_h4.refill_reason(full, burst=burst, elapsed=0.5, per_minute=rate))
+        # el cubo no estaba lleno: el 429 llega antes (también el primero)
+        for spent in (0, 12, 29):
+            partial = [proxy_401()] * spent + [proxy_429()] * (burst + 1 - spent)
+            reason = e2e_h4.refill_reason(partial, burst=burst, elapsed=0.5, per_minute=rate)
+            self.assertIn(f"{spent} × 401", reason or "")
+        # sin 429 en una ráfaga lenta: pudo recargarse una ficha (una cada 6 s); en una rápida, no: sin límite
+        slow = [proxy_401()] * (burst + 1)
+        self.assertIn("6.5 s", e2e_h4.refill_reason(slow, burst=burst, elapsed=6.5, per_minute=rate) or "")
+        self.assertIsNone(e2e_h4.refill_reason(slow, burst=burst, elapsed=0.5, per_minute=rate))
+        # otro estado (un 502, un 200) no se arregla esperando
+        self.assertIsNone(e2e_h4.refill_reason([limit_reply(502)] * 31, burst=burst, elapsed=0.5, per_minute=rate))
 
 
 # --- WebSocket ------------------------------------------------------------------------------------
@@ -903,6 +1021,111 @@ class RedisInspectorTest(unittest.TestCase):
         self.assertEqual(engine.calls(), [])
 
 
+class FakeCaddy:
+    """Un servidor HTTP local que hace de Caddy: anota cada petición y responde `401` a las `burst` primeras y después
+    `429` con `Retry-After: 6`."""
+
+    def __init__(self, burst: int = 2) -> None:
+        self.seen: list[dict[str, object]] = []
+        caddy = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                caddy.seen.append({"method": "POST", "path": self.path, "host": self.headers.get("Host"),
+                                   "xff": self.headers.get("X-Forwarded-For"), "body": body.decode(),
+                                   "key": self.headers.get("X-Baas-Api-Key")})  # fmt: skip
+                limited = len(caddy.seen) > burst
+                payload = json.dumps({"error": {"code": "limited" if limited else "baas_invalid_api_key"}}).encode()
+                self.send_response(429 if limited else 401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                if limited:
+                    self.send_header("Retry-After", "6")
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class CaddyRequestsTest(unittest.TestCase):
+    """`caddy_requests` (grupo «limite», H4-13): el script que se manda al contenedor `fake-upstream` se ejecuta de
+    verdad (motor falso) contra un servidor local que hace de Caddy."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        containers = ["postgres", "redis", "redis-ephemeral", "mcp-server", "fake-upstream"]
+        self.engine = FakeEngine(Path(self.tmp.name), containers=containers)
+        self.caddy = FakeCaddy(burst=2)
+        self.inspector = self.engine.inspector()
+        self.inspector.caddy_url = self.caddy.url
+
+    def tearDown(self) -> None:
+        self.caddy.close()
+        self.tmp.cleanup()
+
+    def request(self, key: str, **changes: object) -> e2e_h4.CaddyRequest:
+        fields: dict[str, object] = {
+            "host": "proxy.localhost",
+            "path": "/org/demo/openai/v1/chat/completions",
+            "headers": {"X-Baas-Api-Key": key, "X-Forwarded-For": "203.0.113.7", "Content-Type": "application/json"},
+            "body": '{"model": "m"}',
+        }
+        return e2e_h4.CaddyRequest(**{**fields, **changes})  # type: ignore[arg-type]
+
+    def test_sends_each_request_with_its_host_and_reads_every_reply(self) -> None:
+        keys = [e2e_h4.unknown_key() for _ in range(3)]
+        mcp = self.request(keys[2], host="mcp.localhost", path="/org/demo/mcp")
+        elapsed, replies = self.inspector.caddy_requests([self.request(keys[0]), self.request(keys[1]), mcp])
+        self.assertGreaterEqual(elapsed, 0)
+        self.assertEqual([r.status for r in replies], [401, 401, 429])
+        self.assertEqual(e2e_h4.response_header(replies[2], "retry-after"), "6")
+        self.assertIsNone(e2e_h4.response_header(replies[0], "Retry-After"))
+        self.assertEqual(replies[0].json(), {"error": {"code": "baas_invalid_api_key"}})
+        self.assertEqual([s["host"] for s in self.caddy.seen], ["proxy.localhost", "proxy.localhost", "mcp.localhost"])
+        self.assertEqual([s["path"] for s in self.caddy.seen][2], "/org/demo/mcp")
+        self.assertEqual({s["xff"] for s in self.caddy.seen}, {"203.0.113.7"}, "la cabecera falsa llega a Caddy")
+        self.assertEqual([s["key"] for s in self.caddy.seen], keys)
+        self.assertEqual(self.caddy.seen[0]["body"], '{"model": "m"}')
+        (call,) = self.engine.calls()[-1:]
+        self.assertEqual(call[:5], ["exec", "-i", "cid-fake-upstream", "python3", "-c"])
+        self.assertFalse([a for a in call if any(k in a for k in keys)], "las claves van por la entrada estándar")
+
+    def test_a_refused_connection_is_status_zero(self) -> None:
+        self.caddy.close()
+        _, (reply,) = self.inspector.caddy_requests([self.request(e2e_h4.unknown_key())])
+        self.assertEqual(reply.status, 0)
+        self.assertIn("Error", reply.body.decode())
+
+    def test_unsafe_requests_are_refused_before_any_command(self) -> None:
+        key = e2e_h4.unknown_key()
+        bad = [
+            self.request(key, host="proxy.localhost\r\nX-Inyectada: 1"),
+            self.request(key, host=""),
+            self.request(key, path="/org/demo mcp"),
+            self.request(key, path="org/demo/mcp"),
+            self.request(key, headers={"Mala Cabecera": "x"}),
+            self.request(key, headers={"X-Baas-Api-Key": "a\r\nX-Inyectada: 1"}),
+            self.request(key, headers={"Host": "otro"}),
+        ]
+        for request in bad:
+            with self.assertRaises(e2e_h4.StepError, msg=request):
+                self.inspector.caddy_requests([request])
+        with self.assertRaises(e2e_h4.StepError):
+            self.inspector.caddy_requests([])
+        self.assertEqual(self.engine.calls(), [])
+        self.assertEqual(self.caddy.seen, [])
+
+
 class FlakyInspector(fake_h4_stack.FakeInspector):
     """La pila simulada con un método que falla `times` veces (y después funciona)."""
 
@@ -988,7 +1211,7 @@ class MissingInspectorTest(unittest.TestCase):
             "redis_keys": ("acme", []), "redis_setting": ("redis", "appendonly"), "disk_files": ("redis",),
             "force_aof_rewrite": ("redis",), "disk_contains": ("redis", ["x"]), "redis_residue": ("redis",),
             "redis_set_temp": ("redis", "baas:e2e:x", "v", 60), "redis_delete": ("redis", "baas:e2e:x"),
-            "mcp_org_dirs": (), "mcp_quarantine": (),
+            "mcp_org_dirs": (), "mcp_quarantine": (), "caddy_requests": ([],),
         }  # fmt: skip
         for name, args in calls.items():
             with self.assertRaises(e2e_h4.StepError, msg=name) as ctx:
@@ -1029,6 +1252,20 @@ def statuses(steps: dict[str, dict], prefix: str) -> set[str]:
     return {s["status"] for name, s in steps.items() if name.startswith(prefix)}
 
 
+@contextlib.contextmanager
+def instant_refill(stack: fake_h4_stack.FakeH4Stack) -> Iterator[list[float]]:
+    """La espera del grupo «limite» a que se llene el cubo adelanta el reloj de los limitadores simulados en vez de
+    dormir; devuelve las esperas pedidas."""
+    waits: list[float] = []
+
+    def refill(_self: e2e_h4.E2EH4, seconds: float) -> None:
+        waits.append(seconds)
+        stack.state.advance(seconds)
+
+    with mock.patch.object(e2e_h4.E2EH4, "refill", refill):
+        yield waits
+
+
 class FullRunTest(unittest.TestCase):
     def assert_all_ok(self, code: int, steps: dict[str, dict], out: str) -> None:
         self.assertEqual(code, 0, out)
@@ -1050,7 +1287,7 @@ class FullRunTest(unittest.TestCase):
         once += ["8.6", "8.7", "8.8", "8.9", "8.10", "8.11", "8.12", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5"]
         once += ["9.6", "9.7", "9.8", "10.0", "10.1", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7"]
         once += ["11.1 ", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7", "11.8", "11.9", "11.10", "11.11", "11.12 "]
-        once += ["11.12b", "11.13", "11.14"]
+        once += ["11.12b", "11.13", "11.14", "13.1", "13.2", "13.3", "13.4"]
         for prefix in once:
             self.assertEqual(len([n for n in steps if n.startswith(prefix)]), 1, prefix)
         self.assertEqual(
@@ -1068,9 +1305,12 @@ class FullRunTest(unittest.TestCase):
         self.assert_all_ok(code, steps, out)
 
     def test_two_runs_in_a_row(self) -> None:
-        with fake_h4_stack.FakeH4Stack() as stack:
+        with fake_h4_stack.FakeH4Stack() as stack, instant_refill(stack) as waits:
             self.assert_all_ok(*run_e2e(stack))
+            self.assertEqual(waits, [], "la primera ejecución encuentra los cubos llenos")
             self.assert_all_ok(*run_e2e(stack))
+        # la segunda espera una vez, en 13.1, a que se llene el cubo del proxy; el del MCP se llena mientras tanto
+        self.assertEqual(waits, [181.0])
 
     def test_leaves_the_switch_off_even_when_it_started_on(self) -> None:
         with fake_h4_stack.FakeH4Stack() as stack:
@@ -1117,6 +1357,89 @@ class FullRunTest(unittest.TestCase):
         # B, X, A y G (las de O2) y F quedan desactivados; C (O3, false) sigue ACTIVE y E sigue INVITED
         self.assertEqual(statuses, {"DISABLED", "ACTIVE", "INVITED"})
         self.assertEqual(sum(not k.revoked for k in keys), 1, "solo la clave de C sigue vigente")
+
+    def test_only_the_limit_group(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "limite")
+            proxy = stack.state.limiters["proxy"].buckets
+            mcp = stack.state.limiters["mcp"].buckets
+            calls = list(stack.inspector.caddy_calls)
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(
+            sorted(n.split(" ")[0] for n in steps), ["0.", "1.", "13.1", "13.2", "13.3", "13.4", "2b.", "3."]
+        )
+        first = next(s for n, s in steps.items() if n.startswith("13.1"))
+        self.assertIn("30 × 401", first["detail"])
+        self.assertIn("baas_auth_rate_limited", first["detail"])
+        self.assertIn("rate_limit_error", first["detail"])
+        self.assertIn("RATE_LIMITED", next(s for n, s in steps.items() if n.startswith("13.3"))["detail"])
+        # las ráfagas salen del contenedor (su cubo, vacío) y no gastan el del equipo: 13.4 solo prueba una clave
+        self.assertEqual(sorted(proxy), sorted([fake_h4_stack.CONTAINER, "127.0.0.1"]))
+        self.assertLess(proxy[fake_h4_stack.CONTAINER][0], 1)
+        self.assertLess(mcp[fake_h4_stack.CONTAINER][0], 1)
+        self.assertEqual(proxy["127.0.0.1"][0], 29)
+        self.assertEqual(mcp["127.0.0.1"][0], 29)
+        # 13.1: 31 claves desconocidas distintas, cada una con un X-Forwarded-For distinto, y una de Messages
+        burst = calls[0]
+        keys = [r.headers["X-Baas-Api-Key"] for r in burst]
+        self.assertEqual(len(burst), 32)
+        self.assertEqual(len(set(keys)), 32)
+        self.assertEqual(len({r.headers["X-Forwarded-For"] for r in burst[:31]}), 31)
+        self.assertEqual({r.host for r in burst}, {"127.0.0.1"}, "el host de las URLs del proxy del handshake")
+        self.assertTrue(all(r.path.endswith("/chat/completions") for r in burst[:31]))
+        self.assertTrue(burst[31].path.endswith("/v1/messages"))
+
+    def test_the_limit_group_waits_for_a_bucket_that_is_not_full(self) -> None:
+        """Otra ejecución hace menos de 3 min dejó la IP del contenedor sin fichas: el grupo espera a que se llene su
+        cubo (30 fichas a 10 por minuto, 180 s y uno de margen) y repite la ráfaga en vez de fallar."""
+        with fake_h4_stack.FakeH4Stack() as stack, instant_refill(stack) as waits:
+            self.assert_all_ok(*run_e2e(stack, "--only", "limite"))
+            stack.state.advance(60)  # 10 fichas
+            code, steps, out = run_e2e(stack, "--only", "limite")
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(waits, [181.0])
+        self.assertIn("10 × 401 antes del primer 429", out)
+        self.assertIn("espero 181 s", out)
+
+    def test_the_limit_group_follows_the_configured_burst_and_rate(self) -> None:
+        with fake_h4_stack.FakeH4Stack(auth_fail_burst=5, auth_fail_per_minute=60) as stack:
+            code, steps, out = run_e2e(stack, "--only", "limite", "--auth-fail-burst", "5",
+                                       "--auth-fail-per-minute", "60")  # fmt: skip
+        self.assert_all_ok(code, steps, out)
+        self.assertIn("5 × 401", next(s for n, s in steps.items() if n.startswith("13.1"))["detail"])
+        with fake_h4_stack.FakeH4Stack(auth_fail_burst=5) as stack, instant_refill(stack) as waits:
+            code, steps, out = run_e2e(stack, "--only", "limite")
+        self.assertEqual(code, 1, "una pila con otra capacidad no pasa por la de omisión (30)")
+        self.assertEqual(waits, [181.0, 181.0], "13.1 y 13.3 esperan una vez por si el cubo no estaba lleno")
+        self.assertIn("la 6.ª", next(s for n, s in steps.items() if n.startswith("13.1"))["detail"])
+
+    def test_the_known_key_step_checks_that_the_ip_is_limited(self) -> None:
+        """13.2 no da por buena una clave que pasa si la IP del contenedor no está frenada en ese momento."""
+        with fake_h4_stack.FakeH4Stack() as stack:
+            argv = ["--app-url", stack.app_url, "--fake-url", stack.fake_url, "--timeout", "10"]
+            e2e = e2e_h4.E2EH4(e2e_h4.parse_args(argv), stack.inspector, nonce="abcdefghij")
+            e2e.handshake_bypass()
+            with self.assertRaises(e2e_h4.StepError) as ctx:
+                e2e.limit_known()  # sin 13.1 antes: el cubo del contenedor está lleno
+        self.assertIn("no estaba frenada", str(ctx.exception))
+        self.assertIn("401, 401, 401", str(ctx.exception))
+
+    def test_the_limit_group_needs_the_inspector(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "limite", inspector=None)
+        self.assertEqual(code, 0, out)
+        self.assertFalse([n for n in steps if n.startswith("13.")], "sin inspector no se registra ningún paso 13.x")
+        self.assertIn("limite", out.split("RESULTADO")[0], "y se dice por qué")
+        missing = e2e_h4.MissingInspector("no hay motor")
+        with fake_h4_stack.FakeH4Stack() as stack:
+            code, steps, out = run_e2e(stack, "--only", "limite", inspector=missing)
+        self.assertEqual(code, 1, out)
+        by_prefix = {n.split(" ")[0]: s for n, s in steps.items()}
+        for prefix in ("13.1", "13.3"):
+            self.assertEqual(by_prefix[prefix]["status"], "FALLO")
+            self.assertIn("--inspect none", by_prefix[prefix]["detail"])
+        self.assertEqual(by_prefix["13.2"]["status"], "SALTADO")
+        self.assertEqual(by_prefix["13.4"]["status"], "OK", "desde el equipo no hace falta el contenedor")
 
     def test_originals_group_sends_every_mode_and_api_and_leaves_nothing_behind(self) -> None:
         with fake_h4_stack.FakeH4Stack() as stack:
@@ -1282,12 +1605,24 @@ class FaultsTest(unittest.TestCase):
         "reactivate-audit-no-org": {"11.12 ": ("user.reactivated: org_slug = None",)},
         "audit-orgadmin-sees-disabled": {"11.12b": ("X ve 1 fila(s) user.disabled", "no debe ver ninguna")},
         "audit-orgadmin-blind": {"11.12b": ("X ve 0 fila(s) user.reactivated",)},
+        "limit-off-proxy": {"13.1": ("31 claves recibieron 401", "ninguna 429")},
+        "limit-off-mcp": {"13.3": ("31 claves recibieron 401", "ninguna 429")},
+        "limit-trusts-xff": {"13.1": ("ninguna 429", "X-Forwarded-For"), "13.3": ("ninguna 429", "X-Forwarded-For")},
+        "limit-blocks-known": {"13.2": ("clave ya válida", "HTTP 429"), "13.3": ("clave ya válida", "HTTP 429")},
+        "limit-global": {"13.4": ("HTTP 429", "otra IP")},
+        "limit-no-retry-after": {"13.1": ("Retry-After = None",), "13.3": ("Retry-After = None",)},
+        "limit-shape": {"13.1": ("baas_auth_rate_limited", "rate_limit_error")},
     }
 
     ORPHAN_PREFIXES = ("preview-", "orphans-", "reactivate-", "disabled-")  # solo los pasos 11 los comprueban
 
     def run_fault(self, fault: str) -> dict[str, dict]:
         only = ("--only", "huerfanos") if fault.startswith(self.ORPHAN_PREFIXES) else ()
+        if fault.startswith("limit-"):  # solo los pasos 13 (con el inspector de la pila simulada)
+            with fake_h4_stack.FakeH4Stack(faults={fault}) as stack:
+                code, steps, out = run_e2e(stack, "--only", "limite")
+            self.assertEqual(code, 1, f"{fault}: {out}")
+            return steps
         with fake_h4_stack.FakeH4Stack(faults={fault}) as stack:
             code, steps, out = run_e2e(stack, "--trace-timeout", "0.5", *only, inspector=None if only else "stack")
         self.assertEqual(code, 1, f"{fault}: {out}")

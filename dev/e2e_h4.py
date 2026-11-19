@@ -33,15 +33,19 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         en ningún dato; foto de disco frente al volumen del MCP; permisos y `usage.viewed`; el proxy con el consumidor
         y el MCP parados; retención y borrado; eventos repetidos; sobrecoste del proxy. Cada paso crea y elimina su
         organización (`uso-<ejecución>-…`).
+  13.   Límite de claves no válidas por IP (H4-13, contrato §7.5), desde el contenedor `fake-upstream` (otra IP que la
+        del equipo) a través de Caddy: 30 claves desconocidas distintas, cada una con un `X-Forwarded-For` falso
+        distinto, reciben `401` y la 31.ª `429` con `Retry-After` en el proxy (`baas_auth_rate_limited`) y en el MCP
+        (`RATE_LIMITED`); una clave ya válida pasa desde la IP frenada; desde el equipo, una desconocida sigue en `401`.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
     uv run python dev/e2e_h4.py --app-url http://app.localhost:8080 --fake-url http://127.0.0.1:18090
 
-Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10 y los pasos 12.4, 12.5, 12.7, 12.8 y 12.9 miran
-dentro de los contenedores (o los paran) con `podman`/`docker` (`--inspect none` los omite). Sale con 0 si todo pasa,
-1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el plugin. `dev/fake_h4_stack.py` simula la
-pila (sin el grupo 12) para probar este script sin ella.
+Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10, los pasos 12.4, 12.5, 12.7, 12.8 y 12.9 y el grupo 13
+miran dentro de los contenedores (o los paran, o envían desde uno) con `podman`/`docker` (`--inspect none` los omite).
+Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el plugin.
+`dev/fake_h4_stack.py` simula la pila (sin el grupo 12) para probar este script sin ella.
 """
 
 from __future__ import annotations
@@ -50,9 +54,11 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import secrets
 import select
 import shutil
 import socket
@@ -80,7 +86,7 @@ from baas_plugin.mcp_client import McpClient
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
 APIS, API_NAMES = h3.APIS, h3.API_NAMES
-GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl")
+GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite")
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
@@ -94,6 +100,9 @@ ORPHAN_ACTIVATED = ("a", "b", "x", "c", "f")  # las demás (e, g) se quedan INVI
 ORPHAN_KEYED = ("a", "b", "c", "f")  # con una clave personal
 ORPHAN_DOMAIN = "huerf.test"
 REVOKED_SUFFIX = " (clave revocada)"
+# Grupo «limite» (H4-13, contrato §7.5): el texto del 429 del proxy, sin la espera (`; vuelve a intentarlo en N s`)
+LIMIT_MESSAGE = "BaaS-AI-IP: demasiadas API keys no válidas desde tu red"
+LIMIT_MARGIN = 1.0  # segundos de más al esperar a que se llene un cubo
 
 
 # --- utilidades puras ------------------------------------------------------------------------------
@@ -341,6 +350,120 @@ def disabled_audit_problems(
     return problems
 
 
+# --- grupo «limite»: claves no válidas frenadas por IP (H4-13, contrato §7.5) ----------------------------------
+
+
+@dataclass
+class CaddyRequest:
+    """Un `POST` que el grupo «limite» envía desde el contenedor `fake-upstream` a Caddy, que lo enruta por `host`
+    (`proxy.<dominio>` o `mcp.<dominio>`) como a cualquier petición de fuera."""
+
+    host: str
+    path: str
+    headers: dict[str, str]
+    body: str
+
+
+MCP_INITIALIZE = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                             "clientInfo": {"name": "baas-e2e-h4", "version": "1"}}}  # fmt: skip
+
+
+def unknown_key() -> str:
+    """Una clave bien formada que no existe: `baas_` y 43 caracteres base64url, como las de verdad. Una mal formada se
+    rechaza sin consultar y no gastaría ficha."""
+    return "baas_" + secrets.token_urlsafe(32)
+
+
+def spoofed_ips(count: int) -> list[str]:
+    """`count` direcciones IPv4 distintas y aleatorias para un `X-Forwarded-For` falso (Caddy debe descartarlo)."""
+    ips: dict[str, None] = {}
+    while len(ips) < count:
+        ips[str(ipaddress.IPv4Address(secrets.randbits(32)))] = None
+    return list(ips)
+
+
+def leading(replies: Sequence[Http], status: int) -> int:
+    """Cuántas respuestas seguidas, desde la primera, tienen `status`."""
+    return next((i for i, res in enumerate(replies) if res.status != status), len(replies))
+
+
+def response_header(res: Http, name: str) -> str | None:
+    return next((v for k, v in res.headers if k.lower() == name.lower()), None)
+
+
+def reply_text(res: Http) -> str:
+    """`HTTP <estado>` y el principio del cuerpo (las respuestas de esta parte no llevan la clave)."""
+    return f"HTTP {res.status} {h3.snippet(res.body, 160)}"
+
+
+def rejected_problems(res: Http, kind: str) -> list[str]:
+    """Una clave desconocida que se consultó: `401` (en el proxy, `baas_invalid_api_key`). `kind`: `chat` o `mcp`."""
+    if res.status != 401:
+        return [f"{reply_text(res)} (se esperaba 401)"]
+    if kind != "mcp" and h3.provider_error(res.body)[1] != "baas_invalid_api_key":
+        return [f"{reply_text(res)} (se esperaba 401 baas_invalid_api_key)"]
+    return []
+
+
+def limited_problems(res: Http, kind: str) -> list[str]:
+    """El `429` del limitador: `Retry-After` en segundos (entero ≥ 1) y el cuerpo de `kind` con esa espera. `chat` y
+    `messages`, el proxy con la forma del proveedor (OpenAI `requests` · `baas_auth_rate_limited`; Anthropic
+    `rate_limit_error`) y su mensaje; `mcp`, `{"error": "RATE_LIMITED", "message": …}`."""
+    if res.status != 429:
+        return [f"{reply_text(res)} (se esperaba 429)"]
+    value = response_header(res, "Retry-After")
+    seconds = int(value) if value is not None and re.fullmatch(r"[0-9]{1,9}", value) and int(value) >= 1 else None
+    problems = [] if seconds is not None else [f"Retry-After = {value!r} (se esperaba un entero de segundos ≥ 1)"]
+    wait = f"vuelve a intentarlo en {seconds} s"
+    if kind == "mcp":
+        data = res.json()
+        data = data if isinstance(data, dict) else {}
+        if data.get("error") != "RATE_LIMITED":
+            problems.append(f"error = {data.get('error')!r} (se esperaba RATE_LIMITED): {reply_text(res)}")
+        elif seconds is not None and wait not in str(data.get("message")):
+            problems.append(f"message = {data.get('message')!r} (se esperaba la espera, «{wait}»)")
+        return problems
+    etype, code, message = h3.provider_error(res.body)
+    want = ("rate_limit_error", None) if kind == "messages" else ("requests", "baas_auth_rate_limited")
+    if (etype, code) != want:
+        problems.append(f"error.type · error.code = {etype} · {code} (se esperaba {want[0]} · {want[1]})")
+    elif seconds is not None and message != f"{LIMIT_MESSAGE}; {wait}":
+        problems.append(f"message = {message!r} (se esperaba «{LIMIT_MESSAGE}; {wait}»)")
+    return problems
+
+
+def burst_problems(replies: Sequence[Http], *, burst: int, kind: str) -> list[str]:
+    """Una ráfaga de claves desconocidas desde un cliente con el cubo lleno: las `burst` primeras se consultan (`401`)
+    y la siguiente recibe el `429` del limitador."""
+    for i, res in enumerate(replies[:burst], 1):
+        problems = rejected_problems(res, kind)
+        if problems:
+            return [f"la {i}.ª clave: {problems[0]} (el cubo admite {burst} antes del 429)"]
+    if len(replies) <= burst:
+        return [f"faltan respuestas: {len(replies)} de {burst + 1}"]
+    if replies[burst].status == 401:
+        return [
+            f"las {burst + 1} claves recibieron 401 y ninguna 429: sin límite, o el cliente sale del X-Forwarded-For "
+            "que envía la petición y no de la IP que pone Caddy"
+        ]
+    return [f"la {burst + 1}.ª clave: {p}" for p in limited_problems(replies[burst], kind)]
+
+
+def refill_reason(replies: Sequence[Http], *, burst: int, elapsed: float, per_minute: float) -> str | None:
+    """Por qué una ráfaga de `burst + 1` claves no prueba nada y hay que repetirla con el cubo lleno (`None` si sí): el
+    `429` llega antes (otra ejecución dejó a medias el cubo de esa IP) o no llega y la ráfaga tardó lo que se tarda en
+    recargar una ficha. Cualquier otra respuesta (un `502`, un `200`) no se arregla esperando."""
+    n = leading(replies, 401)
+    if n < burst and n < len(replies) and replies[n].status == 429:
+        return (
+            f"{n} × 401 antes del primer 429: la IP del contenedor no tenía el cubo lleno (¿otra ejecución hace poco?)"
+        )
+    if n > burst and elapsed >= 60 / per_minute:
+        return f"{n} × 401 en {elapsed:.1f} s: pudo recargarse una ficha durante la ráfaga"
+    return None
+
+
 # --- WebSocket mínimo (RFC 6455) con la biblioteca estándar --------------------------------------------
 
 
@@ -513,6 +636,8 @@ class Inspector(Protocol):
     # Fase 1 H4-05 (grupo «acl»)
     def redis_as(self, service: str, user: str, command: str) -> str: ...
     def redis_admin(self, service: str, *args: str) -> str: ...
+    # H4-13 (grupo «limite»)
+    def caddy_requests(self, requests: Sequence[CaddyRequest]) -> tuple[float, list[Http]]: ...
 
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -547,6 +672,33 @@ _TAG = re.compile(r"^[a-z0-9-]{1,26}$")
 _EVENT_ID = re.compile(r"^[0-9A-Z]{1,26}$")
 _ENTRY = re.compile(r"^[0-9]+-[0-9]+$")
 _SINCE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$")
+# H4-13 (grupo «limite»): las peticiones salen de este contenedor (otra IP que la del equipo) hacia Caddy
+LIMIT_SOURCE = "fake-upstream"
+CADDY_URL = "http://caddy:80"
+MAX_CADDY_REQUESTS = 100
+_HOST = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+_PATH = re.compile(r"^/[A-Za-z0-9._~/%-]{0,500}$")
+_HEADER = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+# Envía, una tras otra, las peticiones que recibe en JSON por la entrada estándar (las claves no van en la línea de
+# órdenes), sin el proxy del entorno y con su `Host` (Caddy enruta por él), y escribe en JSON lo que tardó todo y el
+# estado, las cabeceras y el cuerpo de cada respuesta (estado 0 y el error si no conecta).
+_CADDY_SCRIPT = """import json, sys, time, urllib.error, urllib.request
+spec = json.load(sys.stdin)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+replies, start = [], time.monotonic()
+for r in spec["requests"]:
+    req = urllib.request.Request(spec["base"] + r["path"], data=r["body"].encode(), method="POST",
+                                 headers={**r["headers"], "Host": r["host"]})
+    try:
+        with opener.open(req, timeout=spec["timeout"]) as res:
+            status, headers, body = res.status, res.headers.items(), res.read(65536)
+    except urllib.error.HTTPError as exc:
+        status, headers, body = exc.code, exc.headers.items(), exc.read(65536)
+    except OSError as exc:
+        status, headers, body = 0, [], repr(exc).encode()
+    replies.append({"status": status, "headers": headers, "body": body.decode("utf-8", "replace")})
+print(json.dumps({"elapsed": time.monotonic() - start, "replies": replies}))
+"""
 
 
 def _ere_literal(text: str) -> str:
@@ -584,6 +736,8 @@ class ContainerInspector:
         self.engine, self.project, self.mcp_data_dir = engine, project, mcp_data_dir.rstrip("/")
         self.poll_interval = 0.2  # entre dos consultas mientras Redis reescribe el AOF
         self.rewrite_timeout = 30.0  # lo más que se espera a una reescritura
+        self.caddy_url = CADDY_URL  # grupo «limite»: Caddy visto desde el contenedor `fake-upstream`
+        self.request_timeout = 20.0  # cada petición de ese grupo
 
     def container(self, service: str) -> str | None:
         out = self._run(["ps", "-aq", "--filter", f"label=com.docker.compose.project={self.project}",
@@ -591,10 +745,13 @@ class ContainerInspector:
         ids = out.split()
         return ids[0] if ids else None
 
-    def _run(self, argv: Sequence[str], *, check_rc: bool = True, merge: bool = False, timeout: float = 60) -> str:
+    def _run(
+        self, argv: Sequence[str], *, check_rc: bool = True, merge: bool = False, timeout: float = 60,
+        stdin: str | None = None,
+    ) -> str:  # fmt: skip
         try:
             done = subprocess.run([self.engine, *argv], capture_output=True, text=True, timeout=timeout, check=False,
-                                  errors="replace")  # fmt: skip
+                                  errors="replace", input=stdin)  # fmt: skip
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise StepError(f"{self.engine} {' '.join(argv[:3])}: {type(exc).__name__}") from None
         if check_rc and done.returncode != 0:
@@ -603,11 +760,15 @@ class ContainerInspector:
             )
         return done.stdout + done.stderr if merge else done.stdout
 
-    def _exec(self, service: str, *argv: str, check_rc: bool = True) -> str:
+    def _exec(
+        self, service: str, *argv: str, check_rc: bool = True, stdin: str | None = None, timeout: float = 60
+    ) -> str:
+        """`exec` en el contenedor del servicio; con `stdin`, `exec -i` y eso por la entrada estándar."""
         cid = self.container(service)
         if cid is None:
             raise StepError(f"no hay contenedor «{service}» en el proyecto «{self.project}» ({self.engine})")
-        return self._run(["exec", cid, *argv], check_rc=check_rc)
+        flags = ["-i"] if stdin is not None else []
+        return self._run(["exec", *flags, cid, *argv], check_rc=check_rc, stdin=stdin, timeout=timeout)
 
     def _redis_cli(self, service: str, *args: str, check_rc: bool = True) -> str:
         """`redis-cli` dentro del contenedor: se autentica con SU `$BAAS_REDIS_PASSWORD`; `args` son argumentos."""
@@ -962,6 +1123,36 @@ class ContainerInspector:
                 files.append((path, int(size)))
         return files
 
+    # --- H4-13: peticiones desde otra IP (grupo «limite») -----------------------------------------------------
+    def caddy_requests(self, requests: Sequence[CaddyRequest]) -> tuple[float, list[Http]]:
+        """Envía `requests`, una tras otra, desde el contenedor `fake-upstream` a Caddy: un cliente con otra IP que la
+        del equipo. Devuelve lo que tardaron (medido dentro del contenedor) y cada respuesta."""
+        if not 1 <= len(requests) <= MAX_CADDY_REQUESTS:
+            raise StepError(f"se envían de 1 a {MAX_CADDY_REQUESTS} peticiones, no {len(requests)}")
+        spec = {"base": self.caddy_url, "timeout": self.request_timeout,
+                "requests": [self._caddy_request(r) for r in requests]}  # fmt: skip
+        out = self._exec(LIMIT_SOURCE, "python3", "-c", _CADDY_SCRIPT, stdin=json.dumps(spec),
+                         timeout=30 + self.request_timeout * len(requests))  # fmt: skip
+        try:
+            data = json.loads(out)
+            replies = [Http(int(r["status"]), [(str(k), str(v)) for k, v in r["headers"]], str(r["body"]).encode())
+                       for r in data["replies"]]  # fmt: skip
+            elapsed = float(data["elapsed"])
+        except (ValueError, KeyError, TypeError):
+            raise StepError(f"«{LIMIT_SOURCE}» no devolvió las respuestas: {out[:200]!r}") from None
+        if len(replies) != len(requests):
+            raise StepError(f"«{LIMIT_SOURCE}» devolvió {len(replies)} respuesta(s) de {len(requests)}")
+        return elapsed, replies
+
+    @staticmethod
+    def _caddy_request(r: CaddyRequest) -> dict[str, Any]:
+        if not _HOST.fullmatch(r.host) or not _PATH.fullmatch(r.path):
+            raise StepError(f"petición no válida para Caddy: host {r.host!r}, ruta {r.path!r}")
+        for name, value in r.headers.items():
+            if not _HEADER.fullmatch(name) or name.lower() == "host" or any(c in value for c in "\r\n\x00"):
+                raise StepError(f"cabecera no válida: {name!r}")
+        return {"host": r.host, "path": r.path, "headers": dict(r.headers), "body": r.body}
+
 
 class MissingInspector:
     """No se encontró el motor de contenedores: cada consulta falla diciendo cómo seguir."""
@@ -977,6 +1168,7 @@ class MissingInspector:
     usage_rows = tagged_rows = usage_dump = source_status = insert_old_usage = snapshot_count = key_exists = _fail
     stream_group = stream_entries = stream_add = stream_has = service_control = service_logs = mcp_files = _fail
     redis_as = redis_admin = _fail
+    caddy_requests = _fail
 
 
 def build_inspector(args: argparse.Namespace) -> Inspector | None:
@@ -1029,8 +1221,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--apis", type=h3._csv(APIS), default=list(APIS),
                    help=f"APIs que se prueban, separadas por comas: {', '.join(APIS)} (todas)")  # fmt: skip
     p.add_argument("--inspect", choices=("auto", "podman", "docker", "none"), default="auto",
-                   help="Motor para mirar los contenedores («none» omite 9.1b, 9.8, el grupo 10 y 12.4-12.5, "
-                        "12.7-12.9)")  # fmt: skip
+                   help="Motor para mirar los contenedores («none» omite 9.1b, 9.8, el grupo 10, 12.4-12.5, "
+                        "12.7-12.9 y 13.x)")  # fmt: skip
     p.add_argument("--compose-project", default=os.environ.get("COMPOSE_PROJECT_NAME") or "baas-dev",
                    help="Proyecto de compose de la pila (por defecto, $COMPOSE_PROJECT_NAME o baas-dev)")  # fmt: skip
     p.add_argument("--mcp-data-dir", default="/data", help="BAAS_DATA_DIR del contenedor del MCP")
@@ -1047,8 +1239,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Grupo uso (12.10): umbral (ms) del p95 del sobrecoste")  # fmt: skip
     p.add_argument("--usage-window", type=float, default=5,
                    help="Grupo uso: BAAS_USAGE_WINDOW_SECONDS del MCP (5 en desarrollo)")  # fmt: skip
+    p.add_argument("--auth-fail-burst", type=int, default=30,
+                   help="Grupo limite: BAAS_AUTH_FAIL_BURST del proxy y del MCP de la pila (30)")  # fmt: skip
+    p.add_argument("--auth-fail-per-minute", type=float, default=10,
+                   help="Grupo limite: BAAS_AUTH_FAIL_PER_MINUTE de la pila (10); con él se calcula cuánto esperar a "
+                        "que se llene el cubo si una ejecución anterior lo dejó a medias")  # fmt: skip
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
+    if ns.auth_fail_burst < 1 or not ns.auth_fail_per_minute > 0:
+        p.error(
+            "--auth-fail-burst debe ser ≥ 1 y --auth-fail-per-minute > 0 (con el límite apagado no hay grupo limite)"
+        )
     ns.app_url, ns.fake_url = ns.app_url.rstrip("/"), ns.fake_url.rstrip("/")
     ns.proxy_url = ns.proxy_url.rstrip("/") if ns.proxy_url else None
     return ns
@@ -2792,6 +2993,142 @@ class E2EH4:
             f"cuentas huerf-{self.nonce}-* sin organización (las cuentas no se eliminan)"
         )
 
+    # --- 13: claves no válidas frenadas por IP a través de Caddy (H4-13, contrato §7.5) -----------------------
+    def limit_inspector(self) -> Inspector:
+        assert self.inspector is not None  # los pasos del grupo solo se registran con inspector
+        return self.inspector
+
+    def refill(self, seconds: float) -> None:
+        """Espera a que se llene el cubo de la IP del contenedor (las pruebas adelantan el reloj de la pila falsa)."""
+        time.sleep(seconds)
+
+    def proxy_request(self, api: str, key: str, xff: str | None = None) -> CaddyRequest:
+        """Un turno de `api` con la clave `key` en la organización sin AI-IP (`--bypass-org`), al proxy por Caddy;
+        `xff`, un `X-Forwarded-For` falso."""
+        parts = urlsplit(h3.api_url(self.bypass_binding, api))
+        headers = {"Content-Type": "application/json", "X-Baas-Api-Key": key}
+        if api == "messages":
+            headers |= {"x-api-key": h3.FAKE_ANTHROPIC_KEY, "anthropic-version": "2023-06-01"}
+        else:
+            headers["Authorization"] = f"Bearer {h3.FAKE_OPENAI_KEY}"
+        if xff:
+            headers["X-Forwarded-For"] = xff
+        text = f"{h3.case_tag(self.nonce, 'limite', api, 'json')}. Hola."
+        body = h3.encode(h3.request_body(api, f"e2e-h4-{self.nonce}-limite-{api}", text))
+        return CaddyRequest(parts.hostname or "", parts.path, headers, body.decode())
+
+    def mcp_request(self, key: str, xff: str | None = None) -> CaddyRequest:
+        """Un `initialize` con la clave `key` al MCP de la organización sin AI-IP, por Caddy."""
+        parts = urlsplit(str(self.bypass_binding["mcp_url"]))
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                   "Accept-Language": "es", "Authorization": f"Bearer {key}"}  # fmt: skip
+        if xff:
+            headers["X-Forwarded-For"] = xff
+        return CaddyRequest(parts.hostname or "", parts.path, headers, json.dumps(MCP_INITIALIZE))
+
+    def limit_burst(
+        self, make: Callable[[str, str], CaddyRequest], tail: Callable[[], list[CaddyRequest]]
+    ) -> tuple[list[Http], float]:
+        """Desde el contenedor, `burst + 1` claves desconocidas distintas, cada una con un `X-Forwarded-For` falso
+        distinto (`make(clave, ip)`), y después `tail()`. Si esa ráfaga no prueba nada (`refill_reason`), espera a que
+        se llene el cubo de la IP (`burst` fichas a `per_minute`) y la repite una vez."""
+        a = self.args
+
+        def send() -> tuple[list[Http], float, str | None]:
+            burst = [make(unknown_key(), ip) for ip in spoofed_ips(a.auth_fail_burst + 1)]
+            elapsed, replies = self.limit_inspector().caddy_requests([*burst, *tail()])
+            reason = refill_reason(replies[: len(burst)], burst=a.auth_fail_burst, elapsed=elapsed,
+                                   per_minute=a.auth_fail_per_minute)  # fmt: skip
+            return replies, elapsed, reason
+
+        replies, elapsed, reason = send()
+        if reason is not None:
+            wait = a.auth_fail_burst * 60 / a.auth_fail_per_minute + LIMIT_MARGIN
+            print(f"          ({reason}: espero {wait:g} s a que se llene su cubo y repito)")
+            self.refill(wait)
+            replies, elapsed, _ = send()
+        return replies, elapsed
+
+    def limit_proxy(self) -> str:
+        burst = self.args.auth_fail_burst
+        replies, elapsed = self.limit_burst(
+            lambda key, ip: self.proxy_request("chat", key, ip),
+            lambda: [self.proxy_request("messages", unknown_key(), spoofed_ips(1)[0])],
+        )
+        problems = burst_problems(replies, burst=burst, kind="chat")
+        problems += [f"Messages, con la IP ya frenada: {p}" for p in limited_problems(replies[-1], "messages")]
+        check(not problems, "\n".join([*problems, f"(la ráfaga tardó {elapsed:.2f} s)"]))
+        seconds = response_header(replies[burst], "Retry-After")
+        return (
+            f"{burst} claves desconocidas, cada una con un X-Forwarded-For distinto → {burst} × 401 "
+            f"baas_invalid_api_key; la {burst + 1}.ª → 429 baas_auth_rate_limited (Retry-After {seconds} s) y una de "
+            f"Messages → 429 rate_limit_error ({elapsed:.2f} s): Caddy sobrescribe la cabecera"
+        )
+
+    def limit_known(self) -> str:
+        """Desde el equipo, la clave de `--bypass-email` (el proxy la resuelve como válida); desde el contenedor, con su
+        IP frenada (comprobado: una desconocida justo antes recibe 429), esa clave sigue pasando."""
+        a = self.args
+        text = f"{h3.case_tag(self.nonce, 'limite', 'chat', 'equipo')}. Hola."
+        res = self.send(self.bypass_binding, a.bypass_email, "chat",
+                        h3.request_body("chat", f"e2e-h4-{self.nonce}-limite-chat", text))[1]  # fmt: skip
+        check(res.status == 200, f"desde el equipo, la clave de {a.bypass_email}: {reply_text(res)} (se esperaba 200)")
+        unknown = [self.proxy_request("chat", unknown_key()) for _ in range(3)]
+        _, replies = self.limit_inspector().caddy_requests(
+            [*unknown, self.proxy_request("chat", self.key_of(a.bypass_email))]
+        )
+        check(
+            replies[2].status == 429,
+            "la IP del contenedor no estaba frenada al enviar la clave válida: tres desconocidas → "
+            f"{', '.join(str(r.status) for r in replies[:3])} (se esperaba 429 al menos en la última)",
+        )
+        known = replies[3]
+        check(
+            known.status == 200,
+            f"la clave ya válida de {a.bypass_email} desde la IP frenada: {reply_text(known)} "
+            "(se esperaba 200, no 429)",
+        )
+        return (
+            f"desde el equipo, la clave de {a.bypass_email} → 200; desde el contenedor, frenado (una desconocida → "
+            "429), la misma clave → 200"
+        )
+
+    def limit_mcp(self) -> str:
+        a, burst = self.args, self.args.auth_fail_burst
+        self.mcp_whoami(self.bypass_binding, a.bypass_email)  # desde el equipo: el MCP ya la resolvió como válida
+        key = self.key_of(a.bypass_email)
+        replies, elapsed = self.limit_burst(self.mcp_request, lambda: [self.mcp_request(key)])
+        problems = burst_problems(replies, burst=burst, kind="mcp")
+        if replies[-1].status != 200:
+            problems.append(
+                f"la clave ya válida de {a.bypass_email} desde la IP frenada: {reply_text(replies[-1])} "
+                "(se esperaba 200, no 429)"
+            )
+        check(not problems, "\n".join([*problems, f"(la ráfaga tardó {elapsed:.2f} s)"]))
+        seconds = response_header(replies[burst], "Retry-After")
+        return (
+            f"{burst} claves desconocidas, cada una con un X-Forwarded-For distinto → {burst} × 401; la "
+            f"{burst + 1}.ª → 429 RATE_LIMITED (Retry-After {seconds} s) ({elapsed:.2f} s); la clave ya válida de "
+            f"{a.bypass_email} → 200 desde la IP frenada"
+        )
+
+    def limit_other_ip(self) -> str:
+        """Desde el equipo, otra IP que la del contenedor: una clave desconocida sigue recibiendo 401 (el límite es por
+        cliente)."""
+        a = self.args
+        payload = h3.request_body("chat", f"e2e-h4-{self.nonce}-limite-chat", "Hola.")
+        headers = {"X-Baas-Api-Key": unknown_key(), "Authorization": f"Bearer {h3.FAKE_OPENAI_KEY}"}
+        proxy = h3.http(
+            "POST", h3.api_url(self.bypass_binding, "chat"), headers=headers, payload=payload, timeout=a.timeout
+        )
+        mcp = h3.http("POST", str(self.bypass_binding["mcp_url"]), payload=MCP_INITIALIZE, timeout=a.timeout,
+                      headers={"Authorization": f"Bearer {unknown_key()}",
+                               "Accept": "application/json, text/event-stream"})  # fmt: skip
+        problems = [f"proxy: {p}" for p in rejected_problems(proxy, "chat")]
+        problems += [f"MCP: {p}" for p in rejected_problems(mcp, "mcp")]
+        check(not problems, "\n".join(problems) + "\n(desde otra IP que la del contenedor frenado)")
+        return "desde el equipo (otra IP): proxy → 401 baas_invalid_api_key y MCP → 401, sin 429"
+
     # --- el recorrido ------------------------------------------------------------------------------
     def run(self, runner: Runner) -> None:
         a = self.args
@@ -2816,7 +3153,7 @@ class E2EH4:
         need_obs = bool(groups & {"observacion", "interruptor", "originales"})
         if need_obs:
             step(s2, self.handshake_observation, needs=[s0])
-        if groups & {"observacion", "originales"}:
+        if groups & {"observacion", "originales", "limite"}:
             step(s2b, self.handshake_bypass, needs=[s0])
         if "originales" in groups:
             step(s2c, self.handshake_anon, needs=[s0])
@@ -2941,12 +3278,22 @@ class E2EH4:
             uso.register(runner, [s0, s1, s3])
         if "acl" in groups and self.inspector is not None:
             e2e_acl.register(runner, self, [s0])
+        if "limite" in groups and self.inspector is not None:
+            burst = a.auth_fail_burst
+            l1 = (f"13.1 proxy: {burst} claves desconocidas distintas desde una IP → 401 y la {burst + 1}.ª 429 "
+                  "(con un X-Forwarded-For falso distinto en cada una)")  # fmt: skip
+            step(l1, self.limit_proxy, needs=[s0, s2b])
+            step("13.2 proxy: una clave ya válida pasa desde la IP frenada", self.limit_known, needs=[l1])
+            step(f"13.3 MCP: {burst} claves desconocidas distintas → 401 y la {burst + 1}.ª 429 RATE_LIMITED; una ya "
+                 "válida pasa", self.limit_mcp, needs=[s0, s2b])  # fmt: skip
+            step("13.4 desde el equipo (otra IP), una clave desconocida → 401 en el proxy y en el MCP",
+                 self.limit_other_ip, needs=[s2b])  # fmt: skip
 
 
 def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> int:
     args = parse_args(argv)
     runner = Runner()
-    wants_containers = bool({"eliminar", "originales", "uso", "acl"} & set(args.only))
+    wants_containers = bool({"eliminar", "originales", "uso", "acl", "limite"} & set(args.only))
     inspector = inspector if inspector is not None else build_inspector(args) if wants_containers else None
     e2e = E2EH4(args, inspector)
     print(f"Prueba de punta a punta H4 · webapp {args.app_url} · proveedor falso {args.fake_url}"
@@ -2957,6 +3304,8 @@ def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> i
         print("NOTA: sin --inspect, el grupo «uso» omite 12.4, 12.5, 12.7, 12.8 y 12.9 (miran o paran contenedores)")
     if "acl" in args.only and inspector is None:
         print("NOTA: el grupo «acl» entra en Redis con las credenciales de cada servicio (--inspect): se omite")
+    if "limite" in args.only and inspector is None:
+        print(f"NOTA: el grupo «limite» envía desde el contenedor {LIMIT_SOURCE} (--inspect podman|docker): se omite")
     e2e.run(runner)
     report = {**runner.report(), "app_url": args.app_url, "fake_url": args.fake_url, "nonce": e2e.nonce,
               "only": args.only, "apis": args.apis,
