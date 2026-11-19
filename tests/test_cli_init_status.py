@@ -881,3 +881,71 @@ def test_invalid_address_prints_no_address_marker(home, project, fake_device, ca
     code, out = run(init(project, "--app-url", "esto no es una url"), capsys)
     assert code == 2
     assert "[BAAS_APP_URL " not in out
+
+
+# --- `unchanged` exige que no se haya reescrito nada del proyecto ---------------------------------------------
+
+
+def bound_project(project: Path, server: FakeBaasServer, capsys: pytest.CaptureFixture[str]) -> str:
+    key = save_key("analista@demo.test", server.url)
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+    return key
+
+
+def test_init_with_nothing_to_rewrite_is_unchanged(home, project, server, fake_claude, capsys) -> None:
+    bound_project(project, server, capsys)
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT unchanged]"
+
+
+def test_init_rewriting_a_stale_key_in_the_project_is_linked(home, project, server, fake_claude, capsys) -> None:
+    """La clave compartida se renovó desde otro proyecto: aquí la sesión en marcha aún tiene la vieja."""
+    bound_project(project, server, capsys)
+    settings = project / ".claude/settings.local.json"
+    data = json.loads(settings.read_text())
+    data["env"]["ANTHROPIC_CUSTOM_HEADERS"] = "X-Baas-Api-Key: baas_vieja"
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+    assert "baas_vieja" not in settings.read_text()
+
+
+def test_init_recreating_a_deleted_settings_file_is_linked(home, project, server, fake_claude, capsys) -> None:
+    bound_project(project, server, capsys)
+    (project / ".claude/settings.local.json").unlink()
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+
+
+def test_init_repairing_damaged_json_is_linked(home, project, server, fake_claude, capsys) -> None:
+    bound_project(project, server, capsys)
+    (project / ".claude/settings.local.json").write_text("{esto no es json")
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+
+
+def test_init_rewriting_the_binding_is_linked(home, project, server, fake_claude, capsys) -> None:
+    """Si cambia la dirección del servidor de conocimiento, el MCP se registra de nuevo y hay que reiniciar."""
+    bound_project(project, server, capsys)
+    binding_file = project / ".claude/baas.local.json"
+    binding = json.loads(binding_file.read_text())
+    binding["mcp_url"] = "https://otro.example.com/mcp"
+    binding_file.write_text(json.dumps(binding, indent=2, ensure_ascii=False) + "\n")
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert last_line(out) == "[BAAS_RESULT linked]"
+
+
+def test_init_with_mcp_not_registered_is_linked(home, project, server, fake_claude, capsys, monkeypatch) -> None:
+    bound_project(project, server, capsys)
+    monkeypatch.setenv("FAKE_CLAUDE_EXIT", "1")  # el registro falla: queda un paso pendiente
+    code, out = run(init(project), capsys)
+    assert code == 0, out
+    assert "AVISO" in out
+    assert last_line(out) == "[BAAS_RESULT linked]"

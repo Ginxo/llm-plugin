@@ -175,6 +175,12 @@ def test_no_skill_allows_a_bare_or_wildcard_tool(skill: Path) -> None:
         assert command[2] != "*", tool  # el subcomando nunca es un comodín
 
 
+def test_connection_failure_sentence_does_not_show_the_address() -> None:
+    text = INIT_SKILL.read_text(encoding="utf-8")
+    assert not [s for s in _shown_texts(INIT_SKILL) if "<dirección>" in s and "No encuentro" in s]
+    assert "No encuentro el servidor de BaaS-AI-IP." in text
+
+
 def test_init_skill_never_mentions_local_secret_files() -> None:
     text = INIT_SKILL.read_text(encoding="utf-8")
     assert ".env" not in text
@@ -203,7 +209,13 @@ def test_init_skill_keys_on_result_markers_and_covers_new_rows() -> None:
         "Esa dirección no parece válida; tiene que empezar por https://",
     ):  # fmt: skip
         assert needle in text, needle
-    assert "primera línea con" not in text  # ya no se deduce de «vinculado»/«actualizado»
+    assert "primera línea con" not in text
+    # Fila de cierre: cualquier salida que no esté en la tabla tampoco deja a la persona sin siguiente paso.
+    assert "Cualquier otra salida" in text
+    assert "Algo no ha ido como esperaba. Vuelve a intentarlo con /baas-init" in text
+    assert "no es la esperada" in text
+    assert "respuesta inesperada" in text
+    assert "Ahora mismo no puedo conectar" in text  # ya no se deduce de «vinculado»/«actualizado»
 
 
 def test_status_skill_is_plain_and_points_to_init() -> None:

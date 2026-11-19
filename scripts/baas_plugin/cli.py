@@ -10,8 +10,9 @@ renueva sola una clave revocada) · 6 red o servidor
 (repetir `init --wait`) · 22 la persona canceló la conexión · 23 el código de aprobación caducó.
 
 `init` termina con una marca para la skill: en una salida 0, `[BAAS_RESULT linked]` (vinculación nueva, clave
-renovada o conexión aprobada en esta ejecución) o `[BAAS_RESULT unchanged]` (ya estaba vinculado, nada que
-cambiar); en una salida 6, `[BAAS_APP_URL <dirección>]` con la dirección probada (nunca con credenciales).
+renovada o conexión aprobada en esta ejecución) o `[BAAS_RESULT unchanged]` (ya estaba vinculado y no se reescribió
+nada: ni ajustes, ni vinculación, ni registro pendiente); en una salida 6, `[BAAS_APP_URL <dirección>]` con
+la dirección probada (nunca con credenciales).
 
 `run-script` es la excepción: devuelve **íntegro** el código de salida del script, que puede ser
 cualquiera (también 9 o 10). Sus errores propios salen, además, con una línea `BAAS_ERROR=<código>` en
@@ -305,8 +306,8 @@ def _init(args: argparse.Namespace, paths: BaasPaths, values: dict[str, str], ap
     )
     added = project.ensure_gitignore(proj, ignore)
 
-    project.write_settings_local(proj, org.proxy_anthropic_url, api_key)
-    project.write_binding(
+    settings_changed = project.write_settings_local(proj, org.proxy_anthropic_url, api_key)
+    binding_changed = project.write_binding(
         proj,
         {
             "org": org.slug,
@@ -326,8 +327,18 @@ def _init(args: argparse.Namespace, paths: BaasPaths, values: dict[str, str], ap
     reg = mcp_config.register_mcp_server(proj, org.mcp_url, mcp_config.helper_command(helper))
 
     action = "vinculado" if current != org.slug else "actualizado"
-    # `unchanged` solo si nada cambia para la persona: misma organización, clave que ya valía y nada reparado.
-    unchanged = current == org.slug and not via_approval and not any(repaired)
+    # `unchanged` solo si nada cambia para la persona: misma organización, clave que ya valía y nada reescrito
+    # en el proyecto (ajustes, vinculación ni reparaciones) ni pendiente en el MCP. Si se reescribió algo, la sesión
+    # en marcha aún tiene lo anterior y hay que reiniciar. El registro del MCP se rehace siempre, así que "nuevo" se
+    # deduce de que cambie la vinculación (su dirección) o de que no haya podido registrarse.
+    unchanged = (
+        current == org.slug
+        and not via_approval
+        and not any(repaired)
+        and not settings_changed
+        and not binding_changed
+        and reg.registered
+    )
     _p(
         f"Proyecto {proj} {action}: organización {org.describe()}.",
         f"Usuario: {hs.email} ({hs.platform_role}).",
