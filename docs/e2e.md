@@ -300,6 +300,7 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--timeout` | `60` | Tiempo máximo de cada petición HTTP |
 | `--usage-timeout` | `90` | Grupo `uso`: espera del uso del MCP (ventana de 5 s), de la foto de disco (cada 30 s) y de un servicio que se vuelve a arrancar |
 | `--overhead-n` | `200` | Grupo `uso` (12.10): pares de peticiones (directo y por el proxy) que se miden |
+| `--overhead-p95-ms` | `10` | Grupo `uso` (12.10): umbral del p95 del sobrecoste (el objetivo de `fase-1-h4-mediciones.md`); se puede subir en un ejecutor lento de la CI sin tocar el código |
 | `--usage-window` | `5` | Grupo `uso`: `BAAS_USAGE_WINDOW_SECONDS` del MCP de la pila (5 en desarrollo); 12.3 espera una ventana más 1 s antes de dar el recuento por cerrado |
 | `--json <fichero>` | — | Informe en JSON (pasos, estado, duración, detalle, identificador de la ejecución) |
 
@@ -399,6 +400,7 @@ su organización `uso-<ejecución>-<paso>` con usuarios de la semilla como miemb
 
 | Paso | Qué comprueba |
 | :--- | :--- |
+| 12.0 | La pila tiene la Fase 4: `GET /api/v1/orgs/baas-ai-ip/usage/traffic` (PLATFORM_ADMIN) → `200`. Con `404`, falla con «pila sin la Fase 4 (observabilidad de uso): reconstruye con los repos de la Fase 4» y los pasos 12.x quedan `SALTADO` |
 | 12.1 | N peticiones (Messages, Messages en *stream*, Chat y Responses) → `usage/traffic`: `requests` N, `tokens_in/out` = los que declara el proveedor, `bytes_in` = la longitud exacta de los cuerpos enviados y `bytes_out` = la de los recibidos; la franja local (`hours`, zona de la organización) da N y la complementaria 0; `group_by` `hour`, `weekday_hour` (168 celdas), `user` y `model` (con su proveedor) |
 | 12.2 | `<command-name>/<org>:facturacion</command-name>` (como lo envía Claude Code: el envoltorio en un bloque y la petición en otro) y «usa la herramienta skill `<org>:informes`» (el proveedor falso responde con `tool_use` de `Skill`), cada una en una conversación de **dos turnos correlacionados** (comprobado: `turn_count` 2). En el del comando, el `<command-name>` va en el historial del **cuerpo** que envía el cliente (no en el `request_original` del segundo turno, que es la respuesta anterior y la pregunta nueva); en el de la herramienta, el `request_original` del segundo turno empieza por el `[tool_use: Skill]` y trae el `tool_result` «Launching skill: …» (precondición: se lee `GET …/turns/<n>` como dueño y, si no están, el paso falla) → `INVOKED` 1 cada una (un extractor que contara la herramienta también en `request_original` contaría 2); otro plugin (`otro:cosa`), otra organización (`demo:cosa-<ejecución>`, que tampoco aparece en `demo`: **depende de la organización `demo` de la semilla de desarrollo**), un slug que empieza igual, el listado de skills y `/<org>:x` sin envoltorio → 0 |
 | 12.3 | Una sincronización como la del plugin (`baas_list_skills`, `baas_get_skill_package`, `baas_get_skill_files`) → `SYNCED` 1 y todo lo demás 0 |
@@ -411,7 +413,7 @@ su organización `uso-<ejecución>-<paso>` con usuarios de la semilla como miemb
 | 12.10 | 200 pares intercalados de ~2 KB (Messages, bypass) directos al proveedor falso y por el proxy con conexión persistente: el p95 del sobrecoste debe quedar por debajo de 10 ms (objetivo de `fase-1-h4-mediciones.md`). Es un **control grueso**: el proveedor falso añade ~40 ms en muchas respuestas con conexión persistente (Nagle y ACK retardado). Que el proxy **no empeora respecto a la referencia** lo comprueban sus pruebas de sobrecoste en proceso, que no forman parte de este e2e: en `llm-interceptor-proxy`, `GO_IN_CONTAINER=1 scripts/go.sh go test -count=1 -run 'TestBypassOverheadP95\|TestAIIPOverheadP95\|TestObserveOverheadP95' -v ./internal/proxy/` |
 
 Con podman, `podman start` de `webapp-api` vuelve a ejecutar sus dependencias ya terminadas (`webapp-migrate` y
-`webapp-seed`, idempotentes); `podman restart` no sirve con `podman-compose` (las da por «no arrancadas»). La pila
+`webapp-seed`, idempotentes); `podman restart` no sirve con `podman-compose` (las da por «no arrancadas»). Si una ejecución se corta en el grupo `uso`, puede quedar una organización `uso-<ejecución>-<paso>` (se bloquea y elimina igual desde W3), un servicio en pausa o parado (`podman unpause`/`podman start` de `webapp-api` o `mcp-server`) y, si se corta en 12.8, la retención de métricas en 60 meses (la siguiente ejecución de 12.8 lo avisa; se restaura en Plataforma → Uso). La pila
 simulada (`dev/fake_h4_stack.py`) no simula este grupo: sus utilidades e inspector se prueban en `tests/test_e2e_uso.py`.
 
 Los pasos que dependen de uno fallido quedan `SALTADO` (y cuentan como fallo). El bloqueo, la eliminación y la

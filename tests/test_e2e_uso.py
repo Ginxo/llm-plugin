@@ -550,6 +550,57 @@ class PurgeTest(unittest.TestCase):
         self.assertEqual(self.months(puts), [60, 13])
 
 
+class MidnightTest(unittest.TestCase):
+    """Peticiones a las 23:59:5x locales y consulta a las 00:00:0x: el rango por defecto incluye el día anterior."""
+
+    def test_default_range_starts_yesterday(self) -> None:
+        group = e2e_uso.UsoGroup(e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), inspector=None))
+        madrid = ZoneInfo("Europe/Madrid")
+        org = e2e_uso.UsoOrg("uso-x-tr", ORG_ID, madrid)
+        sent = datetime(2026, 11, 18, 23, 59, 55, tzinfo=madrid)
+        later = datetime(2026, 11, 19, 0, 0, 3, tzinfo=madrid)
+        with mock.patch.object(e2e_uso, "local_now", return_value=later):
+            dates = group.today(org)
+            self.assertLessEqual(dates["from"], sent.date().isoformat())
+            self.assertEqual(dates, {"from": "2026-11-18", "to": "2026-11-19"})
+            self.assertEqual(group.today(org, sent), {"from": "2026-11-18", "to": "2026-11-19"})
+
+
+class RetentionWarningTest(unittest.TestCase):
+    def test_a_retention_left_by_a_killed_run_is_reported(self) -> None:
+        self.assertEqual(e2e_uso.retention_warning(13), "")
+        self.assertIn("AVISO", e2e_uso.retention_warning(e2e_uso.TEST_RETENTION))
+
+
+class Phase4Test(unittest.TestCase):
+    def test_a_stack_without_the_usage_api_is_named(self) -> None:
+        self.assertIsNone(e2e_uso.phase4_problem(200))
+        self.assertIn("pila sin la Fase 4", e2e_uso.phase4_problem(404) or "")
+        self.assertIn("reconstruye", e2e_uso.phase4_problem(404) or "")
+        self.assertIn("HTTP 500", e2e_uso.phase4_problem(500) or "")
+
+
+class CreateOrgTest(unittest.TestCase):
+    def test_a_half_created_organization_is_deleted(self) -> None:
+        e2e = e2e_h4.E2EH4(e2e_h4.parse_args(["--inspect", "none"]), inspector=None)
+        group = e2e_uso.UsoGroup(e2e)
+        posts: list[str] = []
+
+        def admin_post(path: str, payload: object = None, who: object = None, method: str = "POST") -> e2e_h4.Http:
+            posts.append(f"{method} {path}")
+            if path == "/api/v1/orgs":
+                body = {"organization": {"id": ORG_ID, "timezone": "Europe/Madrid"}}
+                return e2e_h4.Http(201, [], json.dumps(body).encode())
+            if path.endswith("/members"):
+                return e2e_h4.Http(500, [], b'{"error": "BOOM"}')
+            return e2e_h4.Http(200, [], b"{}")
+
+        e2e.admin_post = admin_post  # type: ignore[method-assign]
+        with self.assertRaises(e2e_h4.StepError):
+            group.create_org("tr", {"analista@demo.test": "USER"})
+        self.assertIn(f"POST /api/v1/orgs/uso-{e2e.nonce}-tr/delete", posts, "la organización a medias se elimina")
+
+
 class GroupTest(unittest.TestCase):
     def test_uso_is_a_group_and_runs_alone(self) -> None:
         self.assertIn("uso", e2e_h4.GROUPS)
@@ -557,6 +608,8 @@ class GroupTest(unittest.TestCase):
         ns = e2e_h4.parse_args([])
         self.assertIn("uso", ns.only)
         self.assertEqual((ns.usage_timeout, ns.overhead_n, ns.usage_window), (90.0, 200, 5.0))
+        self.assertEqual(ns.overhead_p95_ms, 10.0)
+        self.assertEqual(e2e_h4.parse_args(["--overhead-p95-ms", "25"]).overhead_p95_ms, 25.0)
 
     def test_steps_are_registered_in_order(self) -> None:
         ns = e2e_h4.parse_args(["--only", "uso", "--inspect", "none"])
@@ -568,14 +621,14 @@ class GroupTest(unittest.TestCase):
 
         e2e_h4.E2EH4(ns, inspector=None).run(Recorder())  # type: ignore[arg-type]
         uso = [n for n in names if n.startswith("12.")]
-        self.assertEqual([n.split(" ")[0] for n in uso], ["12.1", "12.2", "12.3", "12.6", "12.10"],
+        self.assertEqual([n.split(" ")[0] for n in uso], ["12.0", "12.1", "12.2", "12.3", "12.6", "12.10"],
                          "sin inspector solo los pasos que no miran dentro de los contenedores")  # fmt: skip
         self.assertFalse([n for n in names if n.startswith(("5.", "8.", "9.", "10.", "11."))])
         inspector = e2e_h4.MissingInspector("prueba")
         names.clear()
         e2e_h4.E2EH4(ns, inspector=inspector).run(Recorder())  # type: ignore[arg-type]
         uso = [n.split(" ")[0] for n in names if n.startswith("12.")]
-        self.assertEqual(uso, [f"12.{i}" for i in range(1, 11)])
+        self.assertEqual(uso, [f"12.{i}" for i in range(11)], "12.0 (la pila tiene la Fase 4) va el primero")
 
 
 if __name__ == "__main__":

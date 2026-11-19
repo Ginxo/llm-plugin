@@ -54,7 +54,6 @@ SOURCES = ("INVOKED", "SYNCED", "SKILL_READ", "SCRIPT_DOWNLOADED", "KNOWLEDGE_RE
 CATEGORIES = ("skills", "scripts", "schemas", "knowledge", "versions", "index")
 SCHEMA_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".sql", ".xsd"})
 DISK_MARGIN = 0.01  # contrato §4: ≤ 1 % en el e2e (el disco puede cambiar mientras se mide)
-OVERHEAD_P95_MS = 10.0  # fase-1-h4-mediciones §1: sobrecoste del proxy en bypass (~2 KB), p95 < 10 ms
 OVERHEAD_BODY = 2000  # bytes del texto de cada petición de 12.10 (~2 KB, como un cuerpo corriente de Claude Code)
 USAGE_STREAM, TRACES_STREAM = "baas:usage", "baas:traces"
 PERSISTENT, EPHEMERAL = "redis", "redis-ephemeral"
@@ -332,6 +331,34 @@ def leaks(raw: str | bytes, needles: Iterable[str]) -> list[str]:
     return [n for n in needles if n in text or n in decoded]
 
 
+def local_now(tz: ZoneInfo) -> datetime:
+    """La hora local de la organización (aparte, para poder simular el reloj en los tests)."""
+    return datetime.now(tz)
+
+
+def phase4_problem(status: int) -> str | None:
+    """12.0: qué decir si `GET …/usage/traffic` (como PLATFORM_ADMIN, de una organización que existe) no da 200."""
+    if status == 200:
+        return None
+    if status == 404:
+        return (
+            "pila sin la Fase 4 (observabilidad de uso): reconstruye con los repos de la Fase 4 (webapp, mcp-server, "
+            "llm-interceptor-proxy y deploy); GET …/usage/traffic → 404"
+        )
+    return f"GET …/usage/traffic → HTTP {status} (se esperaba 200): ¿la pila tiene la Fase 4?"
+
+
+def retention_warning(previous: int) -> str:
+    """12.8: si la retención ya era la de la prueba, seguramente la dejó así una ejecución anterior cortada (SIGKILL)
+    sin restaurarla: se avisa en el detalle del paso para que alguien la ponga a mano en su valor (13 por defecto)."""
+    if previous != TEST_RETENTION:
+        return ""
+    return (
+        f". AVISO: la retención ya estaba en {TEST_RETENTION} meses al empezar (¿una ejecución anterior cortada?): "
+        "ponla a mano en su valor (13 por defecto) en Plataforma → Uso"
+    )
+
+
 def rfc3339(at: datetime) -> str:
     return at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -442,7 +469,17 @@ class UsoGroup:
         check(res.status == 201, f"POST /api/v1/orgs ({slug}) → {describe(res)}")
         data = (res.json() or {}).get("organization") or {}
         org = UsoOrg(slug, str(data.get("id") or ""), ZoneInfo(str(data.get("timezone") or "Europe/Madrid")))
-        check(org.org_id, f"POST /api/v1/orgs no devolvió el id de «{slug}»")
+        try:
+            check(org.org_id, f"POST /api/v1/orgs no devolvió el id de «{slug}»")
+            self.add_members(org, members)
+        except BaseException:
+            with contextlib.suppress(Exception):  # no dejar una organización a medias
+                self.drop_org(slug)
+            raise
+        return org
+
+    def add_members(self, org: UsoOrg, members: dict[str, str]) -> None:
+        slug = org.slug
         for email, role in members.items():
             res = self.e.admin_post(f"/api/v1/orgs/{slug}/members", {"email": email, "governance_role": role})
             check(res.status == 201, f"añadir a {email} ({role}) a «{slug}» → {describe(res)}")
@@ -451,7 +488,6 @@ class UsoGroup:
                 self.user_ids[email] = str(member["user_id"])
             self.key(email)
             org.bindings[email] = self.e.handshake(email, slug, ai_ip=False)
-        return org
 
     def drop_org(self, slug: str) -> None:
         """Bloquea y elimina la organización (sin desactivar a nadie: los miembros son de la semilla)."""
@@ -517,9 +553,10 @@ class UsoGroup:
         return got["data"]
 
     def today(self, org: UsoOrg, start: datetime | None = None) -> dict[str, str]:
-        """`from`/`to` locales que cubren desde `start` (o ahora) hasta ahora."""
-        now = datetime.now(org.tz)
-        first = (start or now).astimezone(org.tz)
+        """`from`/`to` locales que cubren desde `start` hasta ahora; sin `start`, desde **ayer**: una petición enviada a
+        las 23:59:5x y consultada a las 00:00:0x sigue dentro (cada paso crea su organización, sin histórico)."""
+        now = local_now(org.tz)
+        first = (start or now - timedelta(days=1)).astimezone(org.tz)
         return {"from": first.date().isoformat(), "to": now.date().isoformat()}
 
     def totals(self, org: UsoOrg, who: str | None = None, **params: Any) -> dict[str, Any]:
@@ -643,6 +680,13 @@ class UsoGroup:
 
         self.wait(problems, self.a.usage_timeout, what, every=0.5)
         return list(got["events"])
+
+    # --- 12.0 la pila tiene la Fase 4 -----------------------------------------------------------------
+    def phase4(self) -> str:
+        res = self.report("traffic", "baas-ai-ip", self.admin)  # la organización meta existe siempre
+        problem = phase4_problem(res.status)
+        check(problem is None, f"{problem}: {h3.snippet(res.body, 200)}")
+        return "GET /api/v1/orgs/baas-ai-ip/usage/traffic → 200 (la API de uso existe)"
 
     # --- 12.1 tráfico -------------------------------------------------------------------------------
     def traffic(self) -> str:
@@ -1242,6 +1286,7 @@ class UsoGroup:
             f"{TEST_RETENTION + 1} meses (tráfico, contenido y foto) se borran y las de hace {TEST_RETENTION - 1} no; "
             "la conversación borrada sigue contando (1 petición); eliminar "
             f"«{org.slug}» deja 0 filas suyas ({before} antes); retención restaurada a {previous}"
+            + retention_warning(previous)
         )
 
     def purge_with_retention(self, months: int, previous: int, purged: Callable[[], None]) -> list[str]:
@@ -1254,11 +1299,11 @@ class UsoGroup:
         notes: list[str] = []
         changed = stopped = started = False
         try:
+            changed = True  # antes del PUT: si se aplica y la respuesta se pierde, también se restaura (inocuo)
             res = self.e.webapp(
                 "PUT", "/api/v1/platform/settings/metrics-retention", self.admin, {"months": months, "reason": REASON}
             )
             check(res.status == 200, f"PUT …/metrics-retention {{months: {months}}} → {describe(res)}")
-            changed = True
             stopped = True  # antes de `stop`: si falla a medias, también se intenta arrancar
             insp.service_control(CONSUMER, "stop")
             insp.service_control(CONSUMER, "start")
@@ -1375,6 +1420,7 @@ class UsoGroup:
     # --- 12.10 sobrecoste del proxy ---------------------------------------------------------------------
     def proxy_overhead(self) -> str:
         n = int(self.a.overhead_n)
+        limit = float(self.a.overhead_p95_ms)  # 10 ms: objetivo de fase-1-h4-mediciones §1 (bypass, ~2 KB)
         with self.org("lt", {self.user: "USER"}) as org:
             binding = org.bindings[self.user]
             anthropic = {"x-api-key": h3.FAKE_ANTHROPIC_KEY, "anthropic-version": "2023-06-01"}
@@ -1401,18 +1447,21 @@ class UsoGroup:
         detail = (
             f"{n} pares intercalados (~2 KB, Messages, bypass): directo p50/p95 {got['direct_p50']:.2f}/"
             f"{got['direct_p95']:.2f} ms, por el proxy {got['proxy_p50']:.2f}/{got['proxy_p95']:.2f} ms → sobrecoste "
-            f"p50 {got['p50']:.2f} ms y p95 {got['p95']:.2f} ms (umbral p95 < {OVERHEAD_P95_MS:g} ms, "
+            f"p50 {got['p50']:.2f} ms y p95 {got['p95']:.2f} ms (umbral p95 < {limit:g} ms, --overhead-p95-ms; "
             "fase-1-h4-mediciones). Control grueso: que no empeora respecto a la referencia lo dicen las pruebas "
             "de sobrecoste en proceso del proxy (TestBypassOverheadP95, TestAIIPOverheadP95, TestObserveOverheadP95), "
             "que no forman parte de este e2e"
         )
-        check(got["p95"] < OVERHEAD_P95_MS, f"el sobrecoste empeora: {detail}")
+        check(got["p95"] < limit, f"el sobrecoste empeora: {detail}")
         return detail
 
     # --- el recorrido ----------------------------------------------------------------------------------
     def register(self, runner: Runner, base: list[str]) -> None:
         step = runner.step
         has_inspector = self.e.inspector is not None
+        ready = "12.0 la pila tiene la Fase 4 (API de uso)"
+        step(ready, self.phase4, needs=base)
+        base = [*base, ready]
         step("12.1 tráfico: peticiones, tokens, bytes y franja local", self.traffic, needs=base)
         step(
             "12.2 /org:skill y la herramienta Skill cuentan INVOKED; otra organización no", self.invocations, needs=base

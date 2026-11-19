@@ -1017,6 +1017,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--usage-timeout", type=float, default=90,
                    help="Grupo uso: espera (s) del uso del MCP, de la foto y de un servicio reiniciado")  # fmt: skip
     p.add_argument("--overhead-n", type=int, default=200, help="Grupo uso (12.10): pares de peticiones medidos")
+    p.add_argument("--overhead-p95-ms", type=float, default=10.0,
+                   help="Grupo uso (12.10): umbral (ms) del p95 del sobrecoste")  # fmt: skip
     p.add_argument("--usage-window", type=float, default=5,
                    help="Grupo uso: BAAS_USAGE_WINDOW_SECONDS del MCP (5 en desarrollo)")  # fmt: skip
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
