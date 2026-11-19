@@ -1318,7 +1318,7 @@ class FullRunTest(unittest.TestCase):
         once += ["8.6", "8.7", "8.8", "8.9", "8.10", "8.11", "8.12", "9.1 ", "9.1b", "9.2", "9.3", "9.4", "9.5"]
         once += ["9.6", "9.7", "9.8", "10.0", "10.1", "10.2", "10.3", "10.4", "10.5", "10.6", "10.7"]
         once += ["11.1 ", "11.2", "11.3", "11.4", "11.5", "11.6", "11.7", "11.8", "11.9", "11.10", "11.11", "11.12 "]
-        once += ["11.12b", "11.13", "11.14", "13.1", "13.2", "13.3", "13.4"]
+        once += ["11.12b", "11.13", "11.14", "14.1", "14.2", "14.3", "14.4"]
         for prefix in once:
             self.assertEqual(len([n for n in steps if n.startswith(prefix)]), 1, prefix)
         self.assertEqual(
@@ -1340,7 +1340,7 @@ class FullRunTest(unittest.TestCase):
             self.assert_all_ok(*run_e2e(stack))
             self.assertEqual(waits, [], "la primera ejecución encuentra los cubos llenos")
             self.assert_all_ok(*run_e2e(stack))
-        # la segunda espera una vez, en 13.1, a que se llene el cubo del proxy; el del MCP se llena mientras tanto
+        # la segunda espera una vez, en 14.1, a que se llene el cubo del proxy; el del MCP se llena mientras tanto
         self.assertEqual(waits, [181.0])
 
     def test_leaves_the_switch_off_even_when_it_started_on(self) -> None:
@@ -1397,20 +1397,20 @@ class FullRunTest(unittest.TestCase):
             calls = list(stack.inspector.caddy_calls)
         self.assert_all_ok(code, steps, out)
         self.assertEqual(
-            sorted(n.split(" ")[0] for n in steps), ["0.", "1.", "13.1", "13.2", "13.3", "13.4", "2b.", "3."]
+            sorted(n.split(" ")[0] for n in steps), ["0.", "1.", "14.1", "14.2", "14.3", "14.4", "2b.", "3."]
         )
-        first = next(s for n, s in steps.items() if n.startswith("13.1"))
+        first = next(s for n, s in steps.items() if n.startswith("14.1"))
         self.assertIn("30 × 401", first["detail"])
         self.assertIn("baas_auth_rate_limited", first["detail"])
         self.assertIn("rate_limit_error", first["detail"])
-        self.assertIn("RATE_LIMITED", next(s for n, s in steps.items() if n.startswith("13.3"))["detail"])
-        # las ráfagas salen del contenedor (su cubo, vacío) y no gastan el del equipo: 13.4 solo prueba una clave
+        self.assertIn("RATE_LIMITED", next(s for n, s in steps.items() if n.startswith("14.3"))["detail"])
+        # las ráfagas salen del contenedor (su cubo, vacío) y no gastan el del equipo: 14.4 solo prueba una clave
         self.assertEqual(sorted(proxy), sorted([fake_h4_stack.CONTAINER, "127.0.0.1"]))
         self.assertLess(proxy[fake_h4_stack.CONTAINER][0], 1)
         self.assertLess(mcp[fake_h4_stack.CONTAINER][0], 1)
         self.assertEqual(proxy["127.0.0.1"][0], 29)
         self.assertEqual(mcp["127.0.0.1"][0], 29)
-        # 13.1: 31 claves desconocidas distintas y 5 de más (por si vuelven fichas durante la ráfaga), cada una con un
+        # 14.1: 31 claves desconocidas distintas y 5 de más (por si vuelven fichas durante la ráfaga), cada una con un
         # X-Forwarded-For distinto, y una de Messages
         burst = calls[0]
         keys = [r.headers["X-Baas-Api-Key"] for r in burst]
@@ -1441,31 +1441,31 @@ class FullRunTest(unittest.TestCase):
             code, steps, out = run_e2e(stack, "--only", "limite")
         self.assert_all_ok(code, steps, out)
         self.assertEqual(waits, [], "una ráfaga lenta no espera a que se llene el cubo")
-        for prefix in ("13.1", "13.3"):
+        for prefix in ("14.1", "14.3"):
             self.assertIn("32 × 401", next(s for n, s in steps.items() if n.startswith(prefix))["detail"], prefix)
         # la de Messages, al final, se llevó la ficha que volvió: otra justo después sí recibe el 429
-        self.assertIn("volvió una ficha", next(s for n, s in steps.items() if n.startswith("13.1"))["detail"])
+        self.assertIn("volvió una ficha", next(s for n, s in steps.items() if n.startswith("14.1"))["detail"])
 
     def test_the_limit_group_follows_the_configured_burst_and_rate(self) -> None:
         with fake_h4_stack.FakeH4Stack(auth_fail_burst=5, auth_fail_per_minute=60) as stack:
             code, steps, out = run_e2e(stack, "--only", "limite", "--auth-fail-burst", "5",
                                        "--auth-fail-per-minute", "60")  # fmt: skip
         self.assert_all_ok(code, steps, out)
-        self.assertIn("5 × 401", next(s for n, s in steps.items() if n.startswith("13.1"))["detail"])
+        self.assertIn("5 × 401", next(s for n, s in steps.items() if n.startswith("14.1"))["detail"])
         with fake_h4_stack.FakeH4Stack(auth_fail_burst=5) as stack, instant_refill(stack) as waits:
             code, steps, out = run_e2e(stack, "--only", "limite")
         self.assertEqual(code, 1, "una pila con otra capacidad no pasa por la de omisión (30)")
-        self.assertEqual(waits, [181.0, 181.0], "13.1 y 13.3 esperan una vez por si el cubo no estaba lleno")
-        self.assertIn("la 6.ª", next(s for n, s in steps.items() if n.startswith("13.1"))["detail"])
+        self.assertEqual(waits, [181.0, 181.0], "14.1 y 14.3 esperan una vez por si el cubo no estaba lleno")
+        self.assertIn("la 6.ª", next(s for n, s in steps.items() if n.startswith("14.1"))["detail"])
 
     def test_the_known_key_step_checks_that_the_ip_is_limited(self) -> None:
-        """13.2 no da por buena una clave que pasa si la IP del contenedor no está frenada en ese momento."""
+        """14.2 no da por buena una clave que pasa si la IP del contenedor no está frenada en ese momento."""
         with fake_h4_stack.FakeH4Stack() as stack:
             argv = ["--app-url", stack.app_url, "--fake-url", stack.fake_url, "--timeout", "10"]
             e2e = e2e_h4.E2EH4(e2e_h4.parse_args(argv), stack.inspector, nonce="abcdefghij")
             e2e.handshake_bypass()
             with self.assertRaises(e2e_h4.StepError) as ctx:
-                e2e.limit_known()  # sin 13.1 antes: el cubo del contenedor está lleno
+                e2e.limit_known()  # sin 14.1 antes: el cubo del contenedor está lleno
         self.assertIn("no estaba frenada", str(ctx.exception))
         self.assertIn("401, 401, 401", str(ctx.exception))
 
@@ -1473,18 +1473,18 @@ class FullRunTest(unittest.TestCase):
         with fake_h4_stack.FakeH4Stack() as stack:
             code, steps, out = run_e2e(stack, "--only", "limite", inspector=None)
         self.assertEqual(code, 0, out)
-        self.assertFalse([n for n in steps if n.startswith("13.")], "sin inspector no se registra ningún paso 13.x")
+        self.assertFalse([n for n in steps if n.startswith("14.")], "sin inspector no se registra ningún paso 14.x")
         self.assertIn("limite", out.split("RESULTADO")[0], "y se dice por qué")
         missing = e2e_h4.MissingInspector("no hay motor")
         with fake_h4_stack.FakeH4Stack() as stack:
             code, steps, out = run_e2e(stack, "--only", "limite", inspector=missing)
         self.assertEqual(code, 1, out)
         by_prefix = {n.split(" ")[0]: s for n, s in steps.items()}
-        for prefix in ("13.1", "13.3"):
+        for prefix in ("14.1", "14.3"):
             self.assertEqual(by_prefix[prefix]["status"], "FALLO")
             self.assertIn("--inspect none", by_prefix[prefix]["detail"])
-        self.assertEqual(by_prefix["13.2"]["status"], "SALTADO")
-        self.assertEqual(by_prefix["13.4"]["status"], "OK", "desde el equipo no hace falta el contenedor")
+        self.assertEqual(by_prefix["14.2"]["status"], "SALTADO")
+        self.assertEqual(by_prefix["14.4"]["status"], "OK", "desde el equipo no hace falta el contenedor")
 
     def test_originals_group_sends_every_mode_and_api_and_leaves_nothing_behind(self) -> None:
         with fake_h4_stack.FakeH4Stack() as stack:
@@ -1650,20 +1650,20 @@ class FaultsTest(unittest.TestCase):
         "reactivate-audit-no-org": {"11.12 ": ("user.reactivated: org_slug = None",)},
         "audit-orgadmin-sees-disabled": {"11.12b": ("X ve 1 fila(s) user.disabled", "no debe ver ninguna")},
         "audit-orgadmin-blind": {"11.12b": ("X ve 0 fila(s) user.reactivated",)},
-        "limit-off-proxy": {"13.1": ("36 claves recibieron 401", "ninguna 429")},
-        "limit-off-mcp": {"13.3": ("36 claves recibieron 401", "ninguna 429")},
-        "limit-trusts-xff": {"13.1": ("ninguna 429", "X-Forwarded-For"), "13.3": ("ninguna 429", "X-Forwarded-For")},
-        "limit-blocks-known": {"13.2": ("clave ya válida", "HTTP 429"), "13.3": ("clave ya válida", "HTTP 429")},
-        "limit-global": {"13.4": ("HTTP 429", "otra IP")},
-        "limit-no-retry-after": {"13.1": ("Retry-After = None",), "13.3": ("Retry-After = None",)},
-        "limit-shape": {"13.1": ("baas_auth_rate_limited", "rate_limit_error")},
+        "limit-off-proxy": {"14.1": ("36 claves recibieron 401", "ninguna 429")},
+        "limit-off-mcp": {"14.3": ("36 claves recibieron 401", "ninguna 429")},
+        "limit-trusts-xff": {"14.1": ("ninguna 429", "X-Forwarded-For"), "14.3": ("ninguna 429", "X-Forwarded-For")},
+        "limit-blocks-known": {"14.2": ("clave ya válida", "HTTP 429"), "14.3": ("clave ya válida", "HTTP 429")},
+        "limit-global": {"14.4": ("HTTP 429", "otra IP")},
+        "limit-no-retry-after": {"14.1": ("Retry-After = None",), "14.3": ("Retry-After = None",)},
+        "limit-shape": {"14.1": ("baas_auth_rate_limited", "rate_limit_error")},
     }
 
     ORPHAN_PREFIXES = ("preview-", "orphans-", "reactivate-", "disabled-")  # solo los pasos 11 los comprueban
 
     def run_fault(self, fault: str) -> dict[str, dict]:
         only = ("--only", "huerfanos") if fault.startswith(self.ORPHAN_PREFIXES) else ()
-        if fault.startswith("limit-"):  # solo los pasos 13 (con el inspector de la pila simulada)
+        if fault.startswith("limit-"):  # solo los pasos 14 (con el inspector de la pila simulada)
             with fake_h4_stack.FakeH4Stack(faults={fault}) as stack:
                 code, steps, out = run_e2e(stack, "--only", "limite")
             self.assertEqual(code, 1, f"{fault}: {out}")

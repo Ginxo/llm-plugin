@@ -33,7 +33,9 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         en ningún dato; foto de disco frente al volumen del MCP; permisos y `usage.viewed`; el proxy con el consumidor
         y el MCP parados; retención y borrado; eventos repetidos; sobrecoste del proxy. Cada paso crea y elimina su
         organización (`uso-<ejecución>-…`).
-  13.   Límite de claves no válidas por IP (H4-13, contrato §7.5), desde el contenedor `fake-upstream` (otra IP que la
+  13.   ACL de Redis (H4-05, grupo «acl», `dev/e2e_acl.py`): con las credenciales reales de cada usuario, cada
+        servicio solo escribe lo suyo y ninguno entra como `default`; lo que la matriz prohíbe recibe `NOPERM`.
+  14.   Límite de claves no válidas por IP (H4-13, contrato §7.5), desde el contenedor `fake-upstream` (otra IP que la
         del equipo) a través de Caddy: 30 claves desconocidas distintas, cada una con un `X-Forwarded-For` falso
         distinto, reciben `401` y la 31.ª `429` con `Retry-After` en el proxy (`baas_auth_rate_limited`) y en el MCP
         (`RATE_LIMITED`); en una ráfaga lenta, el `429` puede llegar tras las fichas que volvieron mientras duraba. Una
@@ -43,9 +45,10 @@ Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream
 
     uv run python dev/e2e_h4.py --app-url http://app.localhost:8080 --fake-url http://127.0.0.1:18090
 
-Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10, los pasos 12.4, 12.5, 12.7, 12.8 y 12.9 y el grupo 13
-miran dentro de los contenedores (o los paran, o envían desde uno) con `podman`/`docker` (`--inspect none` los omite).
-Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el plugin.
+Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10, los pasos 12.4, 12.5, 12.7, 12.8 y 12.9 y los grupos
+13 y 14 miran dentro de los contenedores (o los paran, o envían desde uno) con `podman`/`docker` (`--inspect none`
+los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el
+plugin.
 `dev/fake_h4_stack.py` simula la pila (sin el grupo 12) para probar este script sin ella.
 """
 
@@ -1256,7 +1259,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=f"APIs que se prueban, separadas por comas: {', '.join(APIS)} (todas)")  # fmt: skip
     p.add_argument("--inspect", choices=("auto", "podman", "docker", "none"), default="auto",
                    help="Motor para mirar los contenedores («none» omite 9.1b, 9.8, el grupo 10, 12.4-12.5, "
-                        "12.7-12.9 y 13.x)")  # fmt: skip
+                        "12.7-12.9, 13.x y 14.x)")  # fmt: skip
     p.add_argument("--compose-project", default=os.environ.get("COMPOSE_PROJECT_NAME") or "baas-dev",
                    help="Proyecto de compose de la pila (por defecto, $COMPOSE_PROJECT_NAME o baas-dev)")  # fmt: skip
     p.add_argument("--mcp-data-dir", default="/data", help="BAAS_DATA_DIR del contenedor del MCP")
@@ -3338,13 +3341,13 @@ class E2EH4:
             e2e_acl.register(runner, self, [s0])
         if "limite" in groups and self.inspector is not None:
             burst = a.auth_fail_burst
-            l1 = (f"13.1 proxy: {burst} claves desconocidas distintas desde una IP → 401 y la {burst + 1}.ª 429 "
+            l1 = (f"14.1 proxy: {burst} claves desconocidas distintas desde una IP → 401 y la {burst + 1}.ª 429 "
                   "(con un X-Forwarded-For falso distinto en cada una)")  # fmt: skip
             step(l1, self.limit_proxy, needs=[s0, s2b])
-            step("13.2 proxy: una clave ya válida pasa desde la IP frenada", self.limit_known, needs=[l1])
-            step(f"13.3 MCP: {burst} claves desconocidas distintas → 401 y la {burst + 1}.ª 429 RATE_LIMITED; una ya "
+            step("14.2 proxy: una clave ya válida pasa desde la IP frenada", self.limit_known, needs=[l1])
+            step(f"14.3 MCP: {burst} claves desconocidas distintas → 401 y la {burst + 1}.ª 429 RATE_LIMITED; una ya "
                  "válida pasa", self.limit_mcp, needs=[s0, s2b])  # fmt: skip
-            step("13.4 desde el equipo (otra IP), una clave desconocida → 401 en el proxy y en el MCP",
+            step("14.4 desde el equipo (otra IP), una clave desconocida → 401 en el proxy y en el MCP",
                  self.limit_other_ip, needs=[s2b])  # fmt: skip
 
 
