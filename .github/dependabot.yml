@@ -1,0 +1,18 @@
+# Dependabot (knowledge#50, H4-12): mantiene al día los SHA de las acciones de los workflows y los digests de
+# las imágenes base, que están fijados en lugar de ir por etiqueta. Como mucho un PR agrupado por ecosistema al
+# mes (cada PR gasta minutos de Actions en la CI) y nunca una versión publicada hace menos de 7 días.
+# Dependabot abre sus PR desde ramas de este repositorio (dependabot/...), no desde un fork.
+# El plugin no construye imágenes: solo hay acciones.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      acciones:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
