@@ -128,6 +128,27 @@ class GroupStepsTest(unittest.TestCase):
         self.assertIn("GET baas:platform:status", detail)
 
 
+class UnusableAttemptTest(unittest.TestCase):
+    """Un intento que no se pudo hacer (auth, SETNAME, conexión) no es un rechazo de la ACL: el paso falla."""
+
+    def test_a_non_noperm_reply_fails_the_step(self) -> None:
+        for reply in ("WRONGPASS invalid username-password pair", "Could not connect to Redis", ""):
+            inspector = FakeInspector({("mcp", c): reply for c in ATTACKS})
+            status, detail = run_group(inspector)["13.2"]
+            self.assertEqual(status, "FALLO", reply)
+            self.assertIn(ATTACKS[0], detail)
+
+    def test_a_step_error_from_redis_as_is_a_failed_step_not_a_crash(self) -> None:
+        class Broken(FakeInspector):
+            def redis_as(self, service: str, user: str, command: str) -> str:
+                raise e2e_h4.StepError(f"no se pudo nombrar la conexión de {user} en {service}")
+
+        got = run_group(Broken())
+        self.assertEqual(got["13.2"][0], "FALLO")
+        self.assertIn("no se pudo nombrar", got["13.2"][1])
+        self.assertEqual(got["13.1"][0], "OK", "el resto de pasos sigue")
+
+
 class RedisAsTest(unittest.TestCase):
     def inspector(self) -> e2e_h4.ContainerInspector:
         return e2e_h4.ContainerInspector("fake", "acl-int")
@@ -156,6 +177,25 @@ class RedisAsTest(unittest.TestCase):
         self.assertIn("CLIENT SETNAME e2e-acl", script)
         self.assertIn("--user mcp", script)
         self.assertEqual(argv[-1], "SET baas:platform:status x", "la orden llega como argumento, no en el guion")
+
+    def run_as(self, out: str) -> str:
+        insp = self.inspector()
+        with mock.patch.object(insp, "_exec", return_value=out):
+            return insp.redis_as("redis", "mcp", "GET x")
+
+    def test_redis_as_fails_unless_setname_replied_ok(self) -> None:
+        for out in (
+            "AUTH failed: WRONGPASS invalid username-password pair\nNOAUTH Authentication required.\n",
+            "NOPERM User mcp has no permissions to run the 'client|setname' command\nNOPERM x\n",
+            "",
+            "OKAY\nNOPERM x\n",
+        ):
+            with self.assertRaises(e2e_h4.StepError, msg=out) as ctx:
+                self.run_as(out)
+            self.assertIn("mcp", str(ctx.exception))
+            self.assertIn("redis", str(ctx.exception))
+        self.assertEqual(self.run_as("OK\nvalor\n"), "valor")
+        self.assertEqual(self.run_as("OK\n"), "")
 
     def test_redis_admin_is_the_default_cli(self) -> None:
         insp = self.inspector()

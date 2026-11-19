@@ -626,7 +626,13 @@ class ContainerInspector:
                   f" | {auth} redis-cli --raw --user {user} 2>&1")  # fmt: skip
         out = self._exec(self._service(service), "sh", "-c", script, "sh", command, check_rc=False)
         first, _, rest = out.strip().partition("\n")
-        return rest.strip() if first.strip() == "OK" else out.strip()
+        if first.strip() != "OK":
+            # sin el OK de SETNAME el intento no se hizo (contraseña, conexión o SETNAME denegado): no es un rechazo
+            # de la orden, y sin nombre de cliente `e2e-ci.sh` vería el rechazo como ajeno
+            raise StepError(
+                f"{user} en {service}: CLIENT SETNAME no respondió OK, el intento no se hizo: {first.strip()[:150]!r}"
+            )
+        return rest.strip()
 
     @staticmethod
     def _slug(slug: str) -> str:
