@@ -36,7 +36,8 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
   13.   Límite de claves no válidas por IP (H4-13, contrato §7.5), desde el contenedor `fake-upstream` (otra IP que la
         del equipo) a través de Caddy: 30 claves desconocidas distintas, cada una con un `X-Forwarded-For` falso
         distinto, reciben `401` y la 31.ª `429` con `Retry-After` en el proxy (`baas_auth_rate_limited`) y en el MCP
-        (`RATE_LIMITED`); una clave ya válida pasa desde la IP frenada; desde el equipo, una desconocida sigue en `401`.
+        (`RATE_LIMITED`); en una ráfaga lenta, el `429` puede llegar tras las fichas que volvieron mientras duraba. Una
+        clave ya válida pasa desde la IP frenada; desde el equipo, una desconocida sigue en `401`.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
@@ -56,6 +57,7 @@ import contextlib
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -103,6 +105,9 @@ REVOKED_SUFFIX = " (clave revocada)"
 # Grupo «limite» (H4-13, contrato §7.5): el texto del 429 del proxy, sin la espera (`; vuelve a intentarlo en N s`)
 LIMIT_MESSAGE = "BaaS-AI-IP: demasiadas API keys no válidas desde tu red"
 LIMIT_MARGIN = 1.0  # segundos de más al esperar a que se llene un cubo
+# Claves desconocidas de más en cada ráfaga, por si vuelven fichas mientras dura (una cada 6 s): cubren una ráfaga de
+# hasta 36 s. Tras el primer `429` no cuentan.
+LIMIT_SLACK = 5
 
 
 # --- utilidades puras ------------------------------------------------------------------------------
@@ -433,34 +438,63 @@ def limited_problems(res: Http, kind: str) -> list[str]:
     return problems
 
 
-def burst_problems(replies: Sequence[Http], *, burst: int, kind: str) -> list[str]:
+def extra_tokens(elapsed: float, per_minute: float) -> int:
+    """Fichas que pueden volver a un cubo durante una ráfaga de `elapsed` segundos."""
+    return math.floor(elapsed * per_minute / 60)
+
+
+def token_came_back(replies: Sequence[Http], *, burst: int, elapsed: float, per_minute: float) -> bool:
+    """La última respuesta es una `401` que pudo llevarse una ficha que volvió durante la ráfaga: en una ráfaga que
+    empezó con el cubo lleno, las `401` no pasan de `burst` más las que pudieron volver en `elapsed` segundos. En una
+    ráfaga rápida (menos de lo que tarda en volver una ficha), nunca."""
+    if not replies or replies[-1].status != 401:
+        return False
+    return sum(r.status == 401 for r in replies) <= burst + extra_tokens(elapsed, per_minute)
+
+
+def burst_problems(
+    replies: Sequence[Http], *, burst: int, kind: str, elapsed: float, per_minute: float
+) -> list[str]:  # fmt: skip
     """Una ráfaga de claves desconocidas desde un cliente con el cubo lleno: las `burst` primeras se consultan (`401`)
-    y la siguiente recibe el `429` del limitador."""
-    for i, res in enumerate(replies[:burst], 1):
+    y el primer `429` del limitador llega en cuanto se gastan las fichas, las del cubo y las que volvieron mientras
+    duraba la ráfaga (`extra_tokens`): en la posición `burst + 1` o, en una ráfaga lenta, hasta
+    `burst + 1 + floor(elapsed · per_minute / 60)`. Las respuestas tras el primer `429` no cuentan."""
+    most = burst + extra_tokens(elapsed, per_minute)
+    n = leading(replies, 401)
+    for i, res in enumerate(replies[: min(n, most)], 1):
         problems = rejected_problems(res, kind)
         if problems:
             return [f"la {i}.ª clave: {problems[0]} (el cubo admite {burst} antes del 429)"]
     if len(replies) <= burst:
         return [f"faltan respuestas: {len(replies)} de {burst + 1}"]
-    if replies[burst].status == 401:
+    if n < burst:
+        return [f"la {n + 1}.ª clave: {rejected_problems(replies[n], kind)[0]} (el cubo admite {burst} antes del 429)"]
+    without_limit = (
+        "sin límite, o el cliente sale del X-Forwarded-For que envía la petición y no de la IP que pone Caddy"
+    )
+    allowed = f"como mucho {most}: {burst} del cubo y {most - burst} que pudieron volver en {elapsed:.1f} s"
+    if n == len(replies):
+        if n > most:
+            return [f"las {n} claves recibieron 401 y ninguna 429 ({allowed}): {without_limit}"]
         return [
-            f"las {burst + 1} claves recibieron 401 y ninguna 429: sin límite, o el cliente sale del X-Forwarded-For "
-            "que envía la petición y no de la IP que pone Caddy"
+            f"las {n} claves recibieron 401 y ninguna 429, pero pudieron volver {most - burst} fichas en "
+            f"{elapsed:.1f} s: la ráfaga fue demasiado lenta para concluir"
         ]
-    return [f"la {burst + 1}.ª clave: {p}" for p in limited_problems(replies[burst], kind)]
+    if n > most:
+        return [f"{n} × 401 antes del primer 429 ({allowed}): {without_limit}"]
+    return [f"la {n + 1}.ª clave: {p}" for p in limited_problems(replies[n], kind)]
 
 
-def refill_reason(replies: Sequence[Http], *, burst: int, elapsed: float, per_minute: float) -> str | None:
-    """Por qué una ráfaga de `burst + 1` claves no prueba nada y hay que repetirla con el cubo lleno (`None` si sí): el
-    `429` llega antes (otra ejecución dejó a medias el cubo de esa IP) o no llega y la ráfaga tardó lo que se tarda en
-    recargar una ficha. Cualquier otra respuesta (un `502`, un `200`) no se arregla esperando."""
+def refill_reason(replies: Sequence[Http], *, burst: int) -> str | None:
+    """Por qué una ráfaga de claves no prueba nada y hay que repetirla con el cubo lleno (`None` si sí): el `429` llega
+    antes de `burst` (otra ejecución dejó a medias el cubo de esa IP). Una ráfaga lenta no se repite: `burst_problems`
+    acepta las fichas que volvieron mientras duraba. Cualquier otra respuesta (un `502`, un `200`) no se arregla
+    esperando."""
     n = leading(replies, 401)
     if n < burst and n < len(replies) and replies[n].status == 429:
         return (
             f"{n} × 401 antes del primer 429: la IP del contenedor no tenía el cubo lleno (¿otra ejecución hace poco?)"
         )
-    if n > burst and elapsed >= 60 / per_minute:
-        return f"{n} × 401 en {elapsed:.1f} s: pudo recargarse una ficha durante la ráfaga"
     return None
 
 
@@ -1242,8 +1276,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--auth-fail-burst", type=int, default=30,
                    help="Grupo limite: BAAS_AUTH_FAIL_BURST del proxy y del MCP de la pila (30)")  # fmt: skip
     p.add_argument("--auth-fail-per-minute", type=float, default=10,
-                   help="Grupo limite: BAAS_AUTH_FAIL_PER_MINUTE de la pila (10); con él se calcula cuánto esperar a "
-                        "que se llene el cubo si una ejecución anterior lo dejó a medias")  # fmt: skip
+                   help="Grupo limite: BAAS_AUTH_FAIL_PER_MINUTE de la pila (10); con él se calcula cuántas fichas "
+                        "pudieron volver durante una ráfaga lenta y cuánto esperar a que se llene el cubo si una "
+                        "ejecución anterior lo dejó a medias")  # fmt: skip
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
     if ns.auth_fail_burst < 1 or not ns.auth_fail_per_minute > 0:
@@ -3028,41 +3063,62 @@ class E2EH4:
 
     def limit_burst(
         self, make: Callable[[str, str], CaddyRequest], tail: Callable[[], list[CaddyRequest]]
-    ) -> tuple[list[Http], float]:
-        """Desde el contenedor, `burst + 1` claves desconocidas distintas, cada una con un `X-Forwarded-For` falso
-        distinto (`make(clave, ip)`), y después `tail()`. Si esa ráfaga no prueba nada (`refill_reason`), espera a que
-        se llene el cubo de la IP (`burst` fichas a `per_minute`) y la repite una vez."""
+    ) -> tuple[list[Http], list[Http], float]:
+        """Desde el contenedor, `burst + 1` claves desconocidas distintas y `LIMIT_SLACK` de más (por si vuelven fichas
+        durante la ráfaga), cada una con un `X-Forwarded-For` falso distinto (`make(clave, ip)`), y después `tail()`.
+        Si el `429` llega antes de tiempo (`refill_reason`: el cubo de la IP no estaba lleno), espera a que se llene
+        (`burst` fichas a `per_minute`) y la repite una vez. Devuelve las respuestas de la ráfaga, las de `tail()` y lo
+        que tardó todo."""
         a = self.args
 
-        def send() -> tuple[list[Http], float, str | None]:
-            burst = [make(unknown_key(), ip) for ip in spoofed_ips(a.auth_fail_burst + 1)]
-            elapsed, replies = self.limit_inspector().caddy_requests([*burst, *tail()])
-            reason = refill_reason(replies[: len(burst)], burst=a.auth_fail_burst, elapsed=elapsed,
-                                   per_minute=a.auth_fail_per_minute)  # fmt: skip
-            return replies, elapsed, reason
+        def send() -> tuple[list[Http], list[Http], float, str | None]:
+            after = tail()
+            size = min(a.auth_fail_burst + 1 + LIMIT_SLACK, MAX_CADDY_REQUESTS - len(after))
+            burst = [make(unknown_key(), ip) for ip in spoofed_ips(size)]
+            elapsed, replies = self.limit_inspector().caddy_requests([*burst, *after])
+            head = replies[: len(burst)]
+            return head, replies[len(burst) :], elapsed, refill_reason(head, burst=a.auth_fail_burst)
 
-        replies, elapsed, reason = send()
+        replies, rest, elapsed, reason = send()
         if reason is not None:
             wait = a.auth_fail_burst * 60 / a.auth_fail_per_minute + LIMIT_MARGIN
             print(f"          ({reason}: espero {wait:g} s a que se llene su cubo y repito)")
             self.refill(wait)
-            replies, elapsed, _ = send()
-        return replies, elapsed
+            replies, rest, elapsed, _ = send()
+        return replies, rest, elapsed
+
+    def burst_summary(self, replies: Sequence[Http], elapsed: float) -> tuple[int, str]:
+        """Las `401` antes del primer `429` y, si pasan de `burst`, cuántas fichas volvieron durante la ráfaga."""
+        burst, n = self.args.auth_fail_burst, leading(replies, 401)
+        back = f" ({burst} del cubo y {n - burst} que volvieron en {elapsed:.1f} s)" if n > burst else ""
+        return n, f"{n} × 401{back}"
 
     def limit_proxy(self) -> str:
-        burst = self.args.auth_fail_burst
-        replies, elapsed = self.limit_burst(
+        a = self.args
+        replies, rest, elapsed = self.limit_burst(
             lambda key, ip: self.proxy_request("chat", key, ip),
             lambda: [self.proxy_request("messages", unknown_key(), spoofed_ips(1)[0])],
         )
-        problems = burst_problems(replies, burst=burst, kind="chat")
-        problems += [f"Messages, con la IP ya frenada: {p}" for p in limited_problems(replies[-1], "messages")]
+        problems = burst_problems(replies, burst=a.auth_fail_burst, kind="chat", elapsed=elapsed,
+                                  per_minute=a.auth_fail_per_minute)  # fmt: skip
+        messages, again = rest[-1], ""
+        if not problems and token_came_back(
+            [*replies, messages], burst=a.auth_fail_burst, elapsed=elapsed, per_minute=a.auth_fail_per_minute
+        ):
+            # Una ráfaga lenta: la de Messages, la última, se llevó una ficha que acababa de volver. Otra justo
+            # después la encuentra gastada.
+            _, (messages,) = self.limit_inspector().caddy_requests(
+                [self.proxy_request("messages", unknown_key(), spoofed_ips(1)[0])]
+            )
+            again = " (la primera recibió 401: volvió una ficha durante la ráfaga y se la llevó; la siguiente)"
+        problems += [f"Messages, con la IP ya frenada: {p}" for p in limited_problems(messages, "messages")]
         check(not problems, "\n".join([*problems, f"(la ráfaga tardó {elapsed:.2f} s)"]))
-        seconds = response_header(replies[burst], "Retry-After")
+        n, rejected = self.burst_summary(replies, elapsed)
+        seconds = response_header(replies[n], "Retry-After")
         return (
-            f"{burst} claves desconocidas, cada una con un X-Forwarded-For distinto → {burst} × 401 "
-            f"baas_invalid_api_key; la {burst + 1}.ª → 429 baas_auth_rate_limited (Retry-After {seconds} s) y una de "
-            f"Messages → 429 rate_limit_error ({elapsed:.2f} s): Caddy sobrescribe la cabecera"
+            f"claves desconocidas, cada una con un X-Forwarded-For distinto → {rejected} baas_invalid_api_key; la "
+            f"{n + 1}.ª → 429 baas_auth_rate_limited (Retry-After {seconds} s) y una de Messages → 429 "
+            f"rate_limit_error{again} ({elapsed:.2f} s): el remitente no elige su cubo con X-Forwarded-For"
         )
 
     def limit_known(self) -> str:
@@ -3094,22 +3150,24 @@ class E2EH4:
         )
 
     def limit_mcp(self) -> str:
-        a, burst = self.args, self.args.auth_fail_burst
+        a = self.args
         self.mcp_whoami(self.bypass_binding, a.bypass_email)  # desde el equipo: el MCP ya la resolvió como válida
         key = self.key_of(a.bypass_email)
-        replies, elapsed = self.limit_burst(self.mcp_request, lambda: [self.mcp_request(key)])
-        problems = burst_problems(replies, burst=burst, kind="mcp")
-        if replies[-1].status != 200:
+        replies, rest, elapsed = self.limit_burst(self.mcp_request, lambda: [self.mcp_request(key)])
+        problems = burst_problems(replies, burst=a.auth_fail_burst, kind="mcp", elapsed=elapsed,
+                                  per_minute=a.auth_fail_per_minute)  # fmt: skip
+        if rest[-1].status != 200:
             problems.append(
-                f"la clave ya válida de {a.bypass_email} desde la IP frenada: {reply_text(replies[-1])} "
+                f"la clave ya válida de {a.bypass_email} desde la IP frenada: {reply_text(rest[-1])} "
                 "(se esperaba 200, no 429)"
             )
         check(not problems, "\n".join([*problems, f"(la ráfaga tardó {elapsed:.2f} s)"]))
-        seconds = response_header(replies[burst], "Retry-After")
+        n, rejected = self.burst_summary(replies, elapsed)
+        seconds = response_header(replies[n], "Retry-After")
         return (
-            f"{burst} claves desconocidas, cada una con un X-Forwarded-For distinto → {burst} × 401; la "
-            f"{burst + 1}.ª → 429 RATE_LIMITED (Retry-After {seconds} s) ({elapsed:.2f} s); la clave ya válida de "
-            f"{a.bypass_email} → 200 desde la IP frenada"
+            f"claves desconocidas, cada una con un X-Forwarded-For distinto → {rejected}; la {n + 1}.ª → 429 "
+            f"RATE_LIMITED (Retry-After {seconds} s) ({elapsed:.2f} s); la clave ya válida de {a.bypass_email} → 200 "
+            "desde la IP frenada"
         )
 
     def limit_other_ip(self) -> str:

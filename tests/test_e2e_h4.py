@@ -414,34 +414,65 @@ class LimitUtilitiesTest(unittest.TestCase):
         self.assertIn("HTTP 200", " ".join(e2e_h4.rejected_problems(limit_reply(200, {}), "chat")))
 
     def test_burst_problems(self) -> None:
-        burst = 30
-        self.assertEqual(e2e_h4.burst_problems([proxy_401()] * burst + [proxy_429()], burst=burst, kind="chat"), [])
-        self.assertEqual(e2e_h4.burst_problems([mcp_401()] * burst + [mcp_429()], burst=burst, kind="mcp"), [])
-        no_limit = " ".join(e2e_h4.burst_problems([proxy_401()] * (burst + 1), burst=burst, kind="chat"))
-        self.assertIn("ninguna 429", no_limit)
+        burst, rate = 30, 10.0
+
+        def problems(replies: list[e2e_h4.Http], kind: str = "chat", elapsed: float = 0.5) -> str:
+            return " ".join(e2e_h4.burst_problems(replies, burst=burst, kind=kind, elapsed=elapsed, per_minute=rate))
+
+        slack = [proxy_429()] * 5  # las claves de más tras el primer 429 no cuentan
+        self.assertEqual(problems([proxy_401()] * burst + [proxy_429()] + slack), "")
+        self.assertEqual(problems([mcp_401()] * burst + [mcp_429()] + [mcp_429()] * 5, kind="mcp"), "")
+        no_limit = problems([proxy_401()] * (burst + 6))
+        self.assertIn("las 36 claves recibieron 401 y ninguna 429", no_limit)
         self.assertIn("X-Forwarded-For", no_limit)
-        early = " ".join(e2e_h4.burst_problems([proxy_401()] * 9 + [proxy_429()] * 22, burst=burst, kind="chat"))
+        # en una ráfaga rápida, una 401 de más ya es un límite que no frena a tiempo
+        late = problems([proxy_401()] * (burst + 1) + [proxy_429()] + slack[:4])
+        self.assertIn("31 × 401 antes del primer 429", late)
+        self.assertIn("X-Forwarded-For", late)
+        # en una lenta, el primer 429 puede llegar tras las fichas que volvieron: floor(13 s × 10 / 60) = 2
+        self.assertEqual(problems([proxy_401()] * (burst + 2) + [proxy_429()] + slack[:3], elapsed=13), "")
+        self.assertIn("33 × 401", problems([proxy_401()] * (burst + 3) + [proxy_429()] + slack[:2], elapsed=13))
+        # si pudieron volver tantas fichas como claves de más, sin ningún 429 no se puede concluir
+        slow = problems([proxy_401()] * (burst + 6), elapsed=40)
+        self.assertIn("demasiado lenta", slow)
+        self.assertNotIn("sin límite", slow)
+        early = problems([proxy_401()] * 9 + [proxy_429()] * 27)
         self.assertIn("la 10.ª", early)
         self.assertIn("429", early)
-        wrong = e2e_h4.burst_problems([proxy_401()] * burst + [mcp_429()], burst=burst, kind="chat")
-        self.assertIn("la 31.ª", " ".join(wrong))
-        self.assertIn("faltan", " ".join(e2e_h4.burst_problems([proxy_401()] * burst, burst=burst, kind="chat")))
+        self.assertIn("la 31.ª", problems([proxy_401()] * burst + [mcp_429()] + slack))
+        self.assertIn("la 32.ª", problems([proxy_401()] * (burst + 1) + [mcp_429()] + slack[:4], elapsed=6.5))
+        self.assertIn("la 7.ª", problems([proxy_401()] * 6 + [limit_reply(401, {})] + [proxy_401()] * 23 + slack))
+        self.assertIn("faltan", problems([proxy_401()] * burst))
+
+    def test_token_came_back(self) -> None:
+        burst, rate = 30, 10.0
+        fast = [proxy_401()] * burst + [proxy_429()] * 6 + [proxy_401()]
+        self.assertFalse(e2e_h4.token_came_back(fast, burst=burst, elapsed=0.5, per_minute=rate))
+        # 13 s: pudieron volver 2 fichas; con 31 + 1 respuestas 401 cabe que la última se llevara una
+        slow = [proxy_401()] * (burst + 1) + [proxy_429()] * 5 + [proxy_401()]
+        self.assertTrue(e2e_h4.token_came_back(slow, burst=burst, elapsed=13, per_minute=rate))
+        too_many = [proxy_401()] * (burst + 2) + [proxy_429()] * 4 + [proxy_401()]
+        self.assertFalse(e2e_h4.token_came_back(too_many, burst=burst, elapsed=13, per_minute=rate))
+
+    def test_extra_tokens(self) -> None:
+        self.assertEqual(e2e_h4.extra_tokens(0.5, 10), 0)
+        self.assertEqual(e2e_h4.extra_tokens(6, 10), 1)
+        self.assertEqual(e2e_h4.extra_tokens(13, 10), 2)
+        self.assertEqual(e2e_h4.extra_tokens(1.5, 60), 1)
 
     def test_refill_reason(self) -> None:
-        burst, rate = 30, 10.0
+        burst = 30
         full = [proxy_401()] * burst + [proxy_429()]
-        self.assertIsNone(e2e_h4.refill_reason(full, burst=burst, elapsed=0.5, per_minute=rate))
+        self.assertIsNone(e2e_h4.refill_reason(full, burst=burst))
         # el cubo no estaba lleno: el 429 llega antes (también el primero)
         for spent in (0, 12, 29):
             partial = [proxy_401()] * spent + [proxy_429()] * (burst + 1 - spent)
-            reason = e2e_h4.refill_reason(partial, burst=burst, elapsed=0.5, per_minute=rate)
-            self.assertIn(f"{spent} × 401", reason or "")
-        # sin 429 en una ráfaga lenta: pudo recargarse una ficha (una cada 6 s); en una rápida, no: sin límite
-        slow = [proxy_401()] * (burst + 1)
-        self.assertIn("6.5 s", e2e_h4.refill_reason(slow, burst=burst, elapsed=6.5, per_minute=rate) or "")
-        self.assertIsNone(e2e_h4.refill_reason(slow, burst=burst, elapsed=0.5, per_minute=rate))
+            self.assertIn(f"{spent} × 401", e2e_h4.refill_reason(partial, burst=burst) or "")
+        # una ráfaga lenta no se repite: se aceptan las fichas que volvieron mientras duraba (`burst_problems`)
+        self.assertIsNone(e2e_h4.refill_reason([proxy_401()] * (burst + 1), burst=burst))
+        self.assertIsNone(e2e_h4.refill_reason([proxy_401()] * (burst + 2) + [proxy_429()], burst=burst))
         # otro estado (un 502, un 200) no se arregla esperando
-        self.assertIsNone(e2e_h4.refill_reason([limit_reply(502)] * 31, burst=burst, elapsed=0.5, per_minute=rate))
+        self.assertIsNone(e2e_h4.refill_reason([limit_reply(502)] * 31, burst=burst))
 
 
 # --- WebSocket ------------------------------------------------------------------------------------
@@ -1379,15 +1410,16 @@ class FullRunTest(unittest.TestCase):
         self.assertLess(mcp[fake_h4_stack.CONTAINER][0], 1)
         self.assertEqual(proxy["127.0.0.1"][0], 29)
         self.assertEqual(mcp["127.0.0.1"][0], 29)
-        # 13.1: 31 claves desconocidas distintas, cada una con un X-Forwarded-For distinto, y una de Messages
+        # 13.1: 31 claves desconocidas distintas y 5 de más (por si vuelven fichas durante la ráfaga), cada una con un
+        # X-Forwarded-For distinto, y una de Messages
         burst = calls[0]
         keys = [r.headers["X-Baas-Api-Key"] for r in burst]
-        self.assertEqual(len(burst), 32)
-        self.assertEqual(len(set(keys)), 32)
-        self.assertEqual(len({r.headers["X-Forwarded-For"] for r in burst[:31]}), 31)
+        self.assertEqual(len(burst), 37)
+        self.assertEqual(len(set(keys)), 37)
+        self.assertEqual(len({r.headers["X-Forwarded-For"] for r in burst[:36]}), 36)
         self.assertEqual({r.host for r in burst}, {"127.0.0.1"}, "el host de las URLs del proxy del handshake")
-        self.assertTrue(all(r.path.endswith("/chat/completions") for r in burst[:31]))
-        self.assertTrue(burst[31].path.endswith("/v1/messages"))
+        self.assertTrue(all(r.path.endswith("/chat/completions") for r in burst[:36]))
+        self.assertTrue(burst[36].path.endswith("/v1/messages"))
 
     def test_the_limit_group_waits_for_a_bucket_that_is_not_full(self) -> None:
         """Otra ejecución hace menos de 3 min dejó la IP del contenedor sin fichas: el grupo espera a que se llene su
@@ -1400,6 +1432,19 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(waits, [181.0])
         self.assertIn("10 × 401 antes del primer 429", out)
         self.assertIn("espero 181 s", out)
+
+    def test_the_limit_group_accepts_the_tokens_back_during_a_slow_burst(self) -> None:
+        """Un ejecutor lento: cada petición tarda 0,5 s y durante la ráfaga vuelven 2 fichas. El primer 429 llega tras
+        32 × 401, dentro de lo que permite lo que tardó, y el paso pasa sin esperar los 181 s."""
+        with fake_h4_stack.FakeH4Stack() as stack, instant_refill(stack) as waits:
+            stack.inspector.caddy_delay = 0.5
+            code, steps, out = run_e2e(stack, "--only", "limite")
+        self.assert_all_ok(code, steps, out)
+        self.assertEqual(waits, [], "una ráfaga lenta no espera a que se llene el cubo")
+        for prefix in ("13.1", "13.3"):
+            self.assertIn("32 × 401", next(s for n, s in steps.items() if n.startswith(prefix))["detail"], prefix)
+        # la de Messages, al final, se llevó la ficha que volvió: otra justo después sí recibe el 429
+        self.assertIn("volvió una ficha", next(s for n, s in steps.items() if n.startswith("13.1"))["detail"])
 
     def test_the_limit_group_follows_the_configured_burst_and_rate(self) -> None:
         with fake_h4_stack.FakeH4Stack(auth_fail_burst=5, auth_fail_per_minute=60) as stack:
@@ -1605,8 +1650,8 @@ class FaultsTest(unittest.TestCase):
         "reactivate-audit-no-org": {"11.12 ": ("user.reactivated: org_slug = None",)},
         "audit-orgadmin-sees-disabled": {"11.12b": ("X ve 1 fila(s) user.disabled", "no debe ver ninguna")},
         "audit-orgadmin-blind": {"11.12b": ("X ve 0 fila(s) user.reactivated",)},
-        "limit-off-proxy": {"13.1": ("31 claves recibieron 401", "ninguna 429")},
-        "limit-off-mcp": {"13.3": ("31 claves recibieron 401", "ninguna 429")},
+        "limit-off-proxy": {"13.1": ("36 claves recibieron 401", "ninguna 429")},
+        "limit-off-mcp": {"13.3": ("36 claves recibieron 401", "ninguna 429")},
         "limit-trusts-xff": {"13.1": ("ninguna 429", "X-Forwarded-For"), "13.3": ("ninguna 429", "X-Forwarded-For")},
         "limit-blocks-known": {"13.2": ("clave ya válida", "HTTP 429"), "13.3": ("clave ya válida", "HTTP 429")},
         "limit-global": {"13.4": ("HTTP 429", "otra IP")},

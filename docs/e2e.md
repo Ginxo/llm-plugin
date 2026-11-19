@@ -309,7 +309,7 @@ claves deterministas del contrato §8 de `observador@observacion.test`, `admin@b
 | `--overhead-p95-ms` | `10` | Grupo `uso` (12.10): umbral del p95 del sobrecoste (el objetivo de `fase-1-h4-mediciones.md`); se puede subir en un ejecutor lento de la CI sin tocar el código |
 | `--usage-window` | `5` | Grupo `uso`: `BAAS_USAGE_WINDOW_SECONDS` del MCP de la pila (5 en desarrollo); 12.3 espera una ventana más 1 s antes de dar el recuento por cerrado |
 | `--auth-fail-burst` | `30` | Grupo `limite`: `BAAS_AUTH_FAIL_BURST` del proxy y del MCP de la pila (claves desconocidas que un cliente puede probar seguidas antes del `429`) |
-| `--auth-fail-per-minute` | `10` | Grupo `limite`: `BAAS_AUTH_FAIL_PER_MINUTE` de la pila; con él se calcula cuánto esperar a que se llene el cubo (`burst × 60 / ritmo` + 1 s, 181 s) si una ejecución anterior lo dejó a medias |
+| `--auth-fail-per-minute` | `10` | Grupo `limite`: `BAAS_AUTH_FAIL_PER_MINUTE` de la pila; con él se calcula cuántas fichas pudieron volver durante una ráfaga lenta y cuánto esperar a que se llene el cubo (`burst × 60 / ritmo` + 1 s, 181 s) si una ejecución anterior lo dejó a medias |
 | `--json <fichero>` | — | Informe en JSON (pasos, estado, duración, detalle, identificador de la ejecución) |
 
 ### 2. Qué comprueba
@@ -446,16 +446,22 @@ formada se rechaza sin consultar. Todas van a la organización sin AI-IP (`--byp
 
 | Paso | Qué comprueba |
 | :--- | :--- |
-| 13.1 | **Proxy**: 31 claves desconocidas distintas a Chat Completions, cada una con un `X-Forwarded-For` aleatorio distinto → las 30 primeras `401 baas_invalid_api_key` y la 31.ª `429` con `Retry-After` (entero ≥ 1), `error.type: requests`, `error.code: baas_auth_rate_limited` y el mensaje con esa espera; una más a Messages → `429` `rate_limit_error`. Prueba que Caddy sobrescribe la cabecera: si el cliente saliera de ella, cada clave tendría su cubo y ninguna recibiría `429` |
+| 13.1 | **Proxy**: 31 claves desconocidas distintas a Chat Completions y 5 de más (por si vuelven fichas durante la ráfaga), cada una con un `X-Forwarded-For` aleatorio distinto → las 30 primeras `401 baas_invalid_api_key` y la 31.ª `429` con `Retry-After` (entero ≥ 1), `error.type: requests`, `error.code: baas_auth_rate_limited` y el mensaje con esa espera; una más a Messages → `429` `rate_limit_error`. Prueba que el remitente no elige su cubo con `X-Forwarded-For`: si el cliente saliera de la cabecera, cada clave tendría su cubo y ninguna recibiría `429` |
 | 13.2 | **Proxy**: desde el equipo, la clave de `--bypass-email` → `200` (el proxy la resuelve como válida); desde el contenedor, tres desconocidas (la última **debe** recibir `429`: la IP sigue frenada) y después esa clave → `200` contra el proveedor falso, no `429` |
-| 13.3 | **MCP**: desde el equipo, `baas_whoami` con la clave de `--bypass-email` (el MCP la resuelve como válida); desde el contenedor, 31 `initialize` con claves desconocidas distintas y un `X-Forwarded-For` falso distinto → 30 × `401` y la 31.ª `429` `{"error": "RATE_LIMITED"}` con `Retry-After` y la espera en el mensaje (`Accept-Language: es`); después, la clave ya válida → `200` desde la IP frenada. El MCP no guarda los «no existe»: cada intento cuenta |
+| 13.3 | **MCP**: desde el equipo, `baas_whoami` con la clave de `--bypass-email` (el MCP la resuelve como válida); desde el contenedor, 31 `initialize` (y 5 de más) con claves desconocidas distintas y un `X-Forwarded-For` falso distinto → 30 × `401` y la 31.ª `429` `{"error": "RATE_LIMITED"}` con `Retry-After` y la espera en el mensaje (`Accept-Language: es`); después, la clave ya válida → `200` desde la IP frenada. El MCP no guarda los «no existe»: cada intento cuenta |
 | 13.4 | Desde el equipo (otra IP), una clave desconocida → `401` en el proxy (`baas_invalid_api_key`) y en el MCP, sin `429`: el límite es por cliente |
 
 **Si la IP del contenedor no tiene el cubo lleno** (otra ejecución del grupo hace menos de 3 min: 30 fichas a 10 por
 minuto), el `429` llega antes de la 31.ª: el paso lo dice (`N × 401 antes del primer 429`), espera a que se llene
 (`--auth-fail-burst × 60 / --auth-fail-per-minute` + 1 s, 181 s) y repite la ráfaga **una vez**; la segunda tiene que
-dar exactamente 30 × `401` y el `429`. Lo mismo si la ráfaga tardara más de lo que se tarda en recargar una ficha (6 s).
-Un límite con otra capacidad falla igual tras la espera. Mientras espera 13.1 se llena también el cubo del MCP, así que
+dar 30 × `401` y el `429`. Un límite con otra capacidad falla igual tras la espera.
+
+**Si la ráfaga es lenta** (un ejecutor cargado), vuelven fichas mientras dura: el primer `429` vale en cualquier
+posición entre la 31.ª y la 31.ª + `floor(elapsed × --auth-fail-per-minute / 60)`, con `elapsed` lo que tardó la
+ráfaga medido dentro del contenedor (las 5 claves de más cubren una ráfaga de hasta 36 s), sin esperar ni repetir. Una
+`401` de más que no cabe en ese margen falla («sin límite, o el cliente sale del `X-Forwarded-For`»). Si la de
+Messages, la última, se llevó una ficha que acababa de volver (recibe `401` y las `401` caben en el margen), se envía
+otra justo después, que tiene que recibir el `429`. Mientras espera 13.1 se llena también el cubo del MCP, así que
 una segunda ejecución seguida espera una sola vez. Un reinicio del proxy o del MCP vacía sus cubos.
 
 Con podman, `podman start` de `webapp-api` vuelve a ejecutar sus dependencias ya terminadas (`webapp-migrate` y
@@ -547,7 +553,7 @@ motivo; `test_every_fault_is_detected` falla si se añade un fallo sin su caso.
 | `orphans-links-kept` (no invalida los enlaces de activación sin usar) | 11.13 |
 | `limit-off-proxy` (el proxy no limita) | 13.1 (13.2, `SALTADO`) |
 | `limit-off-mcp` (el MCP no limita) | 13.3 |
-| `limit-trusts-xff` (el cliente sale del `X-Forwarded-For` de la petición, como si Caddy no lo sobrescribiera) | 13.1 y 13.3 |
+| `limit-trusts-xff` (el cliente sale del `X-Forwarded-For` de la petición: el remitente elige su cubo) | 13.1 y 13.3 |
 | `limit-blocks-known` (una clave ya válida recibe `429` desde un cliente frenado) | 13.2 y 13.3 |
 | `limit-global` (un solo cubo para todos: el equipo queda frenado con el contenedor) | 13.4 |
 | `limit-no-retry-after` (el `429` sin `Retry-After`) | 13.1 y 13.3 |

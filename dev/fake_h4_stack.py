@@ -173,7 +173,7 @@ FAULTS = {
     # límite de claves no válidas por cliente (H4-13)
     "limit-off-proxy": "el proxy no limita las claves desconocidas",
     "limit-off-mcp": "el MCP no limita las claves desconocidas",
-    "limit-trusts-xff": "el cliente sale del X-Forwarded-For de la petición (como si Caddy no lo sobrescribiera)",
+    "limit-trusts-xff": "el cliente sale del X-Forwarded-For de la petición (el remitente elige su cubo)",
     "limit-blocks-known": "una clave ya válida recibe 429 desde un cliente frenado",
     "limit-global": "un solo cubo para todos los clientes: el equipo queda frenado con el contenedor",
     "limit-no-retry-after": "el 429 del límite no lleva Retry-After",
@@ -919,7 +919,8 @@ class StackState:
                 or any(k.secret == key for u in self.users.values() for k in u.keys))  # fmt: skip
 
     def limit_client(self, peer: str, headers: Any) -> str:
-        """El cliente del limitador: quien conecta (Caddy sobrescribe el `X-Forwarded-For` de la petición)."""
+        """El cliente del limitador: quien conecta (el remitente no elige su cubo con el `X-Forwarded-For` de la
+        petición)."""
         if "limit-global" in self.faults:
             return "*"
         spoofed = str(headers.get("X-Forwarded-For") or "").split(",")[0].strip()
@@ -1184,6 +1185,9 @@ class FakeInspector:
     def __init__(self, state: StackState) -> None:
         self.state = state
         self.caddy_calls: list[list[Any]] = []  # las peticiones de cada `caddy_requests`
+        # Lo que «tarda» cada petición de `caddy_requests` (un ejecutor lento): adelanta el reloj de los limitadores,
+        # que recargan fichas durante la ráfaga, y se suma a lo que se mide.
+        self.caddy_delay = 0.0
 
     def vault_rows(self, slug: str) -> int:
         return self.state.vault_rows(slug)
@@ -1253,9 +1257,12 @@ class FakeInspector:
         """Las peticiones del grupo «limite» (`host`, `path`, `headers`, `body`) a la pila simulada, enrutadas por la
         ruta (proxy o MCP) y con el contenedor `fake-upstream` como cliente."""
         self.caddy_calls.append(list(requests))
-        start = time.monotonic()
-        replies = [self._caddy(r) for r in requests]
-        return time.monotonic() - start, replies
+        start, replies = time.monotonic(), []
+        for request in requests:
+            if self.caddy_delay:
+                self.state.advance(self.caddy_delay)
+            replies.append(self._caddy(request))
+        return time.monotonic() - start + self.caddy_delay * len(requests), replies
 
     def _caddy(self, request: Any) -> Reply:
         headers = Message()
