@@ -287,10 +287,11 @@ class Spike:
 
 
 NOTES = {
-    "regex_slash": "<command-name>/{org}:([a-z0-9][a-z0-9_-]*)</command-name>  (re.escape(org); solo en "
-    "turn.request.payload.request_original)",
-    "regex_tool": '\\[tool_use: Skill\\] \\{[^\\n]*?"skill":"/?{org}:([a-z0-9][a-z0-9_-]*)"  (re.escape(org); solo en '
-    "turn.completed.payload.response_received)",
+    # las expresiones normativas del contrato de la Fase 4, §7 (las de la webapp), con {org} en lugar del slug
+    "regex_slash": slash_re("ORG").pattern.replace("ORG", "{org}")
+    + "  (re.escape(org); solo en turn.request.payload.request_original)",
+    "regex_tool": tool_re("ORG").pattern.replace("ORG", "{org}")
+    + "  (re.escape(org); solo en turn.completed.payload.response_received)",
     "regla_de_recuento": "Contar /<org>:<skill> solo en turn.request.request_original y Skill solo en "
     "turn.completed.response_received; cada coincidencia, una invocación. request_original es solo lo nuevo del turno "
     "(delta de la correlación), pero empieza por la respuesta anterior del modelo: un [tool_use: Skill] reaparece en "
