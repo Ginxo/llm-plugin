@@ -112,6 +112,67 @@ class ForeignDirectoryError(BaasError):
     marker = "BAAS_SYNC_FOREIGN_DIR"
 
 
+class _ApprovalError(BaasError):
+    """Aprobación en el navegador (flujo de dispositivo): la skill traduce cada una a un mensaje llano."""
+
+    default_message = ""
+    default_hint: str | None = None
+
+    def __init__(self, message: str | None = None, *, hint: str | None = None) -> None:
+        super().__init__(message or self.default_message, hint=hint or self.default_hint)
+
+
+class ApprovalPendingError(_ApprovalError):
+    """Hay un enlace que la persona debe abrir para aprobar la conexión."""
+
+    exit_code = 20
+    marker = "BAAS_APPROVAL_PENDING"
+    default_message = "Falta que apruebes la conexión de este proyecto en tu navegador."
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        hint: str | None = None,
+        verification_url: str | None = None,
+        user_code: str | None = None,
+    ) -> None:
+        self.verification_url = verification_url
+        self.user_code = user_code
+        if message is None and verification_url:
+            message = f"Abre este enlace para aprobar la conexión de este proyecto: {verification_url}"
+            if user_code:
+                message += f" (comprueba que el código que ves es {user_code})."
+        super().__init__(message, hint=hint)
+
+
+class ApprovalWaitingError(_ApprovalError):
+    """Se sigue esperando la aprobación: hay que volver a comprobarlo."""
+
+    exit_code = 21
+    marker = "BAAS_APPROVAL_WAITING"
+    default_message = "Todavía no has aprobado la conexión en el navegador."
+    default_hint = "Cuando termines de aprobarla, dímelo y lo compruebo de nuevo."
+
+
+class ApprovalDeniedError(_ApprovalError):
+    """La persona canceló la conexión en el navegador."""
+
+    exit_code = 22
+    marker = "BAAS_APPROVAL_DENIED"
+    default_message = "Has cancelado la conexión de este proyecto, así que no se ha cambiado nada."
+    default_hint = "Si fue sin querer, vuelve a empezar y aprueba la conexión en el navegador."
+
+
+class ApprovalExpiredError(_ApprovalError):
+    """El código de aprobación caducó o ya se usó."""
+
+    exit_code = 23
+    marker = "BAAS_APPROVAL_EXPIRED"
+    default_message = "El enlace de aprobación ha caducado."
+    default_hint = "Vuelve a empezar para recibir uno nuevo."
+
+
 def _tool_hint(code: str) -> str | None:
     if code in ("AUTHORIZATION_DENIED", "KILL_SWITCH_ACTIVE"):
         return "Detente e informa al usuario; no intentes rodear la restricción."

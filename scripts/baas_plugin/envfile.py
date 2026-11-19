@@ -30,6 +30,11 @@ class BaasPaths:
         return self.root / ".env"
 
     @property
+    def pending_file(self) -> Path:
+        """Estado de una conexión a medias (código de dispositivo); nunca contiene la API key."""
+        return self.root / "pending.json"
+
+    @property
     def bin_dir(self) -> Path:
         return self.root / "bin"
 
