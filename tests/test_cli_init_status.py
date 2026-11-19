@@ -757,7 +757,7 @@ def test_status_warns_when_session_bypasses_proxy(home, project, server, fake_cl
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
     code, out = run(["status", "--project", str(project), "--no-mcp"], capsys)
     assert code == 0
-    assert "no pasa por el proxy" in out
+    assert "esta sesión aún no está protegida" in out
 
 
 def test_status_reports_lost_access(home, project, server, fake_claude, capsys) -> None:
