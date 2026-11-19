@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -28,6 +29,11 @@ class BaasPaths:
     @property
     def env_file(self) -> Path:
         return self.root / ".env"
+
+    @property
+    def pending_file(self) -> Path:
+        """Estado de una conexión a medias (código de dispositivo); nunca contiene la API key."""
+        return self.root / "pending.json"
 
     @property
     def bin_dir(self) -> Path:
@@ -124,6 +130,25 @@ def update_env(paths: BaasPaths, updates: dict[str, str]) -> list[str]:
     return warnings
 
 
+def remove_env_keys(paths: BaasPaths, keys: Iterable[str]) -> bool:
+    """Quita de `.env` las líneas de `keys` (conserva comentarios y el resto). `True` si cambió algo."""
+    if not paths.env_file.exists():
+        return False
+    drop = set(keys)
+    lines = paths.env_file.read_text(encoding="utf-8").splitlines()
+    kept = [
+        raw
+        for raw in lines
+        if raw.lstrip().startswith("#")
+        or "=" not in raw
+        or raw.split("=", 1)[0].strip().removeprefix("export ").strip() not in drop
+    ]
+    if kept == lines:
+        return False
+    atomic_write(paths.env_file, "\n".join(kept) + "\n" if kept else "")
+    return True
+
+
 def validate_api_key(value: str) -> str:
     key = value.strip()
     if not API_KEY_RE.match(key):
@@ -154,9 +179,8 @@ def normalize_app_url(value: str) -> str:
 
 def missing_key_error(paths: BaasPaths) -> MissingApiKeyError:
     return MissingApiKeyError(
-        f"No hay API key de BaaS-AI-IP en {paths.env_file} (ruta ~/baas-ai-ip/.env).",
-        hint="Guárdala sin pasar por el chat: ejecuta `set-key` en una terminal o edita ese fichero "
-        "(línea BAAS_API_KEY=...). Nunca la pegues en la conversación.",
+        "Este equipo todavía no está conectado a BaaS-AI-IP.",
+        hint="Escribe /baas-init y aprueba la conexión en el navegador.",
     )
 
 

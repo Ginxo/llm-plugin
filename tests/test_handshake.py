@@ -43,7 +43,9 @@ def test_handshake_sends_bearer_and_parses_contract(server: FakeBaasServer, anal
 def test_handshake_invalid_key_is_auth_error(server: FakeBaasServer) -> None:
     with pytest.raises(AuthError) as exc:
         handshake.perform_handshake(server.url, dev_api_key("nadie@demo.test"))
-    assert "no es válida" in exc.value.message
+    assert "ya no vale" in exc.value.message
+    assert "/baas-init" in exc.value.render()
+    assert "set-key" not in exc.value.render()
 
 
 def test_handshake_without_network_is_network_error() -> None:
@@ -51,12 +53,15 @@ def test_handshake_without_network_is_network_error() -> None:
         handshake.perform_handshake("http://127.0.0.1:9", dev_api_key("a@b.test"), timeout=2)
 
 
-@pytest.mark.parametrize(("status", "fragment"), [(429, "límite"), (503, "503"), (500, "500")])
+@pytest.mark.parametrize(
+    ("status", "fragment"), [(429, "demasiadas conexiones"), (503, "no está disponible"), (500, "no está disponible")]
+)
 def test_handshake_server_errors(server: FakeBaasServer, analista_key: str, status: int, fragment: str) -> None:
     server.state.handshake_status = status
     with pytest.raises(NetworkError) as exc:
         handshake.perform_handshake(server.url, analista_key)
     assert fragment in exc.value.message
+    assert "HTTP" not in exc.value.render()
 
 
 def test_parse_rejects_insecure_service_urls() -> None:

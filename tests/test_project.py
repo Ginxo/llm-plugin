@@ -129,3 +129,81 @@ def test_binding_roundtrip_has_no_secrets(project: Path, analista_key: str) -> N
     assert pc.read_binding(project) == binding
     assert analista_key not in (project / ".claude" / "baas.local.json").read_text()
     assert pc.read_binding(project.parent) is None
+
+
+# --- reparación de ficheros dañados -----------------------------------------------------------
+
+
+def test_repair_moves_invalid_json_to_bak(project: Path) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "settings.local.json"
+    path.write_text('{"env": {"X-Baas-Api-Key": "secreto", ')
+    assert pc.repair_json_file(path) is True
+    assert not path.exists()
+    bak = project / ".claude" / "settings.local.json.bak"
+    assert bak.read_text() == '{"env": {"X-Baas-Api-Key": "secreto", '
+    if os.name == "posix":
+        assert mode_of(bak) == 0o600
+
+
+@pytest.mark.parametrize("content", ["[]", '"texto"', "   ", "no es json", "\xff\xfe"])
+def test_repair_treats_non_objects_and_garbage_as_damaged(project: Path, content: str) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "baas.local.json"
+    path.write_bytes(content.encode("latin-1"))
+    assert pc.repair_json_file(path) is True
+    assert (project / ".claude" / "baas.local.json.bak").exists()
+
+
+@pytest.mark.parametrize("content", ["{}", '{"env": {}}', ""])
+def test_repair_leaves_valid_files_alone(project: Path, content: str) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "settings.local.json"
+    path.write_text(content)
+    assert pc.repair_json_file(path) is False
+    assert path.read_text() == content
+    assert not (project / ".claude" / "settings.local.json.bak").exists()
+
+
+def test_repair_missing_file_is_noop(project: Path) -> None:
+    assert pc.repair_json_file(project / ".claude" / "settings.local.json") is False
+
+
+def test_gitignore_can_cover_the_backups(project: Path) -> None:
+    added = pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES)
+    assert ".claude/settings.local.json.bak*" in added
+    assert ".claude/baas.local.json.bak*" in added
+    assert pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES) == []
+
+
+def test_repair_never_overwrites_an_earlier_backup(project: Path) -> None:
+    (project / ".claude").mkdir()
+    path = project / ".claude" / "settings.local.json"
+    for content in ("uno roto", "dos roto", "tres roto"):
+        path.write_text(content)
+        assert pc.repair_json_file(path) is True
+    names = {p.name: p.read_text() for p in (project / ".claude").iterdir()}
+    assert names == {
+        "settings.local.json.bak": "uno roto",
+        "settings.local.json.bak.1": "dos roto",
+        "settings.local.json.bak.2": "tres roto",
+    }
+
+
+def test_backups_exist_detects_any_numbered_copy(project: Path) -> None:
+    assert pc.backups_exist(project) is False
+    (project / ".claude").mkdir()
+    assert pc.backups_exist(project) is False
+    (project / ".claude" / "baas.local.json.bak.3").write_text("x")
+    assert pc.backups_exist(project) is True
+    assert pc.backups_exist(project / "no-existe") is False
+
+
+def test_backup_pattern_ignores_numbered_copies(project: Path) -> None:
+    _git(project, "init", "-q")
+    pc.ensure_gitignore(project, pc.GITIGNORE_ENTRIES + pc.BACKUP_ENTRIES)
+    (project / ".claude").mkdir()
+    for name in ("settings.local.json.bak", "settings.local.json.bak.1", "baas.local.json.bak.2"):
+        (project / ".claude" / name).write_text("clave")
+    res = subprocess.run(["git", "-C", str(project), "status", "--porcelain", "-uall"], capture_output=True, text=True)
+    assert ".claude" not in res.stdout

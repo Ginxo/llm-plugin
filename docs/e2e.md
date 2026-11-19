@@ -8,6 +8,8 @@ distribuyen con el plugin.
 - [Hito H4 (observación y eliminación de organizaciones)](#hito-h4-observación-y-eliminación-de-organizaciones):
   `dev/e2e_h4.py`, el anonimizador apagado, el interruptor, eliminar una organización, la prueba canario de H4-02
   (los originales no llegan al disco de Redis) y qué pasa con los usuarios que se quedan sin ninguna.
+- [`/baas-init` guiado](#baas-init-guiado-conexión-por-aprobación-en-el-navegador): `tests/test_e2e_connect.py`, la
+  conexión por aprobación en el navegador sobre la pila simulada.
 - [Mediciones de H4](#mediciones-de-h4): `dev/measure_h4.py` y `dev/measure_frozen_redis.py`.
 - [E9 (roles funcionales)](#e9-roles-funcionales): `dev/e9_roles.py`, que los roles aíslan el contenido aunque una skill lo cite.
 
@@ -529,6 +531,36 @@ confirmarlos al integrar:
 
 Pendiente de la integración (C2). Contra la pila simulada, la ejecución completa pasa en un par de segundos (la parte
 `huerfanos` en menos de uno).
+
+## /baas-init guiado (conexión por aprobación en el navegador)
+
+`tests/test_e2e_connect.py` prueba el `/baas-init` guiado de punta a punta sobre la pila **simulada**
+(`dev/fake_h4_stack.py`, que ahora incluye `POST /api/v1/plugin/device/start` y `/device/poll`). Lanza
+`python3 scripts/baas.py init ...` como proceso real, con un `HOME` y un proyecto temporales, sin navegador ni `claude`
+reales, y se ejecuta con el resto de la suite (`uv run pytest tests/test_e2e_connect.py`). Cubre:
+
+- recorrido feliz: `init` sale con 20 y el enlace de aprobación; `init --wait` sale con 0 y `[BAAS_RESULT linked]`,
+  deja `~/baas-ai-ip/.env` en 0600 con la clave nueva y `.claude/settings.local.json` con el proxy y la cabecera de la
+  clave; la clave no aparece en la salida de ningún comando; un segundo `init` sale `unchanged` sin pedir otro código;
+- clave guardada revocada (handshake 401): se avisa, se descarta y el flujo la renueva solo;
+- dirección equivocada: sale con 6 y `[BAAS_APP_URL ...]` sin guardar nada; con la correcta, sale con 20;
+- límite de tasa (429) al empezar; código caducado (23) y reinicio con un código nuevo; denegado (22);
+- dos `init` antes de aprobar muestran el mismo código (se reutiliza el pendiente);
+- sondeo con varias respuestas «pendiente» antes de aprobar, con reloj inyectado (sin esperas reales);
+- el guard, en un proyecto vinculado y sin proxy en el entorno: `/baas-init demo` y `/baas-status` pasan; cualquier otro
+  prompt se bloquea con un mensaje en español llano.
+
+El simulado se programa desde la prueba con `stack.device` (`outcome`: `approve`/`deny`/`expire`, `approve_after`,
+`start_status`, `email`) y `stack.state.revoke_key(clave)`. No hay un script `dev/e2e_connect.py` contra la pila real:
+aprobar exige una persona en el navegador.
+
+Verificación manual en la pila de desarrollo (2026-11-19, webapp de la rama `feat/device-flow-plugin` en `baas-dev`, `http://app.localhost:8080`; el plugin con `HOME` y proyecto temporales; la aprobación se hizo por la API con `orgadmin@demo.test`, no en el navegador): **correcta**.
+
+- `init` sin clave → código 20 con enlace y código; `init --wait` tras aprobar → 0 `[BAAS_RESULT linked]`; `.env` y `settings.local.json` con permisos 0600; la clave nueva no aparece en ninguna salida; un tercer `init` → `unchanged`.
+- La clave nueva pasa el proxy (`/org/demo/anthropic`): la respuesta 401 es del proveedor por la credencial de Anthropic falsa que se envió a propósito, no del proxy.
+- Clave revocada desde la API → `init` la renueva solo (aviso «ya no es válida», código 20); un segundo `init` reutiliza el mismo código; tras aprobar → `linked`.
+- Dirección inexistente → código 6 con `[BAAS_APP_URL …]` y nada guardado.
+- Pendiente: recorrido con la pantalla `/connect` en un navegador y con Claude Code real (skill y reinicio).
 
 ## E9 (roles funcionales)
 
