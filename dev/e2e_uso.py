@@ -411,6 +411,8 @@ class Timed:
 
 
 class UsoGroup:
+    slug_prefix = "uso"  # `<prefijo>-<ejecución>-<paso>`: otros grupos (consumo) reutilizan los ayudantes con el suyo
+
     def __init__(self, e2e: E2EH4) -> None:
         self.e = e2e
         self.a = e2e.args
@@ -463,9 +465,9 @@ class UsoGroup:
             time.sleep(every)
 
     # --- organizaciones de cada paso ----------------------------------------------------------------
-    def create_org(self, label: str, members: dict[str, str]) -> UsoOrg:
-        slug = f"uso-{self.nonce}-{label}"
-        res = self.e.admin_post("/api/v1/orgs", {"slug": slug, "name": f"E2E uso {label} {self.nonce}"})
+    def create_org(self, label: str, members: dict[str, str], name: str | None = None) -> UsoOrg:
+        slug = f"{self.slug_prefix}-{self.nonce}-{label}"
+        res = self.e.admin_post("/api/v1/orgs", {"slug": slug, "name": name or f"E2E uso {label} {self.nonce}"})
         check(res.status == 201, f"POST /api/v1/orgs ({slug}) → {describe(res)}")
         data = (res.json() or {}).get("organization") or {}
         org = UsoOrg(slug, str(data.get("id") or ""), ZoneInfo(str(data.get("timezone") or "Europe/Madrid")))
@@ -500,8 +502,8 @@ class UsoGroup:
         check(res.status == 200, f"eliminar «{slug}» → {describe(res)}")
 
     @contextlib.contextmanager
-    def org(self, label: str, members: dict[str, str]) -> Iterator[UsoOrg]:
-        org = self.create_org(label, members)
+    def org(self, label: str, members: dict[str, str], name: str | None = None) -> Iterator[UsoOrg]:
+        org = self.create_org(label, members, name)
         failed = False
         try:
             yield org

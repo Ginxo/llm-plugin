@@ -308,7 +308,8 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual((ns.org, ns.email), ("observacion", "observador@observacion.test"))
         self.assertEqual((ns.admin_email, ns.orgadmin_email), ("admin@baas.test", "orgadmin@demo.test"))
         self.assertEqual(
-            ns.only, ["observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite"]
+            ns.only,
+            ["observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite", "consumo"],
         )
         self.assertEqual((ns.auth_fail_burst, ns.auth_fail_per_minute), (30, 10.0), "los valores del contrato §7.5")
         self.assertEqual((ns.anon_org, ns.anon_email), ("privada", "analista@privada.test"))
@@ -324,6 +325,21 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual((ns.app_url, ns.fake_url), ("http://a:1", "http://f:2"))
         self.assertEqual((ns.only, ns.apis, ns.inspect), (["eliminar"], ["chat"], "none"))
         self.assertEqual((ns.propagation_wait, ns.trace_timeout), (0.2, 5.0))
+
+    def test_consumo_group_is_registered_in_groups_and_only_help(self) -> None:
+        self.assertIn("consumo", e2e_h4.GROUPS)
+        self.assertEqual(e2e_h4.GROUPS[-1], "consumo", "va tras «limite»: el 15 es del grupo «ner»")
+        self.assertIn("consumo", e2e_h4.parse_args([]).only, "entra en el --only por defecto")
+        self.assertEqual(e2e_h4.parse_args(["--only", "consumo"]).only, ["consumo"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+            e2e_h4.parse_args(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        help_text = re.sub(r"\s+", " ", out.getvalue())
+        self.assertRegex(help_text, r"separadas por comas: [^()]*\bconsumo\b[^()]* \(todas\)", "la ayuda de --only")
+        doc = e2e_h4.__doc__ or ""
+        self.assertRegex(doc, r"\n  16\.\s+Consumo de la plataforma \(Fase 2, grupo «consumo», `dev/e2e_consumo.py`\)")
+        self.assertIn("16.0", doc)
 
     def test_invalid_choice_exits_two(self) -> None:
         bad_limits = (["--auth-fail-burst", "0"], ["--auth-fail-per-minute", "0"], ["--auth-fail-per-minute", "-1"])
@@ -1255,8 +1271,10 @@ class MissingInspectorTest(unittest.TestCase):
 
 # La pila simulada no simula la observabilidad de uso (Fase 4): el grupo «uso» se prueba contra la pila real y aquí
 # solo sus utilidades (tests/test_e2e_uso.py); lo mismo con «acl»
-# (tests/test_e2e_acl.py). Sin `--only`, el recorrido es el de los grupos de H4.
-H4_GROUPS = ",".join(g for g in e2e_h4.GROUPS if g not in ("uso", "acl"))
+# (tests/test_e2e_acl.py) y con «consumo» (tests/test_e2e_consumo.py; la pila simulada sirve el informe de turnos por
+# modo de 16.0, 16.1 y 16.4, no el disco de 16.2 ni el CSV de 16.3). Sin `--only`, el recorrido es el de los grupos
+# de H4.
+H4_GROUPS = ",".join(g for g in e2e_h4.GROUPS if g not in ("uso", "acl", "consumo"))
 
 
 def run_e2e(
@@ -1571,6 +1589,64 @@ class FullRunTest(unittest.TestCase):
         self.assertEqual(tested, set(fake_h4_stack.FAULTS), "cada fallo inyectable debe tener su test")
 
 
+class ConsumoRunTest(unittest.TestCase):
+    """Grupo «consumo» (16.x) contra la pila simulada: 16.0, 16.1 y 16.4. El disco de 16.2 y el CSV de 16.3 solo se
+    prueban contra la pila real (sus utilidades, en `tests/test_e2e_consumo.py`)."""
+
+    SEEDS: ClassVar[list[str]] = ["baas-ai-ip", "demo", "observacion", "privada"]
+
+    @staticmethod
+    def step(steps: dict[str, dict], prefix: str) -> dict:
+        (found,) = (s for n, s in steps.items() if n.startswith(prefix))
+        return found
+
+    def test_consumo_step_16_1_counts_match_sent_turns(self) -> None:
+        served: list[tuple[str, str]] = []  # (organización, modo) de cada turno que el proxy simulado sirvió
+        original = fake_h4_stack.StackState._record
+
+        def record(state: fake_h4_stack.StackState, conv: fake_h4_stack.Conv, mode: str, *args: object) -> None:
+            served.append((conv.org, mode))
+            original(state, conv, mode, *args)  # type: ignore[arg-type]
+
+        with (
+            fake_h4_stack.FakeH4Stack() as stack,
+            mock.patch.object(fake_h4_stack.StackState, "_record", record),
+        ):
+            _code, steps, _out = run_e2e(stack, "--only", "consumo", inspector=None)
+        step = self.step(steps, "16.1")
+        self.assertEqual(step["status"], "OK", step["detail"])
+        ours = [mode for org, mode in served if org.startswith("consumo-") and org.endswith("-modos")]
+        counts = {m: ours.count(k) for m, k in (("ANONYMIZED", "anonymize"), ("OBSERVATION", "observe"),
+                                                ("BYPASS", "bypass"))}  # fmt: skip
+        self.assertEqual(len(set(counts.values())), 3, f"cada modo con una cifra distinta: {counts}")
+        self.assertTrue(all(counts.values()), f"los tres modos se envían: {counts}")
+        for mode, n in counts.items():
+            self.assertIn(f"{mode} {n}", step["detail"], "el paso dice cuántos turnos comparó por modo")
+        self.assertIn(f"{sum(counts.values())} turnos", step["detail"])
+
+    def test_the_steps_the_simulated_stack_serves_pass_and_leave_nothing_behind(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            _code, steps, _out = run_e2e(stack, "--only", "consumo", inspector=None)
+            leftovers = sorted(stack.state.orgs)
+        for prefix in ("16.0", "16.1", "16.4"):
+            step = self.step(steps, prefix)
+            self.assertEqual(step["status"], "OK", f"{prefix}: {step['detail']}")
+        self.assertEqual(leftovers, self.SEEDS, "las organizaciones de cada paso se eliminan, también si el paso falla")
+
+    def test_a_stack_without_the_report_fails_16_0_and_skips_the_rest(self) -> None:
+        with fake_h4_stack.FakeH4Stack(faults={"consumo-absent"}) as stack:
+            code, steps, out = run_e2e(stack, "--only", "consumo", inspector=None)
+        self.assertEqual(code, 1, out)
+        ready = self.step(steps, "16.0")
+        self.assertEqual(ready["status"], "FALLO")
+        for fragment in ("sin el informe de consumo", "period", "T2"):
+            self.assertIn(fragment, ready["detail"])
+        for prefix in ("16.1", "16.2", "16.3", "16.4"):
+            step = self.step(steps, prefix)
+            self.assertEqual(step["status"], "SALTADO", prefix)
+            self.assertIn("16.0", step["detail"], "dice de qué depende")
+
+
 class FaultsTest(unittest.TestCase):
     """Cada fallo inyectado en la pila simulada hace fallar el paso que lo comprueba (código 1)."""
 
@@ -1657,12 +1733,21 @@ class FaultsTest(unittest.TestCase):
         "limit-global": {"14.4": ("HTTP 429", "otra IP")},
         "limit-no-retry-after": {"14.1": ("Retry-After = None",), "14.3": ("Retry-After = None",)},
         "limit-shape": {"14.1": ("baas_auth_rate_limited", "rate_limit_error")},
+        "consumo-absent": {"16.0": ("sin el informe de consumo", "period")},
+        "consumo-mode-wrong": {"16.1": ("turns_by_mode", "OBSERVATION")},
     }
 
     ORPHAN_PREFIXES = ("preview-", "orphans-", "reactivate-", "disabled-")  # solo los pasos 11 los comprueban
 
     def run_fault(self, fault: str) -> dict[str, dict]:
         only = ("--only", "huerfanos") if fault.startswith(self.ORPHAN_PREFIXES) else ()
+        if fault.startswith(
+            "consumo-"
+        ):  # solo los pasos 16 (la pila simulada no tiene el disco ni el CSV: 16.2 y 16.3)
+            with fake_h4_stack.FakeH4Stack(faults={fault}) as stack:
+                code, steps, out = run_e2e(stack, "--only", "consumo", inspector=None)
+            self.assertEqual(code, 1, f"{fault}: {out}")
+            return steps
         if fault.startswith("limit-"):  # solo los pasos 14 (con el inspector de la pila simulada)
             with fake_h4_stack.FakeH4Stack(faults={fault}) as stack:
                 code, steps, out = run_e2e(stack, "--only", "limite")

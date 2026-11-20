@@ -31,6 +31,11 @@ que el hito H4 añade (contrato §4, §5.2, §6 y §8; plan, tareas W2 a W5, P2,
   una ficha y, sin fichas, `429` con `Retry-After` en la forma de cada uno. Una clave válida no pasa por el limitador y
   una que existe (revocada) devuelve su ficha. El cliente es quien conecta: la pila simulada hace de Caddy, que
   sobrescribe el `X-Forwarded-For` que envía la petición.
+- **Informe de consumo** (`GET /api/v1/platform/usage`, contrato de la Fase 2 §7.3, grupo «consumo» del e2e): solo el
+  PLATFORM_ADMIN (`403` a los demás), `month` (con `422` si no es `YYYY-MM`) o `from`/`to`, y por organización los
+  turnos que el proxy simulado ha servido (peticiones, tokens que declara el proveedor y el bloque del anonimizador con
+  los turnos por modo, las sustituciones y la verificación). No simula el disco, el contenido ni el CSV: 16.2 y 16.3 del
+  e2e se prueban contra la pila real.
 - `FakeInspector`: lo que `ContainerInspector` mira dentro de los contenedores (vault, Redis, discos y MCP) y las
   peticiones del grupo «limite», que van a la pila simulada con el contenedor `fake-upstream` como cliente.
 
@@ -62,6 +67,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from email.message import Message
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -178,6 +184,9 @@ FAULTS = {
     "limit-global": "un solo cubo para todos los clientes: el equipo queda frenado con el contenedor",
     "limit-no-retry-after": "el 429 del límite no lleva Retry-After",
     "limit-shape": "el 429 del proxy no tiene la forma del proveedor (lleva la del MCP)",
+    # informe de consumo (Fase 2)
+    "consumo-absent": "la pila no trae el informe de consumo (T2–T3): GET /platform/usage es el de la Fase 4",
+    "consumo-mode-wrong": "el informe cuenta como anonimizados los turnos que salieron en observación",
 }
 
 
@@ -263,6 +272,7 @@ class Org:
     ai_ip: bool = False
     anonymizer: bool = True
     blocked: bool = False
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 @dataclass
@@ -512,8 +522,9 @@ class StackState:
 
     # --- organizaciones ------------------------------------------------------------------------------
     def org_json(self, org: Org) -> dict[str, Any]:
-        return {"slug": org.slug, "name": org.name, "blocked": org.blocked, "paused": False,
-                "ai_ip_enabled": org.ai_ip, "anonymizer_enabled": org.anonymizer, "retention_days": 30}  # fmt: skip
+        return {"id": org.id, "slug": org.slug, "name": org.name, "timezone": "Europe/Madrid", "blocked": org.blocked,
+                "paused": False, "ai_ip_enabled": org.ai_ip, "anonymizer_enabled": org.anonymizer,
+                "retention_days": 30}  # fmt: skip
 
     def handshake(self, user: User) -> dict[str, Any]:
         orgs = []
@@ -1089,6 +1100,75 @@ class StackState:
                         continue
                     sub.messages.put(json.dumps(message))
 
+    # --- webapp: informe de consumo ---------------------------------------------------------------------------
+    def platform_usage(self, viewer: User, query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+        """`GET /platform/usage` (contrato de la Fase 2 §7.3), con lo que el proxy simulado ha servido: todos los turnos
+        (la pila simulada no los reparte por fechas), cada uno con los tokens que el proveedor falso declara (12 y 9).
+        """
+        if not viewer.platform_admin:
+            return 403, {"error": "FORBIDDEN", "message": "Forbidden"}
+        month = (query.get("month") or [None])[0]
+        today = datetime.now(timezone.utc).date()
+        if month is not None:
+            if not re.fullmatch(r"20[0-9]{2}-(0[1-9]|1[0-2])", month) or "from" in query or "to" in query:
+                return 422, {"error": "VALIDATION_ERROR", "message": "month must be YYYY-MM (year 2000–2100)",
+                             "field": "month"}  # fmt: skip
+            first = date(int(month[:4]), int(month[5:]), 1)
+        else:
+            first = date.fromisoformat((query.get("from") or [today.replace(day=1).isoformat()])[0])
+        if month is None and "to" in query:
+            last = date.fromisoformat(query["to"][0])
+        else:
+            last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        rows = []
+        with self.lock:
+            for org in self.orgs.values():
+                turns = [t for c in self.convs.values() if c.org == org.slug for t in c.turns]
+                rows.append(self._consumption_row(org, turns))
+        rows.sort(key=lambda r: (-r["requests"], r["slug"]))
+        totals = {"orgs": len(rows), **{k: sum(r[k] for r in rows) for k in ("requests", "tokens_in", "tokens_out")}}
+        report: dict[str, Any] = {"tz": "UTC", "from": first.isoformat(), "to": last.isoformat(), "data_until": None,
+                                  "metrics_retention_months": 13, "totals": totals, "orgs": rows}  # fmt: skip
+        if "consumo-absent" in self.faults:  # el de la Fase 4: sin period ni data_until_by_source
+            return 200, report
+        report["period"] = {"month": month, "from": first.isoformat(), "to": last.isoformat(), "open": True}
+        report["data_until_by_source"] = {"traffic": None, "content": None, "storage": None}
+        return 200, report
+
+    def _consumption_row(self, org: Org, turns: list[dict[str, Any]]) -> dict[str, Any]:
+        def mode(turn: dict[str, Any]) -> str:
+            if not turn["ai_ip"]:
+                return "BYPASS"
+            observed = not turn["anonymizer"]
+            return "ANONYMIZED" if not observed or "consumo-mode-wrong" in self.faults else "OBSERVATION"
+
+        verifications = [t["verification"] for t in turns if isinstance(t["verification"], dict)]
+
+        def replaced(name: str) -> int:
+            return sum(sum(v.get(name, {}).values()) for v in verifications)
+
+        def verified(status: str) -> int:
+            return sum(1 for v in verifications if v.get("status") == status)
+
+        bytes_in = sum(len(str(t["original"]).encode()) for t in turns)
+        counts = {m: sum(1 for t in turns if mode(t) == m) for m in ("ANONYMIZED", "OBSERVATION", "BYPASS")}
+        anonymizer = {
+            "turns": len(turns), "turns_by_mode": counts, "tokens_in": 12 * len(turns), "tokens_out": 9 * len(turns),
+            "bytes_in": bytes_in, "replaced_in": replaced("request_replacements_by_type"),
+            "restored_out": replaced("response_replacements_by_type"), "verified_clean": verified("CLEAN"),
+            "verified_warning": verified("WARNING"), "verified_error": verified("ERROR"),
+            **dict.fromkeys(("l2_turns", "l2_enabled", "l2_applied", "l2_degraded", "l2_observed_turns",
+                             "l2_known_values_only", "l2_analyzed_bytes", "l2_cached_bytes",
+                             "l2_unanalyzed_bytes", "l2_observed"), 0),
+        }  # fmt: skip
+        return {
+            "slug": org.slug, "name": org.name, "timezone": "Europe/Madrid", "blocked": org.blocked, "paused": False,
+            "requests": len(turns), "blocked_requests": 0, "errors": 0, "tokens_in": 12 * len(turns),
+            "tokens_out": 9 * len(turns), "bytes_in": bytes_in,
+            "bytes_out": sum(len(str(t["response_received"]).encode()) for t in turns), "active_users": 0,
+            "invocations": 0, "storage_bytes": None, "storage_taken_at": None, "anonymizer": anonymizer,
+        }  # fmt: skip
+
     # --- webapp: conversaciones --------------------------------------------------------------------------------
     def conv_json(self, conv: Conv, viewer: User) -> dict[str, Any]:
         data = {
@@ -1353,6 +1433,8 @@ def webapp_handler(state: StackState) -> type[BaseHTTPRequestHandler]:
                 return self._json(200, state.me_json(viewer))
             if url.path == "/api/v1/api-keys":
                 return self._json(200, {"items": [state.key_json(k, viewer) for k in viewer.keys]})
+            if url.path == "/api/v1/platform/usage":
+                return self._json(*state.platform_usage(viewer, parse_qs(url.query)))
             if m := _ORG_GET.fullmatch(url.path):
                 slug = m.group(1)
                 if m.group(2) == "delete-preview":

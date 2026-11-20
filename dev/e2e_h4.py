@@ -40,6 +40,11 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         distinto, reciben `401` y la 31.ª `429` con `Retry-After` en el proxy (`baas_auth_rate_limited`) y en el MCP
         (`RATE_LIMITED`); en una ráfaga lenta, el `429` puede llegar tras las fichas que volvieron mientras duraba. Una
         clave ya válida pasa desde la IP frenada; desde el equipo, una desconocida sigue en `401`.
+  16.   Consumo de la plataforma (Fase 2, grupo «consumo», `dev/e2e_consumo.py`): el informe
+        `GET /platform/usage` con `period` y datos hasta por tubería (16.0, y si falta se saltan los demás); turnos por
+        modo (bypass, observación y anonimizado) que cuadran con los enviados (16.1); disco con media, máximo, última
+        y el índice aparte (16.2); el CSV igual que el JSON (16.3); `403` a un ORG_ADMIN y a un USER y `401` sin sesión
+        (16.4). Cada paso crea y elimina su organización (`consumo-<ejecución>-…`); no mira dentro de los contenedores.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
@@ -49,7 +54,7 @@ Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10, los pasos 12.4, 1
 13 y 14 miran dentro de los contenedores (o los paran, o envían desde uno) con `podman`/`docker` (`--inspect none`
 los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el
 plugin.
-`dev/fake_h4_stack.py` simula la pila (sin el grupo 12) para probar este script sin ella.
+`dev/fake_h4_stack.py` simula la pila (sin el grupo 12 ni el disco y el CSV del 16) para probar este script sin ella.
 """
 
 from __future__ import annotations
@@ -81,6 +86,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import e2e_acl
+import e2e_consumo
 import e2e_h3 as h3
 import e2e_uso
 from e2e_h2 import DEV_PASSWORD, DEV_TOTP_SECRET, Http, Runner, StepError, check, dev_api_key
@@ -91,7 +97,7 @@ from baas_plugin.mcp_client import McpClient
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
 APIS, API_NAMES = h3.APIS, h3.API_NAMES
-GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite")
+GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite", "consumo")
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
@@ -3226,6 +3232,8 @@ class E2EH4:
         )
         uso = e2e_uso.UsoGroup(self) if "uso" in groups else None
         logins += uso.logins() if uso else []
+        consumo = e2e_consumo.ConsumoGroup(self) if "consumo" in groups else None
+        logins += consumo.logins() if consumo else []
         step(s3, lambda: self.login(*logins), needs=[s0])
         cases = [(api, stream) for api in APIS for stream in (False, True)]
         if groups & {"observacion", "interruptor", "originales"}:
@@ -3337,6 +3345,8 @@ class E2EH4:
                  self.orph_cleanup, needs=[react_a, visible, react_g, keep])  # fmt: skip
         if uso is not None:
             uso.register(runner, [s0, s1, s3])
+        if consumo is not None:
+            consumo.register(runner, [s0, s1, s3])
         if "acl" in groups and self.inspector is not None:
             e2e_acl.register(runner, self, [s0])
         if "limite" in groups and self.inspector is not None:
