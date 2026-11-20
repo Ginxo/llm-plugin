@@ -41,15 +41,22 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         (`RATE_LIMITED`); en una ráfaga lenta, el `429` puede llegar tras las fichas que volvieron mientras duraba. Una
         clave ya válida pasa desde la IP frenada; desde el equipo, una desconocida sigue en `401`.
 
+  15.   NER de la Fase 2 (L2, grupo «ner», `dev/e2e_ner.py`): los interruptores del NER con motivo y auditoría; un
+        nombre, una empresa y una dirección salen como tokens y vuelven restaurados (tres APIs, con y sin *streaming*);
+        el segundo turno solo analiza lo nuevo con el historial idéntico; con la caché de la efímera perdida el
+        historial sale igual y no se espera; con el servicio `ner` parado, `DEGRADE` da `DEGRADED` y `REJECT` da
+        `503`; la observación (`observed_detections`) sin cambiar el estado del turno; y la prueba en vivo con
+        `ALLOWLISTED`. Cada paso crea y elimina su organización (`ner-<ejecución>-…`).
+
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
     uv run python dev/e2e_h4.py --app-url http://app.localhost:8080 --fake-url http://127.0.0.1:18090
 
-Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10, los pasos 12.4, 12.5, 12.7, 12.8 y 12.9 y los grupos
-13 y 14 miran dentro de los contenedores (o los paran, o envían desde uno) con `podman`/`docker` (`--inspect none`
-los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el
-plugin.
-`dev/fake_h4_stack.py` simula la pila (sin el grupo 12) para probar este script sin ella.
+Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10, los pasos 12.4, 12.5, 12.7, 12.8 y 12.9, los grupos
+13 y 14 y los pasos 15.4 y 15.5 miran dentro de los contenedores (o los paran, o envían desde uno) con
+`podman`/`docker` (`--inspect none` los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos
+no valen. No se distribuye con el plugin.
+`dev/fake_h4_stack.py` simula la pila (sin los grupos 12, 13 y 15) para probar este script sin ella.
 """
 
 from __future__ import annotations
@@ -82,6 +89,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import e2e_acl
 import e2e_h3 as h3
+import e2e_ner
 import e2e_uso
 from e2e_h2 import DEV_PASSWORD, DEV_TOTP_SECRET, Http, Runner, StepError, check, dev_api_key
 
@@ -91,7 +99,7 @@ from baas_plugin.mcp_client import McpClient
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
 APIS, API_NAMES = h3.APIS, h3.API_NAMES
-GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite")
+GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite", "ner")
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
@@ -675,11 +683,24 @@ class Inspector(Protocol):
     def redis_admin(self, service: str, *args: str) -> str: ...
     # H4-13 (grupo «limite»)
     def caddy_requests(self, requests: Sequence[CaddyRequest]) -> tuple[float, list[Http]]: ...
+    # Fase 2, L2 (grupo «ner»)
+    def ephemeral_scan(self, pattern: str) -> list[str]: ...
+    def ephemeral_delete(self, keys: Sequence[str]) -> int: ...
+    def ner_control(self, action: str) -> None: ...
+    def ner_health(self) -> str: ...
 
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _SETTING = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+# Fase 2, L2 (grupo «ner»): lo único que se busca y se borra de la efímera son las cachés de una organización y la copia
+# caliente del vault de una conversación; del servicio `ner`, solo se para y se arranca
+_UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_EPHEMERAL_PATTERN = re.compile(rf"^baas:(ner:{_UUID_RE}:\*|conv:{_UUID_RE}:vault)$")
+_EPHEMERAL_KEY = re.compile(rf"^baas:(ner:{_UUID_RE}:[A-Za-z0-9@._:-]{{1,200}}|conv:{_UUID_RE}:vault)$")
+EPHEMERAL_DEL_BATCH = 100
+NER_SERVICE = "ner"
+NER_ACTIONS = ("stop", "start")
 _E2E_KEY = re.compile(r"^baas:e2e:[a-z0-9-]{1,60}$")
 _REDIS_CLI = 'REDISCLI_AUTH="$BAAS_REDIS_PASSWORD" exec redis-cli "$@"'
 # Busca cada patrón (argumentos 2…) en todos los ficheros del directorio (argumento 1) y escribe el número de los que
@@ -1190,6 +1211,45 @@ class ContainerInspector:
                 raise StepError(f"cabecera no válida: {name!r}")
         return {"host": r.host, "path": r.path, "headers": dict(r.headers), "body": r.body}
 
+    # --- Fase 2, L2: caché del NER y servicio `ner` (grupo «ner», `dev/e2e_ner.py`) -----------------------------
+    def ephemeral_scan(self, pattern: str) -> list[str]:
+        """Las claves de la efímera que casan con `pattern`: solo la caché del NER de una organización
+        (`baas:ner:<org_id>:*`) o la copia caliente del vault de una conversación (`baas:conv:<id>:vault`)."""
+        if not _EPHEMERAL_PATTERN.fullmatch(pattern):
+            raise StepError(f"patrón no permitido en la efímera: {pattern!r}")
+        return self._lines(self._redis_cli(self._service(EPHEMERAL), "--scan", "--pattern", pattern))
+
+    def ephemeral_delete(self, keys: Sequence[str]) -> int:
+        """Borra esas claves de la efímera (solo cachés del NER y copias calientes del vault; si alguna no vale, no
+        se borra ninguna) y devuelve cuántas existían. Es lo que el e2e usa en vez de `FLUSHALL`."""
+        keys = list(keys)
+        for key in keys:
+            if not _EPHEMERAL_KEY.fullmatch(key):
+                raise StepError(f"clave no permitida en la efímera: {key!r}")
+        svc, deleted = self._service(EPHEMERAL), 0
+        for i in range(0, len(keys), EPHEMERAL_DEL_BATCH):
+            reply = self._redis_cli(svc, "DEL", *keys[i : i + EPHEMERAL_DEL_BATCH]).strip()
+            if not reply.isdigit():
+                raise StepError(f"DEL en «{svc}»: {reply[:100]!r}")
+            deleted += int(reply)
+        return deleted
+
+    def _ner_container(self) -> str:
+        cid = self.container(NER_SERVICE)
+        if cid is None:
+            raise StepError(f"no hay contenedor «{NER_SERVICE}» en el proyecto «{self.project}» ({self.engine})")
+        return cid
+
+    def ner_control(self, action: str) -> None:
+        """Para o arranca el servicio `ner` (la pila se queda sin NER; `start` lo devuelve)."""
+        if action not in NER_ACTIONS:
+            raise StepError(f"acción no permitida: {action!r} (solo {', '.join(NER_ACTIONS)})")
+        self._run([action, self._ner_container()], timeout=SERVICE_TIMEOUT)
+
+    def ner_health(self) -> str:
+        """El estado de salud del contenedor `ner` (`healthy`, `starting`, `unhealthy`…)."""
+        return self._run(["inspect", "-f", "{{.State.Health.Status}}", self._ner_container()]).strip()
+
 
 class MissingInspector:
     """No se encontró el motor de contenedores: cada consulta falla diciendo cómo seguir."""
@@ -1206,6 +1266,7 @@ class MissingInspector:
     stream_group = stream_entries = stream_add = stream_has = service_control = service_logs = mcp_files = _fail
     redis_as = redis_admin = _fail
     caddy_requests = _fail
+    ephemeral_scan = ephemeral_delete = ner_control = ner_health = _fail
 
 
 def build_inspector(args: argparse.Namespace) -> Inspector | None:
@@ -1259,7 +1320,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=f"APIs que se prueban, separadas por comas: {', '.join(APIS)} (todas)")  # fmt: skip
     p.add_argument("--inspect", choices=("auto", "podman", "docker", "none"), default="auto",
                    help="Motor para mirar los contenedores («none» omite 9.1b, 9.8, el grupo 10, 12.4-12.5, "
-                        "12.7-12.9, 13.x y 14.x)")  # fmt: skip
+                        "12.7-12.9, 13.x, 14.x, 15.4 y 15.5)")  # fmt: skip
     p.add_argument("--compose-project", default=os.environ.get("COMPOSE_PROJECT_NAME") or "baas-dev",
                    help="Proyecto de compose de la pila (por defecto, $COMPOSE_PROJECT_NAME o baas-dev)")  # fmt: skip
     p.add_argument("--mcp-data-dir", default="/data", help="BAAS_DATA_DIR del contenedor del MCP")
@@ -1282,6 +1343,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Grupo limite: BAAS_AUTH_FAIL_PER_MINUTE de la pila (10); con él se calcula cuántas fichas "
                         "pudieron volver durante una ráfaga lenta y cuánto esperar a que se llene el cubo si una "
                         "ejecución anterior lo dejó a medias")  # fmt: skip
+    p.add_argument("--ner-timeout", type=float, default=150,
+                   help="Grupo ner (15.5): espera (s) a que ner vuelva y el disyuntor se cierre")  # fmt: skip
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
     if ns.auth_fail_burst < 1 or not ns.auth_fail_per_minute > 0:
@@ -3226,6 +3289,8 @@ class E2EH4:
         )
         uso = e2e_uso.UsoGroup(self) if "uso" in groups else None
         logins += uso.logins() if uso else []
+        ner = e2e_ner.NerGroup(self) if "ner" in groups else None
+        logins += ner.logins() if ner else []
         step(s3, lambda: self.login(*logins), needs=[s0])
         cases = [(api, stream) for api in APIS for stream in (False, True)]
         if groups & {"observacion", "interruptor", "originales"}:
@@ -3349,12 +3414,14 @@ class E2EH4:
                  "válida pasa", self.limit_mcp, needs=[s0, s2b])  # fmt: skip
             step("14.4 desde el equipo (otra IP), una clave desconocida → 401 en el proxy y en el MCP",
                  self.limit_other_ip, needs=[s2b])  # fmt: skip
+        if ner is not None:
+            ner.register(runner, [s0, s1, s3])
 
 
 def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> int:
     args = parse_args(argv)
     runner = Runner()
-    wants_containers = bool({"eliminar", "originales", "uso", "acl", "limite"} & set(args.only))
+    wants_containers = bool({"eliminar", "originales", "uso", "acl", "limite", "ner"} & set(args.only))
     inspector = inspector if inspector is not None else build_inspector(args) if wants_containers else None
     e2e = E2EH4(args, inspector)
     print(f"Prueba de punta a punta H4 · webapp {args.app_url} · proveedor falso {args.fake_url}"
@@ -3367,6 +3434,8 @@ def main(argv: list[str] | None = None, inspector: Inspector | None = None) -> i
         print("NOTA: el grupo «acl» entra en Redis con las credenciales de cada servicio (--inspect): se omite")
     if "limite" in args.only and inspector is None:
         print(f"NOTA: el grupo «limite» envía desde el contenedor {LIMIT_SOURCE} (--inspect podman|docker): se omite")
+    if "ner" in args.only and inspector is None:
+        print("NOTA: sin --inspect, el grupo «ner» omite 15.4 y 15.5 (vacían la caché de la efímera y paran el NER)")
     e2e.run(runner)
     report = {**runner.report(), "app_url": args.app_url, "fake_url": args.fake_url, "nonce": e2e.nonce,
               "only": args.only, "apis": args.apis,
