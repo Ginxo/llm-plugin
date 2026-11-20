@@ -688,6 +688,7 @@ class Inspector(Protocol):
     def ephemeral_delete(self, keys: Sequence[str]) -> int: ...
     def ner_control(self, action: str) -> None: ...
     def ner_health(self) -> str: ...
+    def service_health(self, service: str) -> str: ...
 
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -722,7 +723,7 @@ MAX_NEEDLE = 200
 CONTROL_DB = "baas_control"
 USAGE_STREAMS = {PERSISTENT: ("baas:usage",), EPHEMERAL: ("baas:traces",)}
 USAGE_KEYS = ("baas:usage",)  # EXISTS en cualquiera de las dos instancias
-CONTROLLED_SERVICES = ("webapp-api", "mcp-server")
+CONTROLLED_SERVICES = ("webapp-api", "mcp-server", "llm-interceptor-proxy")  # el proxy: 15.4 (grupo «ner»)
 SERVICE_ACTIONS = ("stop", "start", "pause", "unpause")
 # `podman start webapp-api` vuelve a ejecutar la migración y la semilla (dependencias de compose ya terminadas)
 SERVICE_TIMEOUT = 180.0
@@ -1246,9 +1247,27 @@ class ContainerInspector:
             raise StepError(f"acción no permitida: {action!r} (solo {', '.join(NER_ACTIONS)})")
         self._run([action, self._ner_container()], timeout=SERVICE_TIMEOUT)
 
+    def _health(self, cid: str, name: str) -> str:
+        """`healthy`, `starting`, `unhealthy`… del contenedor; sin healthcheck, lo dice (no hay nada que esperar)."""
+        try:
+            status = self._run(["inspect", "-f", "{{.State.Health.Status}}", cid]).strip()
+        except StepError as exc:
+            raise StepError(f"no se pudo leer la salud de «{name}» (¿sin healthcheck?): {exc}") from None
+        if status in ("", "<no value>", "none"):
+            raise StepError(f"el contenedor «{name}» no define healthcheck: no se puede esperar a que esté sano")
+        return status
+
     def ner_health(self) -> str:
-        """El estado de salud del contenedor `ner` (`healthy`, `starting`, `unhealthy`…)."""
-        return self._run(["inspect", "-f", "{{.State.Health.Status}}", self._ner_container()]).strip()
+        """El estado de salud del contenedor `ner`."""
+        return self._health(self._ner_container(), NER_SERVICE)
+
+    def service_health(self, service: str) -> str:
+        """El estado de salud de la webapp, el MCP o el proxy."""
+        svc = self._controlled(service)
+        cid = self.container(svc)
+        if cid is None:
+            raise StepError(f"no hay contenedor «{svc}» en el proyecto «{self.project}» ({self.engine})")
+        return self._health(cid, svc)
 
 
 class MissingInspector:
@@ -1266,7 +1285,7 @@ class MissingInspector:
     stream_group = stream_entries = stream_add = stream_has = service_control = service_logs = mcp_files = _fail
     redis_as = redis_admin = _fail
     caddy_requests = _fail
-    ephemeral_scan = ephemeral_delete = ner_control = ner_health = _fail
+    ephemeral_scan = ephemeral_delete = ner_control = ner_health = service_health = _fail
 
 
 def build_inspector(args: argparse.Namespace) -> Inspector | None:

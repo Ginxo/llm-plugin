@@ -111,6 +111,17 @@ class HistoryTest(unittest.TestCase):
             restored = self.second(api, reply="Eco: " + FIRST.replace("[[PERSON_001]]", "Ana Gómez"))
             self.assertIn("asistente", "\n".join(e2e_ner.history_problems(api, first_body(api), restored)), api)
 
+    def test_the_history_is_compared_with_its_key_order(self) -> None:
+        """El proveedor guarda el cuerpo ya interpretado: lo más cerca de «byte a byte» es la serialización con el orden
+        de claves de la petición (un diccionario con otro orden es igual para `==`)."""
+        for api in ("messages", "chat", "responses"):
+            second = self.second(api)
+            items = second["input" if api == "responses" else "messages"]
+            items[0] = dict(reversed(list(items[0].items())))  # type: ignore[index,arg-type]
+            problems = e2e_ner.history_problems(api, first_body(api), second)
+            self.assertEqual(len(problems), 1, api)
+            self.assertIn("orden", problems[0])
+
     def test_a_second_turn_without_a_new_message_is_reported(self) -> None:
         for api in ("messages", "chat", "responses"):
             problems = e2e_ner.history_problems(api, first_body(api), first_body(api))
@@ -143,10 +154,36 @@ class L2Test(unittest.TestCase):
         problems = "\n".join(e2e_ner.new_only_problems(self.l2(121), self.l2(46, cached=100), 46))
         self.assertIn("cached_bytes", problems)
 
-    def test_with_the_cache_lost_seen_text_may_be_unanalyzed_but_not_awaited(self) -> None:
+    def test_with_every_cache_layer_lost_seen_text_is_all_unanalyzed_and_not_awaited(self) -> None:
         lost = self.l2(46, cached=0, unanalyzed=121)
         self.assertEqual(e2e_ner.new_only_problems(self.l2(121), lost, 46, cache_lost=True), [])
         self.assertTrue(e2e_ner.new_only_problems(self.l2(121), lost, 46), "sin pérdida de caché no debería faltar")
+
+    def test_the_system_text_is_awaited_with_the_cache_lost_and_the_messages_are_not(self) -> None:
+        """Contra la pila real (15.4): el `system` (57 B) no es un mensaje de la correlación, así que se espera al NER
+        por él en la misma llamada que lo nuevo (`analyzed_bytes` 102); los mensajes ya vistos (110 B) no se esperan."""
+        got = self.l2(102, cached=0, unanalyzed=110)
+        self.assertEqual(
+            e2e_ner.new_only_problems(self.l2(46, cached=121), got, 45, cache_lost=True, awaited_extra=57), []
+        )
+        problems = "\n".join(e2e_ner.new_only_problems(self.l2(46, cached=121), got, 45, cache_lost=True))
+        self.assertIn("analyzed_bytes 102", problems)
+        late = self.l2(167, cached=0, unanalyzed=0)  # esperó por los mensajes ya vistos
+        problems = "\n".join(
+            e2e_ner.new_only_problems(self.l2(46, cached=121), late, 45, cache_lost=True, awaited_extra=57)
+        )
+        self.assertIn("analyzed_bytes 167", problems)
+        self.assertIn("unanalyzed_bytes 0", problems)
+
+    def test_with_the_cache_lost_anything_still_cached_or_awaited_is_reported(self) -> None:
+        # el LRU del proxy sobrevivió: lo visto sale de la caché, así que el paso no prueba nada
+        survived = "\n".join(e2e_ner.new_only_problems(self.l2(121), self.l2(46, cached=121), 46, cache_lost=True))
+        self.assertIn("cached_bytes 121", survived)
+        # se esperó al NER por lo ya visto: lo analizó de nuevo
+        awaited = "\n".join(e2e_ner.new_only_problems(self.l2(121), self.l2(167), 46, cache_lost=True))
+        self.assertIn("analyzed_bytes 167", awaited)
+        partly = "\n".join(e2e_ner.new_only_problems(self.l2(121), self.l2(46, 0, 100), 46, cache_lost=True))
+        self.assertIn("unanalyzed_bytes 100", partly)
 
     def test_a_turn_that_is_not_applied_is_reported(self) -> None:
         problems = "\n".join(e2e_ner.new_only_problems(self.l2(121), self.l2(46, 121, status="DEGRADED"), 46))
@@ -226,6 +263,14 @@ class LiveTestTest(unittest.TestCase):
         self.assertEqual(e2e_ner.live_test_problems(self.TEXT, self.body(allow=True), want), [])
         problems = "\n".join(e2e_ner.live_test_problems(self.TEXT, self.body(), want))
         self.assertIn("ALLOWLISTED", problems)
+
+    def test_an_integer_score_is_a_score_but_a_boolean_is_not(self) -> None:
+        want = [("PERSON", "Ana Gómez", "REPLACED")]
+        body = self.body()
+        body["matches"][0]["score"] = 1  # type: ignore[index]
+        self.assertEqual(e2e_ner.live_test_problems(self.TEXT, body, want), [])
+        body["matches"][0]["score"] = True  # type: ignore[index]
+        self.assertIn("score", "\n".join(e2e_ner.live_test_problems(self.TEXT, body, want)))
 
     def test_unavailable_service_wrong_layer_and_bad_offsets_are_reported(self) -> None:
         want = [("PERSON", "Ana Gómez", "REPLACED")]
@@ -322,9 +367,31 @@ for needle, (out, err, rc) in replies.items():
         self.assertEqual(self.inspector.ner_health(), "healthy")
         self.assertEqual(self.runs()[0], ["inspect", "-f", "{{.State.Health.Status}}", "cid-ner"])
 
+    def test_ner_health_without_a_healthcheck_says_so(self) -> None:
+        for out in ("", "<no value>\n"):
+            self.reply(inspect=(out, "", 0))
+            with self.assertRaises(e2e_h4.StepError) as ctx:
+                self.inspector.ner_health()
+            self.assertIn("healthcheck", str(ctx.exception))
+        self.reply(inspect=("", "map has no entry", 1))
+        with self.assertRaises(e2e_h4.StepError) as ctx:
+            self.inspector.ner_health()
+        self.assertIn("healthcheck", str(ctx.exception))
+
+    def test_the_proxy_can_be_stopped_started_and_its_health_read(self) -> None:
+        self.inspector.service_control("llm-interceptor-proxy", "stop")
+        self.inspector.service_control("llm-interceptor-proxy", "start")
+        self.reply(inspect=("healthy\n", "", 0))
+        self.assertEqual(self.inspector.service_health("llm-interceptor-proxy"), "healthy")
+        self.assertEqual(self.runs()[0], ["stop", "cid-llm-interceptor-proxy"])
+        self.assertEqual(self.runs()[1], ["start", "cid-llm-interceptor-proxy"])
+        for service in ("postgres", "redis", "ner"):
+            with self.assertRaises(e2e_h4.StepError, msg=service):
+                self.inspector.service_health(service)
+
     def test_missing_inspector_says_how_to_continue(self) -> None:
         missing = e2e_h4.MissingInspector("podman no está instalado")
-        for name in ("ephemeral_scan", "ephemeral_delete", "ner_control", "ner_health"):
+        for name in ("ephemeral_scan", "ephemeral_delete", "ner_control", "ner_health", "service_health"):
             with self.assertRaises(e2e_h4.StepError, msg=name):
                 getattr(missing, name)("x")
 

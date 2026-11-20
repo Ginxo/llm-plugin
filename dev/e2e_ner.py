@@ -58,6 +58,13 @@ VALUES_3 = {"PERSON": "Pedro Martínez", "ORG": "Repsol", "LOCATION": "Bilbao"}
 ECHO = "Eco: "  # el proveedor falso contesta con el eco del último mensaje del usuario
 TOKEN_RE = re.compile(r"\[\[([A-Z_]+)_[0-9]{3,}\]\]")
 DEGRADED_CAUSES = ("TIMEOUT", "UNAVAILABLE", "OVERLOADED", "BREAKER_OPEN")
+PROXY = "llm-interceptor-proxy"
+# 15.4: lo que puede tardar el turno cuyo historial perdió todas las cachés: una llamada interactiva al NER (el tiempo
+# máximo es de 2 s y una llamada normal tarda decenas de ms) con margen; esperar al NER por lo visto la pasaría
+LOST_CACHE_BOUND = 1.5
+# APIs cuyo texto de sistema no es un mensaje de la conversación: con la caché perdida se espera al NER por él (diseño
+# §5.3, «posiblemente nuevo»), en la misma llamada que lo nuevo; en Chat es el primer mensaje y cuenta como ya visto
+SYSTEM_OUTSIDE_MESSAGES = ("messages", "responses")
 SPEEDY = 1.0  # segundos: un turno con el disyuntor abierto no espera al NER (el tiempo máximo del NER es de 2 s)
 
 
@@ -135,6 +142,13 @@ def new_user_text(api: str, body: Any) -> str:
     return item_text(items[-1]) if items else ""
 
 
+def raw_item(item: Any) -> str:
+    """Un mensaje serializado con el orden de claves con que llegó al proveedor. El proveedor falso guarda el cuerpo ya
+    interpretado (no los bytes), así que esto es lo más cerca de «byte a byte»: un cambio de valor, de orden o de
+    nombre de campo se nota; un cambio de espacios o de escapes del JSON, no."""
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+
+
 def history_problems(api: str, first: Any, second: Any, reply_prefix: str = ECHO) -> list[str]:
     """15.3 y 15.4: lo que recibió el proveedor en el segundo turno empieza por lo que recibió en el primero (mensaje a
     mensaje, idéntico), sigue con la respuesta del modelo tal como la dio (eco del primer mensaje, con sus tokens) y
@@ -145,9 +159,9 @@ def history_problems(api: str, first: Any, second: Any, reply_prefix: str = ECHO
                 f"(el primero trae {len(before)})"]  # fmt: skip
     problems = []
     for i, (was, now) in enumerate(zip(before, after, strict=False)):
-        if was != now:
+        if raw_item(was) != raw_item(now):
             problems.append(f"el mensaje {i} del historial no es idéntico al del primer turno: "
-                            f"{h3.first_difference(was, now)}")  # fmt: skip
+                            f"{h3.first_difference(was, now) or 'mismos valores, otro orden de claves'}")  # fmt: skip
     answer = after[len(before)]
     want = reply_prefix + item_text(before[-1])
     if not isinstance(answer, dict) or answer.get("role") != "assistant":
@@ -163,10 +177,14 @@ def _bytes(l2: Mapping[str, Any], name: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else -1
 
 
-def new_only_problems(first: Any, second: Any, new_bytes: int, *, cache_lost: bool = False) -> list[str]:
+def new_only_problems(
+    first: Any, second: Any, new_bytes: int, *, cache_lost: bool = False, awaited_extra: int = 0
+) -> list[str]:
     """15.3 y 15.4: `verification.l2` del primer y del segundo turno. Solo lo nuevo se analiza (`analyzed_bytes`); todo
     lo ya visto (`analyzed + cached + unanalyzed` del primero) sale de la caché (`cached_bytes`) o, con la caché
-    perdida, se cuenta como no analizado (`unanalyzed_bytes`) sin esperar al NER."""
+    perdida, se cuenta como no analizado (`unanalyzed_bytes`) sin esperar al NER. `awaited_extra`: bytes de texto de
+    origen cliente que **no** es un mensaje ya visto y por eso sí se espera con la caché perdida (diseño §5.3:
+    «posiblemente nuevo», p. ej. el `system`, que no es un mensaje de la correlación)."""
     if not isinstance(first, dict):
         return ["turno 1: sin verification.l2"]
     if not isinstance(second, dict):
@@ -177,11 +195,18 @@ def new_only_problems(first: Any, second: Any, new_bytes: int, *, cache_lost: bo
             problems.append(f"{name}: l2.status {l2.get('status')!r} (se esperaba APPLIED; causa {l2.get('cause')!r})")
     seen = sum(max(_bytes(first, n), 0) for n in ("analyzed_bytes", "cached_bytes", "unanalyzed_bytes"))
     analyzed, cached, unanalyzed = (_bytes(second, n) for n in ("analyzed_bytes", "cached_bytes", "unanalyzed_bytes"))
-    if analyzed != new_bytes:
-        problems.append(f"turno 2: l2.analyzed_bytes {analyzed} (solo lo nuevo: {new_bytes} bytes)")
+    expected_analyzed = new_bytes + (awaited_extra if cache_lost else 0)
+    if analyzed != expected_analyzed:
+        problems.append(f"turno 2: l2.analyzed_bytes {analyzed} (solo lo nuevo: {expected_analyzed} bytes)")
     if cache_lost:
-        if cached + unanalyzed != seen:
-            problems.append(f"turno 2: l2.cached_bytes {cached} + unanalyzed_bytes {unanalyzed} (lo ya visto: {seen})")
+        # ninguna capa tiene lo visto (ni Redis ni el LRU del proxy): se cuenta como no analizado y no se espera
+        if cached != 0:
+            problems.append(f"turno 2: l2.cached_bytes {cached} (con todas las cachés perdidas, 0)")
+        if unanalyzed != seen - awaited_extra:
+            problems.append(
+                f"turno 2: l2.unanalyzed_bytes {unanalyzed} (los mensajes ya vistos, sin esperar al NER: "
+                f"{seen - awaited_extra})"
+            )
     else:
         if cached != seen:
             problems.append(f"turno 2: l2.cached_bytes {cached} (lo ya visto, de la caché: {seen})")
@@ -252,7 +277,8 @@ def live_test_problems(text: str, body: Any, expected: Sequence[tuple[str, str, 
         start, end = m.get("start"), m.get("end")
         if not (isinstance(start, int) and isinstance(end, int) and text[start:end] == value):
             problems.append(f"{kind} «{value}»: desplazamientos {start}-{end} (puntos de código) no apuntan al valor")
-        if not isinstance(m.get("score"), float):
+        score = m.get("score")
+        if not isinstance(score, int | float) or isinstance(score, bool):
             problems.append(f"{kind} «{value}»: sin score")
     return problems
 
@@ -561,6 +587,36 @@ class NerGroup:
         return "segundo turno: " + " · ".join(done) + " · historial idéntico y respuesta del modelo tal cual"
 
     # --- 15.4 caché perdida --------------------------------------------------------------------------------
+    def wait_healthy(self, read: Callable[[], str], name: str) -> None:
+        """Espera a que el contenedor esté `healthy` (`read` falla con un mensaje claro si no define healthcheck)."""
+        deadline = time.monotonic() + self.a.ner_timeout
+        while (health := read()) != "healthy":
+            if time.monotonic() > deadline:
+                raise StepError(f"el contenedor {name} no está sano tras {self.a.ner_timeout:g} s ({health})")
+            time.sleep(1)
+
+    def restart_proxy(self, org: NerOrg) -> None:
+        """Para y arranca el proxy: su caché local (LRU en memoria) se pierde. Espera a que esté sano y a que Caddy lo
+        sirva otra vez (una petición sin clave da `401`, no un error de conexión ni un `502`)."""
+        insp = self.inspector()
+        try:
+            insp.service_control(PROXY, "stop")
+        finally:  # `start` es idempotente: si `stop` agota el tiempo tras parar de verdad, vuelve a arrancar
+            insp.service_control(PROXY, "start")
+        self.wait_healthy(lambda: insp.service_health(PROXY), PROXY)
+        url = h3.api_url(org.binding, "messages")
+        deadline = time.monotonic() + self.a.ner_timeout
+        while True:
+            try:
+                status = h3.http("POST", url, payload={}, timeout=5).status
+            except OSError:
+                status = 0
+            if status == 401:
+                return
+            if time.monotonic() > deadline:
+                raise StepError(f"el proxy no responde por Caddy tras {self.a.ner_timeout:g} s (HTTP {status})")
+            time.sleep(1)
+
     def lost_cache(self) -> str:
         insp = self.inspector()
         api = self.main_api()
@@ -579,6 +635,9 @@ class NerGroup:
                 f"baas:conv:{second['_conversation_id']}:vault"
             )
             check(not left, f"tras vaciar la efímera quedan {len(left)} clave(s) de la organización")
+            # el LRU del proxy sobrevive al borrado de Redis: sin reiniciarlo, lo visto saldría de él y el paso no
+            # probaría nada sobre esperar al NER
+            self.restart_proxy(org)
             _, res, elapsed = self.send(org, api, model, TEXT_3, history=history)
             check(res.status == 200, f"el turno tras vaciar la efímera → HTTP {res.status}: {h3.snippet(res.body)}")
             _, req2, req3 = (provider_body(e) for e in self.provider_requests(model, api, count=3))
@@ -587,7 +646,14 @@ class NerGroup:
             problems += [f"proveedor, lo nuevo: {p}"
                          for p in tokenization_problems(new_user_text(api, req3), VALUES_3, expected_3)]  # fmt: skip
             third = self.turn(org, model, 3)
-            problems += new_only_problems(self.l2_of(second), self.l2_of(third), len(TEXT_3.encode()), cache_lost=True)
+            problems += new_only_problems(
+                self.l2_of(second), self.l2_of(third), len(TEXT_3.encode()), cache_lost=True,
+                awaited_extra=len(h3.SYSTEM.encode()) if api in SYSTEM_OUTSIDE_MESSAGES else 0,
+            )  # fmt: skip
+            if elapsed > LOST_CACHE_BOUND:
+                problems.append(
+                    f"el turno tarda {elapsed:.2f} s (más de {LOST_CACHE_BOUND} s: ¿espera al NER por lo visto?)"
+                )
             check(not problems, "\n".join(problems))
             again = self.e.poll(
                 lambda: [] if insp.ephemeral_scan(f"baas:ner:{org.org_id}:*") else ["sin claves baas:ner:*"]
@@ -596,9 +662,10 @@ class NerGroup:
             l2 = self.l2_of(third)
         return (
             f"{len(cache)} clave(s) de la caché del NER y {len(vault)} de la copia caliente del vault borradas "
-            f"({deleted} DEL, solo las de la organización; no FLUSHALL) · turno 3 en {elapsed * 1000:.0f} ms: "
+            f"({deleted} DEL, solo las de la organización; no FLUSHALL) y el proxy reiniciado (sin su caché local) · "
+            f"turno 3 en {elapsed * 1000:.0f} ms (límite {LOST_CACHE_BOUND * 1000:.0f} ms): "
             f"{l2['analyzed_bytes']} B nuevos, {l2['cached_bytes']} B de caché, "
-            f"{l2['unanalyzed_bytes']} B sin esperar · "
+            f"{l2['unanalyzed_bytes']} B de mensajes ya vistos sin esperar al NER · "
             "historial idéntico y tokens que siguen la numeración (el vault se recargó de PostgreSQL)"
         )
 
@@ -633,10 +700,7 @@ class NerGroup:
         insp.ner_control("start")
         start = time.monotonic()
         deadline = start + self.a.ner_timeout
-        while (health := insp.ner_health()) != "healthy":
-            if time.monotonic() > deadline:
-                raise StepError(f"el contenedor ner no está sano tras {self.a.ner_timeout:g} s ({health})")
-            time.sleep(1)
+        self.wait_healthy(lambda: insp.ner_health(), "ner")
         self.set_ner(org.slug, on_failure="REJECT")
         self.settle()
         tries = 0
@@ -662,8 +726,10 @@ class NerGroup:
         with self.org("caido", mode="ACTIVE") as org:
             stopped = failed = False
             try:
+                stopped = (
+                    True  # antes de parar: si `podman stop` agota el tiempo tras parar de verdad, se reinicia igual
+                )
                 insp.ner_control("stop")
-                stopped = True
                 elapsed, l2, _ = self.degraded_turn(org, api, "d0")
                 notes.append(f"DEGRADE: DEGRADED/{l2['cause']} y WARNING ({elapsed:.1f} s)")
                 for i in range(1, 9):  # cinco fallos abren el disyuntor (BAAS_NER_BREAKER_FAILURES)
