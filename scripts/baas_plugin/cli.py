@@ -579,9 +579,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_desktop_config)
 
     from .runner import add_run_script_parser  # el ejecutor vive en su propio módulo
+    from .setup_tools import add_setup_parser  # `setup <herramienta>`: otras herramientas de IA (T3, #165)
 
     add_run_script_parser(sub)
     sync.add_sync_parser(sub)
+    add_setup_parser(sub)
     return parser
 
 
