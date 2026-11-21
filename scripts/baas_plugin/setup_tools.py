@@ -41,6 +41,11 @@ class ClientTarget:
     drop_keys: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()  # avisos de lo que esta conexión no cubre
     doc: str = "docs/antigravity.md"
+    # Regla de proyecto con las instrucciones de `baas-brain`: el cuerpo es común (`templates/baas_rule.md`) y la
+    # cabecera es del formato de cada herramienta. Sin `rule_path`, no se escribe regla.
+    rule_path: tuple[str, ...] | None = None
+    rule_frontmatter: str = ""
+    rule_max_bytes: int | None = None
 
     @property
     def config_entry(self) -> str:
@@ -54,6 +59,16 @@ ANTIGRAVITY = ClientTarget(
     config_path=(".agents", "mcp_config.json"),
     url_key="serverUrl",
     drop_keys=("url", "httpUrl", "command", "args", "env", "cwd"),
+    rule_path=(".agents", "rules", "baas.md"),
+    # `trigger` es obligatorio (sin él Antigravity descarta la regla en silencio); `always_on` la inyecta en cada turno
+    rule_frontmatter=(
+        "---\n"
+        "trigger: always_on\n"
+        'description: "Cómo usar el MCP baas de la organización (tools baas_*) y detenerse ante'
+        ' AUTHORIZATION_DENIED o KILL_SWITCH_ACTIVE"\n'
+        "---\n"
+    ),
+    rule_max_bytes=24_000,  # por regla; lo que pasa se trunca en silencio
     notes=(
         "Antigravity no pasa por el proxy de BaaS-AI-IP: solo conecta con el cerebro (el MCP). Sus conversaciones"
         " van a Google sin anonimizar (sin AI-IP) y no aparecen en la webapp.",
@@ -130,6 +145,34 @@ def _restrict(path: Path) -> bool:
     return False
 
 
+# --- la regla de proyecto ---------------------------------------------------------------------------
+
+RULE_TEMPLATE = Path(__file__).resolve().parent / "templates" / "baas_rule.md"
+RULE_MARKER = "<!-- baas-managed: lo escribe `baas.py setup`; tus cambios se pierden al repetirlo -->"
+
+
+def render_rule(target: ClientTarget) -> str:
+    text = f"{target.rule_frontmatter}{RULE_MARKER}\n\n{RULE_TEMPLATE.read_text(encoding='utf-8')}"
+    if target.rule_max_bytes is not None and len(text.encode("utf-8")) > target.rule_max_bytes:
+        raise ConfigError(
+            f"La regla de {target.name} supera los {target.rule_max_bytes} bytes que admite la herramienta."
+        )
+    return text
+
+
+def plan_rule(path: Path, desired: str) -> str:
+    """`new`, `update`, `same` o `foreign` (existe y no la escribió `setup`: no se pisa)."""
+    if not path.exists():
+        return "new"
+    try:
+        current = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "foreign"
+    if RULE_MARKER not in current:
+        return "foreign"
+    return "same" if current == desired else "update"
+
+
 # --- el comando ------------------------------------------------------------------------------------
 
 
@@ -169,6 +212,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     new_config = merged_config(target, read_config(config_file), org.mcp_url, creds.api_key, config_file)
     content = _render(new_config)
 
+    rule_file = proj.joinpath(*target.rule_path) if target.rule_path else None
+    rule_text = render_rule(target) if rule_file else None
+    rule_plan = plan_rule(rule_file, rule_text) if rule_file and rule_text else None
+
     if args.print_only:
         shown = merged_config(target, {}, org.mcp_url, KEY_PLACEHOLDER, config_file)
         shown[target.servers_key][SERVER_NAME][target.headers_key]["Authorization"] = (
@@ -182,6 +229,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
             f"«{KEY_PLACEHOLDER}» se sustituye por tu API key, leída de {paths.env_file}; no se imprime ni se pasa",
             "como argumento. Se conservan los demás servidores y ajustes del fichero.",
         )
+        if rule_file and rule_text:
+            _p(
+                "",
+                f"Y la regla de proyecto {rule_file} ({len(rule_text.encode('utf-8'))} bytes), que empieza así:",
+                "",
+                target.rule_frontmatter.rstrip("\n"),
+            )
         return 0
 
     project.check_not_tracked(proj, (target.config_entry,), command=f"`setup {target.name}`")
@@ -191,6 +245,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if changed:
         atomic_write(config_file, content)
     tightened = _restrict(config_file)
+    if rule_file and rule_text and rule_plan in ("new", "update"):
+        rule_file.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(rule_file, rule_text, mode=0o644)  # sin secretos: se puede versionar
 
     _p(
         f"{target.label}: proyecto {proj}, organización {org.describe()}.",
@@ -200,12 +257,22 @@ def cmd_setup(args: argparse.Namespace) -> int:
     )
     if added:
         _p(f"Añadido a .gitignore: {', '.join(added)}.")
+    if rule_file:
+        _p(
+            {
+                "new": f"Regla de proyecto escrita en {rule_file} (siempre activa: enseña las tools `baas_*`).",
+                "update": f"Regla de proyecto actualizada en {rule_file}.",
+                "same": f"Regla de proyecto {rule_file}: sin cambios.",
+                "foreign": f"AVISO: {rule_file} ya existe y no es de BaaS: no lo toco. Renómbralo o bórralo y repite"
+                " el comando para que el agente conozca las tools `baas_*`.",
+            }[str(rule_plan)]
+        )
     for warning in handshake.kill_switch_warnings(hs, org):
         _p(f"AVISO: {warning}")
     _p(
         f"AVISO: tu API key queda en claro en {config_file}: {target.label.split(' (')[0]} no admite variables de"
         " entorno ni un comando para el secreto. No lo subas a git ni lo compartas; si se expone, revócala en la"
-        " webapp (Mis API keys) y vuelve a lanzar este comando.",
+        " webapp (Mis API keys), guarda otra con `set-key` o `/baas-init` y repite este comando.",
         *(f"AVISO: {note}" for note in target.notes),
         f"Guía de uso y comprobación: {target.doc}",
     )

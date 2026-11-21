@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import yaml
 from fake_baas import FakeBaasServer, dev_api_key
 
 from baas_plugin import cli, envfile
@@ -164,7 +166,7 @@ def test_setup_refuses_to_write_a_tracked_file(home, project, server, capsys) ->
     git(project, "init", "-q")
     (project / ".agents").mkdir()
     (project / CONFIG).write_text("{}\n", encoding="utf-8")
-    git(project, "add", CONFIG)
+    git(project, "add", "-f", CONFIG)
     code, out = run(setup(project), capsys)
     assert code == 7
     assert "BAAS_PROJECT_UNSAFE" in out
@@ -278,3 +280,103 @@ def test_setup_says_the_key_is_in_clear_and_that_the_chat_is_not_protected(home,
 def test_unknown_tool_is_rejected_by_the_parser() -> None:
     with pytest.raises(SystemExit):
         cli.main(["setup", "no-existe"])
+
+
+# --- la regla de proyecto (equivalente de la skill `baas-brain`) ----------------------------------
+
+RULE = ".agents/rules/baas.md"
+SKILL = Path(__file__).resolve().parents[1] / "skills" / "baas-brain" / "SKILL.md"
+RULE_MAX_BYTES = 24_000  # tope por regla en Antigravity: lo que pasa se trunca en silencio
+
+
+def frontmatter_of(text: str) -> dict:
+    assert text.startswith("---\n"), "una regla sin frontmatter se descarta en silencio"
+    return yaml.safe_load(text[4 : text.index("\n---", 4)])
+
+
+def test_setup_writes_an_always_on_rule_within_the_size_limit(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    code, out = run(setup(project), capsys)
+    assert code == 0, out
+    rule = project / RULE
+    assert rule.parent == project / ".agents" / "rules", "solo se leen los .md directos de .agents/rules/"
+    text = rule.read_text(encoding="utf-8")
+    meta = frontmatter_of(text)
+    assert meta["trigger"] == "always_on"
+    assert meta["description"].strip()
+    assert len(text.encode("utf-8")) <= RULE_MAX_BYTES
+
+
+def test_the_rule_teaches_every_tool_of_baas_brain_and_to_stop_on_denials(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(setup(project), capsys)[0] == 0
+    text = (project / RULE).read_text(encoding="utf-8")
+    tools = set(re.findall(r"baas_[a-z]+(?:_[a-z]+)+", SKILL.read_text(encoding="utf-8")))
+    assert len(tools) >= 10
+    assert not {t for t in tools if t not in text}, "la regla no enseña alguna tool de la skill baas-brain"
+    for code in ("AUTHORIZATION_DENIED", "KILL_SWITCH_ACTIVE"):
+        assert code in text
+    assert "Detente" in text
+
+
+def test_the_rule_has_nothing_specific_to_claude_code_and_no_secret(home, project, server, capsys) -> None:
+    key = save_key("analista@demo.test", server.url)
+    assert run(setup(project), capsys)[0] == 0
+    text = (project / RULE).read_text(encoding="utf-8")
+    for claude_only in ("/baas-sync", "/baas-init", "CLAUDE_", "mcp__baas__", ".claude", "headersHelper"):
+        assert claude_only not in text, claude_only
+    assert key not in text
+    assert "Bearer" not in text
+
+
+def test_the_rule_is_idempotent_and_is_not_ignored_in_git(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(setup(project), capsys)[0] == 0
+    first = (project / RULE).read_bytes()
+    assert run(setup(project), capsys)[0] == 0
+    assert (project / RULE).read_bytes() == first
+    ignored = (project / ".gitignore").read_text().splitlines()
+    assert ".agents/mcp_config.json" in ignored
+    assert not any("rules" in line for line in ignored), "la regla no lleva secretos: se puede versionar"
+
+
+def test_setup_never_touches_agents_md_or_gemini_md(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    (project / "AGENTS.md").write_text("# Mis reglas\n", encoding="utf-8")
+    assert run(setup(project), capsys)[0] == 0
+    assert (project / "AGENTS.md").read_text(encoding="utf-8") == "# Mis reglas\n"
+    assert not (project / "GEMINI.md").exists()
+    assert not (project / ".agents" / "AGENTS.md").exists()
+
+
+def test_setup_does_not_overwrite_a_rule_of_the_user_with_the_same_name(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    (project / ".agents" / "rules").mkdir(parents=True)
+    mine = "---\ntrigger: manual\n---\nMi regla.\n"
+    (project / RULE).write_text(mine, encoding="utf-8")
+    code, out = run(setup(project), capsys)
+    assert code == 0, out
+    assert (project / RULE).read_text(encoding="utf-8") == mine
+    assert "AVISO" in out
+    assert "no es de BaaS" in out
+    assert (project / CONFIG).exists(), "el MCP se configura igualmente"
+
+
+def test_setup_refreshes_a_rule_it_wrote_before(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(setup(project), capsys)[0] == 0
+    current = (project / RULE).read_text(encoding="utf-8")
+    stale = current.replace("baas_whoami", "baas_quien_soy")
+    assert stale != current
+    (project / RULE).write_text(stale, encoding="utf-8")
+    assert run(setup(project), capsys)[0] == 0
+    assert (project / RULE).read_text(encoding="utf-8") == current
+
+
+def test_print_mentions_the_rule_and_writes_nothing(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    code, out = run(setup(project, "--print"), capsys)
+    assert code == 0, out
+    assert RULE in out
+    assert "always_on" in out
+    assert list(project.iterdir()) == []
