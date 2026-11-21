@@ -1,5 +1,5 @@
-"""CLI del plugin: `set-key`, `init`, `status`, `desktop-config`, `run-script`, `sync`, `inspect`, `publish`
-y `export`. Mensajes en español.
+"""CLI del plugin: `set-key`, `init`, `status`, `desktop-config`, `run-script`, `sync`, `inspect`, `publish`,
+`export` y `setup <herramienta>` (otras herramientas de IA, p. ej. Antigravity). Mensajes en español.
 
 Códigos de salida (las skills los interpretan): 0 ok · 2 configuración (falta la clave o la URL)
 · 3 hay que elegir organización · 4 sin organizaciones · 5 clave no válida (`init` ya no lo produce:
