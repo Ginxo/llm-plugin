@@ -772,9 +772,9 @@ class UsoGroup:
         check(res.status == 200, f"Messages en «{org.slug}» → HTTP {res.status}: {h3.snippet(res.body)}")
         return res
 
-    def conversations(self, org: UsoOrg) -> dict[str, dict[str, Any]]:
-        """Modelo → conversación de la organización (lo que ve su ORG_ADMIN)."""
-        res = self.e.webapp("GET", f"/api/v1/conversations?org={org.slug}&limit=200", self.org_admin)
+    def conversations(self, org: UsoOrg, who: str | None = None) -> dict[str, dict[str, Any]]:
+        """Modelo → conversación de la organización (lo que ve su ORG_ADMIN, o `who` si no es el de la semilla)."""
+        res = self.e.webapp("GET", f"/api/v1/conversations?org={org.slug}&limit=200", who or self.org_admin)
         check(res.status == 200, f"GET /api/v1/conversations?org={org.slug} → {describe(res)}")
         items = [i for i in (res.json() or {}).get("items") or [] if isinstance(i, dict)]
         return {str(i.get("model")): i for i in items}

@@ -44,7 +44,11 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         `GET /platform/usage` con `period` y datos hasta por tubería (16.0, y si falta se saltan los demás); turnos por
         modo (bypass, observación y anonimizado) que cuadran con los enviados (16.1); disco con media, máximo, última
         y el índice aparte (16.2); el CSV igual que el JSON (16.3); `403` a un ORG_ADMIN y a un USER y `401` sin sesión
-        (16.4). Cada paso crea y elimina su organización (`consumo-<ejecución>-…`); no mira dentro de los contenedores.
+        en el informe y en las cuatro rutas globales (16.4); el tráfico global es la suma de las organizaciones y cada
+        una es su propio informe (16.5); el anonimizador de una organización es el de plataforma, con sus permisos
+        (16.6); las consultas globales y del anonimizador no dejan `usage.viewed` (16.7); con el NER, las columnas de
+        L2 se llenan (16.8, se salta sin NER). Cada paso crea y elimina su organización (`consumo-<ejecución>-…`); no
+        mira dentro de los contenedores.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
@@ -54,7 +58,7 @@ Los pasos 9.1b y 9.8 (vault, Redis y cuarentena), el grupo 10, los pasos 12.4, 1
 13 y 14 miran dentro de los contenedores (o los paran, o envían desde uno) con `podman`/`docker` (`--inspect none`
 los omite). Sale con 0 si todo pasa, 1 si algún paso falla y 2 si los argumentos no valen. No se distribuye con el
 plugin.
-`dev/fake_h4_stack.py` simula la pila (sin el grupo 12 ni el disco y el CSV del 16) para probar este script sin ella.
+`dev/fake_h4_stack.py` simula la pila (sin el grupo 12 ni el disco y el CSV de 16.2 y 16.3) para probarlo sin ella.
 """
 
 from __future__ import annotations
@@ -1276,7 +1280,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Segundos de espera antes de mirar el AOF vivo (Redis lo escribe con retraso)")  # fmt: skip
     p.add_argument("--timeout", type=float, default=60, help="Tiempo máximo de cada petición HTTP")
     p.add_argument("--usage-timeout", type=float, default=90,
-                   help="Grupo uso: espera (s) del uso del MCP, de la foto y de un servicio reiniciado")  # fmt: skip
+                   help="Grupos uso y consumo: espera (s) del uso del MCP, de la foto de disco (12.5 y 16.2) y de un "
+                        "servicio reiniciado")  # fmt: skip
     p.add_argument("--overhead-n", type=int, default=200, help="Grupo uso (12.10): pares de peticiones medidos")
     p.add_argument("--overhead-p95-ms", type=float, default=10.0,
                    help="Grupo uso (12.10): umbral (ms) del p95 del sobrecoste")  # fmt: skip

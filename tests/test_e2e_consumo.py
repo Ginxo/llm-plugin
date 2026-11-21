@@ -1,9 +1,10 @@
 """Grupo «consumo» (16.x) de la prueba de punta a punta de H4 (`dev/e2e_consumo.py`).
 
-Los pasos 16.0–16.4 se ejecutan contra la pila real (la simulada de `dev/fake_h4_stack.py` sirve el informe de turnos
-por modo, no el disco de 16.2 ni el CSV de 16.3); aquí se prueban las utilidades puras con las que deciden y el
-recorrido del grupo (orden, dependencias y qué se salta si la pila no trae el informe). Con `unittest` (se ejecutan con
-`pytest` en la CI). Los pasos contra la pila simulada (16.0, 16.1 y 16.4) están en `tests/test_e2e_h4.py`.
+Los pasos 16.0–16.8 se ejecutan contra la pila real (la simulada de `dev/fake_h4_stack.py` sirve los informes de
+turnos por modo, los globales y el del anonimizador, no el disco de 16.2 ni el CSV de 16.3); aquí se prueban las
+utilidades puras con las que deciden y el recorrido del grupo (orden, dependencias y qué se salta si la pila no trae el
+informe). Con `unittest` (se ejecutan con `pytest` en la CI). Los pasos contra la pila simulada (16.0, 16.1 y 16.4 a
+16.8) están en `tests/test_e2e_h4.py`.
 """
 
 from __future__ import annotations
@@ -332,6 +333,360 @@ class Step164Test(unittest.TestCase):
         self.assertTrue(e2e_consumo.denied_problems(403, {"error": "NOT_FOUND"}, 403))
         self.assertEqual(e2e_consumo.denied_problems(401, {"error": "UNAUTHENTICATED"}, 401), [])
 
+    def test_a_denied_reply_of_a_global_report_carries_no_series_either(self) -> None:
+        problems = e2e_consumo.denied_problems(403, {"error": "FORBIDDEN", "series": [{"key": "demo"}]}, 403)
+        self.assertTrue(any("series" in p for p in problems), problems)
+        problems = e2e_consumo.denied_problems(403, {"error": "FORBIDDEN", "orgs": [], "totals": {}, "period": {}}, 403)
+        self.assertTrue(any("orgs" in p and "totals" in p and "period" in p for p in problems), problems)
+
+    def test_not_found_is_the_third_reply_the_matrix_knows(self) -> None:
+        self.assertEqual(e2e_consumo.denied_problems(404, {"error": "NOT_FOUND", "message": "x"}, 404), [])
+        self.assertTrue(e2e_consumo.denied_problems(403, {"error": "FORBIDDEN"}, 404))
+        self.assertTrue(e2e_consumo.denied_problems(404, {"error": "FORBIDDEN"}, 404))
+        self.assertTrue(e2e_consumo.denied_problems(404, {"error": "NOT_FOUND", "totals": {}}, 404))
+
+    def test_the_five_platform_routes_are_the_report_and_the_four_global_ones(self) -> None:
+        self.assertEqual(e2e_consumo.GLOBAL_KINDS, ("traffic", "content", "storage", "anonymizer"))
+        self.assertEqual(
+            e2e_consumo.platform_routes(),
+            [
+                "/api/v1/platform/usage",
+                "/api/v1/platform/usage/traffic",
+                "/api/v1/platform/usage/content",
+                "/api/v1/platform/usage/storage",
+                "/api/v1/platform/usage/anonymizer",
+            ],
+        )
+
+
+def traffic_item(slug: str = "consumo-abc-a", **overrides: object) -> dict:
+    """Un elemento de `series` de `GET /platform/usage/traffic?group_by=org` (contrato §7.4)."""
+    item = {"key": slug, "label": "Org", "org": {"slug": slug, "name": "Org"}, "requests": 3, "blocked": 1, "errors": 2,
+            "tokens_in": 36, "tokens_out": 27, "bytes_in": 900, "bytes_out": 500, "latency_p50_ms": 1000,
+            "latency_p95_ms": 2000, "ttft_avg_ms": 800, "active_users": 2}  # fmt: skip
+    item.update(overrides)
+    return item
+
+
+def own_totals(**overrides: object) -> dict:
+    """`totals` del informe de tráfico de la propia organización (Fase 4 §8.3): lo mismo, sin `active_users`."""
+    totals = {k: v for k, v in traffic_item().items() if k not in ("key", "label", "org", "active_users")}
+    totals.update(overrides)
+    return totals
+
+
+def own_users(*requests: int) -> list[dict]:
+    """`series` de `group_by=user` de la propia organización: una fila por persona con datos."""
+    return [{"key": f"u{i}", "label": f"u{i}", "user": {"id": f"u{i}"}, "requests": n} for i, n in enumerate(requests)]
+
+
+def traffic_report(group_by: str, series: list[dict], **totals: object) -> dict:
+    base = {"orgs": len(series), **{k: sum(s.get(k) or 0 for s in series) for k in e2e_consumo.TRAFFIC_ADDED}}
+    return {"group_by": group_by, "period": {"month": None, "from": "2026-11-19", "to": "2026-11-20", "open": True},
+            "totals": {**base, **totals}, "series": series}  # fmt: skip
+
+
+class Step165Test(unittest.TestCase):
+    def test_the_figures_that_are_compared_one_by_one(self) -> None:
+        self.assertEqual(
+            e2e_consumo.TRAFFIC_COMPARED,
+            ("requests", "blocked", "errors", "tokens_in", "tokens_out", "bytes_in", "bytes_out", "latency_p50_ms",
+             "latency_p95_ms", "ttft_avg_ms"),
+        )  # fmt: skip
+        self.assertEqual(e2e_consumo.TRAFFIC_ADDED, (*e2e_consumo.TRAFFIC_COMPARED[:7], "active_users"))
+
+    def test_the_global_row_is_the_report_of_the_organisation(self) -> None:
+        self.assertEqual(e2e_consumo.traffic_row_problems("a", traffic_item(), own_totals(), own_users(2, 1)), [])
+
+    def test_each_compared_figure_is_reported(self) -> None:
+        for name in e2e_consumo.TRAFFIC_COMPARED:
+            with self.subTest(name=name):
+                row = traffic_item(**{name: (traffic_item()[name] or 0) + 1})
+                problems = e2e_consumo.traffic_row_problems("a", row, own_totals(), own_users(2, 1))
+                self.assertTrue(any(name in p for p in problems), problems)
+
+    def test_percentiles_that_are_null_on_both_sides_agree(self) -> None:
+        row = traffic_item(latency_p50_ms=None, latency_p95_ms=None, ttft_avg_ms=None)
+        own = own_totals(latency_p50_ms=None, latency_p95_ms=None, ttft_avg_ms=None)
+        self.assertEqual(e2e_consumo.traffic_row_problems("a", row, own, own_users(2, 1)), [])
+        problems = e2e_consumo.traffic_row_problems("a", row, own_totals(), own_users(2, 1))
+        self.assertTrue(any("latency_p50_ms" in p for p in problems), problems)
+
+    def test_active_users_are_the_people_with_requests_in_the_report_of_the_organisation(self) -> None:
+        problems = e2e_consumo.traffic_row_problems("a", traffic_item(), own_totals(), own_users(3))
+        self.assertTrue(any("active_users" in p and "2" in p and "1" in p for p in problems), problems)
+        # una persona sin peticiones no es activa
+        self.assertEqual(e2e_consumo.traffic_row_problems("a", traffic_item(), own_totals(), own_users(2, 1, 0)), [])
+
+    def test_an_organisation_missing_from_the_global_report_is_named(self) -> None:
+        problems = e2e_consumo.traffic_row_problems("consumo-abc-a", None, own_totals(), own_users(2, 1))
+        self.assertTrue(any("consumo-abc-a" in p and "no sale" in p for p in problems), problems)
+
+    def test_a_type_mix_up_is_a_difference(self) -> None:
+        problems = e2e_consumo.traffic_row_problems("a", traffic_item(requests=3.0), own_totals(), own_users(2, 1))
+        self.assertTrue(any("requests" in p for p in problems), problems)
+        problems = e2e_consumo.traffic_row_problems(
+            "a", traffic_item(requests=True), own_totals(requests=1), own_users(2)
+        )
+        self.assertTrue(any("requests" in p for p in problems), problems)
+
+    def test_totals_are_the_sum_of_the_series(self) -> None:
+        series = [traffic_item("a"), traffic_item("b", requests=5, active_users=1)]
+        self.assertEqual(e2e_consumo.traffic_sum_problems(traffic_report("org", series)), [])
+        report = traffic_report("org", series)
+        report["totals"]["requests"] += 1
+        report["totals"]["orgs"] = 3
+        report["totals"]["active_users"] = 9
+        problems = " ".join(e2e_consumo.traffic_sum_problems(report))
+        for fragment in ("requests", "orgs", "active_users"):
+            self.assertIn(fragment, problems)
+
+    def test_days_and_pairs_have_no_active_users_to_add(self) -> None:
+        series = [{"key": "2026-11-19", **{k: 1 for k in e2e_consumo.TRAFFIC_ADDED[:7]}},
+                  {"key": "2026-11-20", **{k: 2 for k in e2e_consumo.TRAFFIC_ADDED[:7]}}]  # fmt: skip
+        report = {"group_by": "day", "totals": {"orgs": 4, **{k: 3 for k in e2e_consumo.TRAFFIC_ADDED[:7]}},
+                  "series": series}  # fmt: skip
+        self.assertEqual(e2e_consumo.traffic_sum_problems(report, orgs=4), [])
+        report["totals"]["tokens_in"] = 4
+        self.assertTrue(any("tokens_in" in p for p in e2e_consumo.traffic_sum_problems(report, orgs=4)))
+
+    def test_the_series_is_every_day_of_the_range(self) -> None:
+        days = {"series": [{"key": "2026-11-19"}, {"key": "2026-11-20"}]}
+        self.assertEqual(e2e_consumo.days_problems(days, "2026-11-19", "2026-11-20"), [])
+        self.assertTrue(e2e_consumo.days_problems({"series": [{"key": "2026-11-20"}]}, "2026-11-19", "2026-11-20"))
+        self.assertTrue(e2e_consumo.days_problems(days, "2026-11-18", "2026-11-20"))
+
+    def test_the_three_groupings_say_the_same_totals(self) -> None:
+        by_org = traffic_report("org", [traffic_item("a")])
+        by_day = {"totals": {k: by_org["totals"][k] for k in e2e_consumo.TRAFFIC_ADDED[:7]}}
+        by_pair = {"totals": dict(by_day["totals"])}
+        self.assertEqual(e2e_consumo.same_totals_problems({"org": by_org, "day": by_day, "org_day": by_pair}), [])
+        by_pair["totals"]["requests"] += 1
+        problems = e2e_consumo.same_totals_problems({"org": by_org, "day": by_day, "org_day": by_pair})
+        self.assertTrue(any("org_day" in p and "requests" in p for p in problems), problems)
+
+    def test_org_day_adds_up_to_each_organisation_it_names(self) -> None:
+        pairs = {"top": ["a", "b"], "series": [
+            {"key": "a:2026-11-19", "org": {"slug": "a"}, "requests": 1},
+            {"key": "a:2026-11-20", "org": {"slug": "a"}, "requests": 2},
+            {"key": "(otras):2026-11-20", "org": None, "requests": 9},
+        ]}  # fmt: skip
+        self.assertEqual(e2e_consumo.org_day_problems(pairs, {"a": 3, "b": 0}), [])
+        problems = e2e_consumo.org_day_problems(pairs, {"a": 4})
+        self.assertTrue(any("a" in p and "3" in p and "4" in p for p in problems), problems)
+        # una organización fuera de las 10 mayores no se comprueba (va en «(otras)»)
+        self.assertEqual(e2e_consumo.org_day_problems(pairs, {"z": 7}), [])
+        too_many = {"top": [f"o{i}" for i in range(11)], "series": []}
+        self.assertTrue(any("10" in p for p in e2e_consumo.org_day_problems(too_many, {})))
+
+    def test_the_consumption_report_agrees_with_the_global_traffic(self) -> None:
+        row = {"slug": "a", "requests": 3, "blocked_requests": 1, "errors": 2, "tokens_in": 36, "tokens_out": 27,
+               "bytes_in": 900, "bytes_out": 500, "active_users": 2}  # fmt: skip
+        self.assertEqual(e2e_consumo.platform_row_problems("a", row, traffic_item()), [])
+        problems = e2e_consumo.platform_row_problems("a", {**row, "blocked_requests": 0}, traffic_item())
+        self.assertTrue(any("blocked" in p for p in problems), problems)
+        self.assertTrue(e2e_consumo.platform_row_problems("a", None, traffic_item()))
+
+
+def anonymizer_block(**overrides: object) -> dict:
+    """El bloque `M` de una organización (contrato §6.5): tres modos distintos y una cifra por columna."""
+    block = {**ZERO_ANON, "turns": 6, "turns_by_mode": {"ANONYMIZED": 3, "OBSERVATION": 2, "BYPASS": 1},
+             "tokens_in": 72, "tokens_out": 54, "bytes_in": 9000, "replaced_in": 9, "restored_out": 9,
+             "verified_clean": 3, "verified_warning": 2}  # fmt: skip
+    block.update(overrides)
+    return block
+
+
+def anonymizer_series(*days: dict) -> dict:
+    """El informe de organización (`group_by=day`) cuyos días suman `totals`."""
+    series = [{"key": f"2026-11-{19 + i}", "label": f"2026-11-{19 + i}", **block} for i, block in enumerate(days)]
+    columns = [c for c in e2e_consumo.ANONYMIZER_COLUMNS]
+    totals = {c: sum(b[c] for b in days) for c in columns}
+    totals["turns_by_mode"] = {m: sum(b["turns_by_mode"][m] for b in days) for m in e2e_consumo.MODES}
+    return {"group_by": "day", "totals": totals, "series": series}
+
+
+class Step166Test(unittest.TestCase):
+    def test_the_columns_are_the_anonymizer_block_of_the_contract(self) -> None:
+        self.assertEqual(len(e2e_consumo.ANONYMIZER_COLUMNS), 19)
+        self.assertEqual(set(e2e_consumo.ANONYMIZER_COLUMNS) | {"turns_by_mode"}, set(anonymizer_block()))
+        self.assertEqual(len(e2e_consumo.L2_COLUMNS), 10)
+        self.assertTrue(all(c.startswith("l2_") for c in e2e_consumo.L2_COLUMNS))
+
+    def test_the_three_readings_of_one_organisation_agree(self) -> None:
+        block = anonymizer_block()
+        own = {**block}
+        globl = {"key": "a", "label": "A", "org": {"slug": "a", "name": "A"}, **block}
+        self.assertEqual(e2e_consumo.anonymizer_equal_problems("a", own, block, globl), [])
+
+    def test_each_column_is_compared_in_the_three_readings(self) -> None:
+        block = anonymizer_block()
+        for column in e2e_consumo.ANONYMIZER_COLUMNS:
+            for where in ("org", "platform", "global"):
+                with self.subTest(column=column, where=where):
+                    own, platform, globl = {**block}, {**block}, {"key": "a", **block}
+                    {"org": own, "platform": platform, "global": globl}[where][column] += 1
+                    problems = e2e_consumo.anonymizer_equal_problems("a", own, platform, globl)
+                    self.assertTrue(any(column in p for p in problems), problems)
+
+    def test_the_turns_by_mode_are_compared_by_mode(self) -> None:
+        block = anonymizer_block()
+        own = {**block, "turns_by_mode": {"ANONYMIZED": 2, "OBSERVATION": 3, "BYPASS": 1}}
+        problems = e2e_consumo.anonymizer_equal_problems("a", own, block, {"key": "a", **block})
+        self.assertTrue(any("turns_by_mode" in p and "ANONYMIZED" in p for p in problems), problems)
+
+    def test_a_missing_reading_is_named(self) -> None:
+        block = anonymizer_block()
+        problems = e2e_consumo.anonymizer_equal_problems("a", block, block, None)
+        self.assertTrue(any("plataforma" in p and "a" in p for p in problems), problems)
+
+    def test_the_days_add_up_to_the_totals(self) -> None:
+        zero = anonymizer_block(**{c: 0 for c in ("turns", "tokens_in", "tokens_out", "bytes_in", "replaced_in",
+                                                  "restored_out", "verified_clean", "verified_warning")},
+                                turns_by_mode={"ANONYMIZED": 0, "OBSERVATION": 0, "BYPASS": 0})  # fmt: skip
+        report = anonymizer_series(zero, anonymizer_block())
+        self.assertEqual(e2e_consumo.anonymizer_series_problems(report, days=["2026-11-19", "2026-11-20"]), [])
+        report["totals"]["replaced_in"] += 1
+        report["totals"]["turns_by_mode"]["BYPASS"] += 1
+        problems = " ".join(e2e_consumo.anonymizer_series_problems(report, days=["2026-11-19", "2026-11-20"]))
+        self.assertIn("replaced_in", problems)
+        self.assertIn("BYPASS", problems)
+
+    def test_every_day_of_the_range_is_there_with_zeros(self) -> None:
+        report = anonymizer_series(anonymizer_block())
+        problems = e2e_consumo.anonymizer_series_problems(report, days=["2026-11-19", "2026-11-20"])
+        self.assertTrue(any("2026-11-20" in p for p in problems), problems)
+
+    def test_hours_are_checked_by_count(self) -> None:
+        zero = anonymizer_block(**{c: 0 for c in ("turns", "tokens_in", "tokens_out", "bytes_in", "replaced_in",
+                                                  "restored_out", "verified_clean", "verified_warning")},
+                                turns_by_mode={"ANONYMIZED": 0, "OBSERVATION": 0, "BYPASS": 0})  # fmt: skip
+        hours = [{"key": f"2026-11-19T{h:02d}:00:00+00:00", **zero} for h in range(24)]
+        hours[3] = {**hours[3], **anonymizer_block()}
+        report = {"group_by": "hour", "series": hours,
+                  "totals": anonymizer_series(anonymizer_block())["totals"]}  # fmt: skip
+        self.assertEqual(e2e_consumo.anonymizer_series_problems(report, count=24), [])
+        self.assertTrue(e2e_consumo.anonymizer_series_problems(report, count=48))
+
+
+def audit_row(row_id: str, count: int = 1, **overrides: object) -> dict:
+    meta = {"group_by": "user", "format": "json", "users": 0}
+    row = {"id": row_id, "action": "usage.viewed", "org_slug": "consumo-abc-vista", "target_type": "usage_report",
+           "target_id": "traffic", "count": count, "metadata": meta}  # fmt: skip
+    row.update(overrides)
+    return row
+
+
+class Step167Test(unittest.TestCase):
+    def test_the_snapshot_is_the_rows_with_their_counts(self) -> None:
+        rows = [audit_row("a", 2), audit_row("b")]
+        self.assertEqual(e2e_consumo.viewed_snapshot(rows), {"a": 2, "b": 1})
+
+    def test_no_new_row_and_no_new_count_is_clean(self) -> None:
+        before = {"a": 2, "b": 1}
+        self.assertEqual(e2e_consumo.viewed_problems(before, dict(before)), [])
+
+    def test_a_new_row_is_a_problem(self) -> None:
+        problems = e2e_consumo.viewed_problems({"a": 2}, {"a": 2, "b": 1})
+        self.assertTrue(any("usage.viewed" in p and "b" in p for p in problems), problems)
+
+    def test_an_aggregated_row_that_grows_is_a_problem(self) -> None:
+        problems = e2e_consumo.viewed_problems({"a": 2}, {"a": 3})
+        self.assertTrue(any("a" in p and "2" in p and "3" in p for p in problems), problems)
+
+    def test_a_row_that_disappears_is_not_ours_to_judge(self) -> None:
+        self.assertEqual(e2e_consumo.viewed_problems({"a": 2, "b": 1}, {"a": 2}), [])
+
+    def test_the_organisation_audit_must_be_empty(self) -> None:
+        self.assertEqual(e2e_consumo.org_viewed_problems("consumo-abc-vista", []), [])
+        problems = e2e_consumo.org_viewed_problems("consumo-abc-vista", [audit_row("a", target_id="anonymizer")])
+        self.assertTrue(any("consumo-abc-vista" in p and "anonymizer" in p for p in problems), problems)
+
+    def test_the_control_is_one_row_of_the_detail_by_person(self) -> None:
+        self.assertEqual(e2e_consumo.control_problems("consumo-abc-vista", [audit_row("a")]), [])
+        self.assertTrue(
+            e2e_consumo.control_problems("consumo-abc-vista", []), "sin fila, la comprobación no probaría nada"
+        )
+        self.assertTrue(e2e_consumo.control_problems("consumo-abc-vista", [audit_row("a"), audit_row("b")]))
+        wrong = audit_row("a", metadata={"group_by": "day"})
+        self.assertTrue(e2e_consumo.control_problems("consumo-abc-vista", [wrong]))
+        self.assertTrue(e2e_consumo.control_problems("consumo-abc-vista", [audit_row("a", target_id="content")]))
+
+
+def l2_turn(status: str = "OBSERVED", **l2: object) -> dict:
+    block = {"status": status, "enabled": True, "cause": None, "analyzed_bytes": 100, "cached_bytes": 0,
+             "unanalyzed_bytes": 0, "observed": 3}  # fmt: skip
+    block.update(l2)
+    return {"status": "CLEAN", "request_replacements_by_type": {}, "response_replacements_by_type": {}, "l2": block}
+
+
+def l2_sent() -> list[e2e_consumo.Sent]:
+    """Dos turnos anonimizados y uno en observación con el NER, y uno en bypass (sin verificación)."""
+    turns = [e2e_consumo.Sent("ANONYMIZED", 12, 9, "ANONYMIZED", l2_turn(analyzed_bytes=100, observed=3)),
+             e2e_consumo.Sent("ANONYMIZED", 12, 9, "ANONYMIZED",
+                              l2_turn("APPLIED", analyzed_bytes=60, cached_bytes=40)),
+             e2e_consumo.Sent("OBSERVATION", 12, 9, "OBSERVATION", l2_turn(enabled=False, unanalyzed_bytes=7)),
+             e2e_consumo.Sent("BYPASS", 12, 9, "BYPASS", None)]  # fmt: skip
+    return turns
+
+
+class Step168Test(unittest.TestCase):
+    def test_the_ner_is_there_when_a_turn_carries_l2(self) -> None:
+        self.assertTrue(e2e_consumo.has_l2(l2_sent()))
+        self.assertFalse(e2e_consumo.has_l2(sent_turns()), "sin NER, verification no lleva l2")
+        self.assertFalse(e2e_consumo.has_l2([e2e_consumo.Sent("ANONYMIZED", 1, 1, "ANONYMIZED", {"l2": None})]))
+        self.assertFalse(e2e_consumo.has_l2([e2e_consumo.Sent("ANONYMIZED", 1, 1, "ANONYMIZED", {"l2": "x"})]))
+
+    def test_the_columns_are_what_each_turn_says_of_its_l2(self) -> None:
+        want = e2e_consumo.l2_expected(l2_sent())
+        self.assertEqual(want, {
+            "l2_turns": 3, "l2_enabled": 2, "l2_applied": 1, "l2_degraded": 0, "l2_observed_turns": 2,
+            "l2_known_values_only": 0, "l2_analyzed_bytes": 260, "l2_cached_bytes": 40, "l2_unanalyzed_bytes": 7,
+            "l2_observed": 9,
+        })  # fmt: skip
+
+    def test_only_a_boolean_true_enables_and_only_an_object_counts(self) -> None:
+        odd = [e2e_consumo.Sent("ANONYMIZED", 1, 1, "ANONYMIZED", l2_turn(enabled="true", status="UNKNOWN")),
+               e2e_consumo.Sent("ANONYMIZED", 1, 1, "ANONYMIZED", {"status": "CLEAN", "l2": None})]  # fmt: skip
+        want = e2e_consumo.l2_expected(odd)
+        self.assertEqual((want["l2_turns"], want["l2_enabled"]), (1, 0))
+        self.assertEqual((want["l2_applied"], want["l2_degraded"], want["l2_observed_turns"]), (0, 0, 0))
+
+    def test_negative_or_non_integer_bytes_count_zero(self) -> None:
+        odd = l2_turn(analyzed_bytes=-5, cached_bytes=1.5, unanalyzed_bytes=True, observed="2")
+        bad = [e2e_consumo.Sent("ANONYMIZED", 1, 1, "ANONYMIZED", odd)]
+        want = e2e_consumo.l2_expected(bad)
+        self.assertEqual([want[c] for c in ("l2_analyzed_bytes", "l2_cached_bytes", "l2_unanalyzed_bytes",
+                                            "l2_observed")], [0, 0, 0, 0])  # fmt: skip
+
+    def test_a_filled_block_matches(self) -> None:
+        want = e2e_consumo.l2_expected(l2_sent())
+        self.assertEqual(e2e_consumo.l2_problems(anonymizer_block(**want), want), [])
+
+    def test_a_block_left_at_zero_is_named(self) -> None:
+        want = e2e_consumo.l2_expected(l2_sent())
+        problems = e2e_consumo.l2_problems(anonymizer_block(), want)
+        self.assertTrue(any("l2_turns" in p for p in problems), problems)
+        self.assertTrue(any("se llenan" in p for p in problems), problems)
+
+    def test_each_column_is_compared_exactly(self) -> None:
+        want = e2e_consumo.l2_expected(l2_sent())
+        for column in e2e_consumo.L2_COLUMNS:
+            with self.subTest(column=column):
+                problems = e2e_consumo.l2_problems(anonymizer_block(**{**want, column: want[column] + 1}), want)
+                self.assertTrue(any(column in p for p in problems), problems)
+
+    def test_observing_or_applying_must_show(self) -> None:
+        degraded = [e2e_consumo.Sent("ANONYMIZED", 1, 1, "ANONYMIZED", l2_turn("DEGRADED", cause="TIMEOUT"))]
+        want = e2e_consumo.l2_expected(degraded)
+        problems = e2e_consumo.l2_problems(anonymizer_block(**want), want)
+        self.assertTrue(any("l2_observed_turns" in p and "l2_applied" in p for p in problems), problems)
+
+    def test_the_skip_says_why(self) -> None:
+        text = e2e_consumo.no_ner_message()
+        for fragment in ("SALTADO", "NER", "verification.l2"):
+            self.assertIn(fragment, text)
+
 
 class GroupTest(unittest.TestCase):
     def register(self) -> list[tuple[str, tuple[str, ...]]]:
@@ -347,7 +702,10 @@ class GroupTest(unittest.TestCase):
 
     def test_the_steps_are_registered_in_order_without_an_inspector(self) -> None:
         steps = self.register()
-        self.assertEqual([n.split(" ")[0] for n, _ in steps], ["16.0", "16.1", "16.2", "16.3", "16.4"])
+        self.assertEqual(
+            [n.split(" ")[0] for n, _ in steps],
+            ["16.0", "16.1", "16.2", "16.3", "16.4", "16.5", "16.6", "16.7", "16.8"],
+        )
 
     def test_every_step_needs_16_0_so_a_stack_without_the_report_skips_them(self) -> None:
         steps = self.register()
