@@ -397,8 +397,9 @@ for needle, (out, err, rc) in replies.items():
 
 
 class GroupWiringTest(unittest.TestCase):
-    def test_ner_is_the_last_group_and_in_the_default_list(self) -> None:
-        self.assertEqual(e2e_h4.GROUPS[-1], "ner", "los pasos 15.x van después de los 14.x")
+    def test_ner_goes_after_limite_and_is_in_the_default_list(self) -> None:
+        groups = e2e_h4.GROUPS
+        self.assertEqual(groups.index("ner"), groups.index("limite") + 1, "los pasos 15.x van después de los 14.x")
         self.assertIn("ner", e2e_h4.parse_args([]).only)
         self.assertEqual(e2e_h4.parse_args(["--only", "ner"]).only, ["ner"])
 

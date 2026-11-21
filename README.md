@@ -15,7 +15,7 @@ Este repositorio es a la vez el **marketplace** `baas-ai-ip` y el **plugin** `ba
 
 - Claude Code (CLI o extensión de IDE). Probado con 2.1.325.
 - **Python 3.10 o superior** como `python3` (solo biblioteca estándar: no hay que instalar nada).
-- Una cuenta de BaaS-AI-IP con acceso a una organización. La dirección de la aplicación solo hace falta si el plugin no la trae ya puesta ([La dirección de BaaS-AI-IP](#la-dirección-de-baas-ai-ip)).
+- Una cuenta de BaaS-AI-IP con acceso a una organización. La dirección de la aplicación solo hace falta si no es la pública por defecto ([La dirección de BaaS-AI-IP](#la-dirección-de-baas-ai-ip)).
 - Linux o macOS. Windows no está probado.
 
 ## Primer uso (tres pasos)
@@ -45,9 +45,9 @@ El plugin necesita saber a qué servidor conectarse. Se resuelve así, por orden
 1. `--app-url <dirección>` en la línea de órdenes (lo usa Claude cuando se la das en el chat).
 2. La variable de entorno **`BAAS_APP_URL`**.
 3. La que ya recuerda el equipo (`BAAS_APP_URL` en `~/baas-ai-ip/.env`, que `/baas-init` guarda solo cuando el servidor responde).
-4. **`DEFAULT_APP_URL`** de `scripts/baas_plugin/defaults.py`: vacía en el repositorio, **se rellena al publicar el plugin** para que quien lo instala no tenga que escribir ninguna dirección.
+4. **`DEFAULT_APP_URL`** de `scripts/baas_plugin/defaults.py`: `https://app.spawner.com.es`, para que quien instala el plugin no tenga que escribir ninguna dirección.
 
-Una dirección que no responde nunca se guarda.
+Una dirección que no responde nunca se guarda, ni siquiera la de por defecto: si no hay conexión, `/baas-init` ofrece reintentar o escribir otra.
 
 ### Para administradores y CI: `set-key`
 
