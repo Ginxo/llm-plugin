@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from baas_plugin import defaults, device
-from baas_plugin.envfile import BaasPaths
+from baas_plugin.envfile import BaasPaths, normalize_app_url
 from baas_plugin.errors import (
     ApprovalDeniedError,
     ApprovalExpiredError,
@@ -496,8 +496,12 @@ def test_resolve_app_url_none_when_nothing_is_known(monkeypatch: pytest.MonkeyPa
     assert device.resolve_app_url(None, {}, None) is None
 
 
-def test_default_app_url_is_empty_in_repo() -> None:
-    assert defaults.DEFAULT_APP_URL == ""
+def test_default_app_url_is_the_public_webapp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.undo()  # el conftest la vacía para el resto de pruebas; aquí queremos la real
+    real = defaults.DEFAULT_APP_URL
+    assert real == "https://app.spawner.com.es"
+    assert normalize_app_url(real) == real  # pasa la validación (https, sin credenciales ni ambigüedades)
+    assert device.resolve_app_url(None, {}, None) == real
 
 
 # --- errores -----------------------------------------------------------------------------------

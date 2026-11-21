@@ -24,6 +24,15 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return fake_home
 
 
+@pytest.fixture(autouse=True)
+def no_default_app_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Los tests no dependen de la dirección pública por defecto: parten de «no hay ninguna conocida»."""
+    from baas_plugin import defaults
+
+    monkeypatch.setattr(defaults, "DEFAULT_APP_URL", "")
+    monkeypatch.delenv("BAAS_APP_URL", raising=False)
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     proj = tmp_path / "proyecto"
