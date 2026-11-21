@@ -47,8 +47,9 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         en el informe y en las cuatro rutas globales (16.4); el tráfico global es la suma de las organizaciones y cada
         una es su propio informe (16.5); el anonimizador de una organización es el de plataforma, con sus permisos
         (16.6); las consultas globales y del anonimizador no dejan `usage.viewed` (16.7); con el NER, las columnas de
-        L2 se llenan (16.8, se salta sin NER). Cada paso crea y elimina su organización (`consumo-<ejecución>-…`); no
-        mira dentro de los contenedores.
+        L2 se llenan (16.8; se salta sin NER, salvo que se declare con `--ner` o `BAAS_E2E_NER=1`: entonces, que no
+        llegue ningún `verification.l2` es un fallo). Cada paso crea y elimina su organización
+        (`consumo-<ejecución>-…`); no mira dentro de los contenedores.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
@@ -1293,6 +1294,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Grupo limite: BAAS_AUTH_FAIL_PER_MINUTE de la pila (10); con él se calcula cuántas fichas "
                         "pudieron volver durante una ráfaga lenta y cuánto esperar a que se llene el cubo si una "
                         "ejecución anterior lo dejó a medias")  # fmt: skip
+    p.add_argument("--ner", action="store_true",
+                   default=os.environ.get("BAAS_E2E_NER", "").lower() in ("1", "true", "yes"),
+                   help="Grupo consumo (16.8): declara que la pila trae el NER (también con BAAS_E2E_NER=1). Sin "
+                        "esto, 16.8 se salta (OK con «SALTADO») si ningún turno trae verification.l2; con esto, "
+                        "falla")  # fmt: skip
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
     if ns.auth_fail_burst < 1 or not ns.auth_fail_per_minute > 0:

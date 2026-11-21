@@ -9,11 +9,15 @@ informe). Con `unittest` (se ejecutan con `pytest` en la CI). Los pasos contra l
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
+import os
 import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev"))
 
@@ -685,6 +689,33 @@ class Step168Test(unittest.TestCase):
     def test_the_skip_says_why(self) -> None:
         text = e2e_consumo.no_ner_message()
         for fragment in ("SALTADO", "NER", "verification.l2"):
+            self.assertIn(fragment, text)
+        for fragment in ("--ner", "BAAS_E2E_NER"):
+            self.assertIn(fragment, text, "dice cómo se declara el NER para que el paso no se salte")
+
+    def test_the_failure_with_the_ner_declared_says_what_it_can_be(self) -> None:
+        text = e2e_consumo.ner_declared_message()
+        for fragment in ("--ner", "BAAS_E2E_NER", "verification.l2", "NER", "regresión", "l2_*"):
+            self.assertIn(fragment, text)
+        self.assertNotIn("SALTADO", text, "un fallo no se presenta como un salto")
+
+    def test_the_ner_is_declared_by_flag_or_by_environment_and_never_by_default(self) -> None:
+        for env in ({}, {"BAAS_E2E_NER": ""}, {"BAAS_E2E_NER": "0"}, {"BAAS_E2E_NER": "no"}):
+            with mock.patch.dict(os.environ, env, clear=False):
+                if "BAAS_E2E_NER" not in env:
+                    os.environ.pop("BAAS_E2E_NER", None)
+                self.assertFalse(e2e_h4.parse_args(["--only", "consumo"]).ner, env)
+        self.assertTrue(e2e_h4.parse_args(["--only", "consumo", "--ner"]).ner)
+        for value in ("1", "true", "TRUE", "yes"):
+            with mock.patch.dict(os.environ, {"BAAS_E2E_NER": value}):
+                self.assertTrue(e2e_h4.parse_args(["--only", "consumo"]).ner, value)
+
+    def test_the_help_of_the_group_explains_the_ner_option(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            e2e_h4.parse_args(["--help"])
+        text = " ".join(out.getvalue().split())
+        for fragment in ("--ner", "BAAS_E2E_NER", "16.8", "verification.l2"):
             self.assertIn(fragment, text)
 
 

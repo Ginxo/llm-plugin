@@ -1710,6 +1710,63 @@ class ConsumoRunTest(unittest.TestCase):
         failed = out.strip().splitlines()[-1]
         self.assertNotIn("16.8", failed, "el paso saltado no figura entre los que no tuvieron éxito")
 
+    def test_16_8_skip_says_how_to_declare_the_ner(self) -> None:
+        with fake_h4_stack.FakeH4Stack() as stack:
+            _code, steps, _out = run_e2e(stack, "--only", "consumo", inspector=None)
+        detail = self.step(steps, "16.8")["detail"]
+        self.assertIn("--ner", detail)
+        self.assertIn("BAAS_E2E_NER", detail)
+
+    def test_16_8_fails_when_the_ner_is_declared_and_no_turn_carries_l2(self) -> None:
+        """Con `--ner` ya no se salta: un NER desplegado que dejara de emitir `l2` sería un falso verde."""
+        with fake_h4_stack.FakeH4Stack() as stack:  # una pila sin NER, declarada con NER
+            code, steps, out = run_e2e(stack, "--only", "consumo", "--ner", inspector=None)
+            leftovers = sorted(stack.state.orgs)
+        step = self.step(steps, "16.8")
+        self.assertEqual(step["status"], "FALLO", step["detail"])
+        for fragment in ("--ner", "verification.l2", "NER", "regresión"):
+            self.assertIn(fragment, step["detail"])
+        self.assertNotIn("SALTADO", step["detail"])
+        self.assertEqual(code, 1, out)
+        self.assertEqual(leftovers, self.SEEDS, "también falla limpiando su organización")
+
+    def test_16_8_fails_with_the_environment_variable_too(self) -> None:
+        with (
+            fake_h4_stack.FakeH4Stack() as stack,
+            mock.patch.dict(os.environ, {"BAAS_E2E_NER": "1"}),
+        ):
+            _code, steps, _out = run_e2e(stack, "--only", "consumo", inspector=None)
+        step = self.step(steps, "16.8")
+        self.assertEqual(step["status"], "FALLO", step["detail"])
+        self.assertIn("BAAS_E2E_NER", step["detail"])
+
+    def test_16_8_still_skips_when_the_environment_variable_is_not_a_yes(self) -> None:
+        for value in ("", "0", "no"):
+            with self.subTest(value=value):
+                with (
+                    fake_h4_stack.FakeH4Stack() as stack,
+                    mock.patch.dict(os.environ, {"BAAS_E2E_NER": value}),
+                ):
+                    _code, steps, _out = run_e2e(stack, "--only", "consumo", inspector=None)
+                step = self.step(steps, "16.8")
+                self.assertEqual(step["status"], "OK", step["detail"])
+                self.assertTrue(step["detail"].startswith("SALTADO"), step["detail"])
+
+    def test_16_8_checks_the_columns_with_the_ner_declared_and_present(self) -> None:
+        with fake_h4_stack.FakeH4Stack(ner=True) as stack:
+            _code, steps, _out = run_e2e(stack, "--only", "consumo", "--ner", inspector=None)
+        step = self.step(steps, "16.8")
+        self.assertEqual(step["status"], "OK", step["detail"])
+        self.assertFalse(step["detail"].startswith("SALTADO"))
+        self.assertIn("l2_turns 3", step["detail"])
+
+    def test_16_8_with_the_ner_declared_still_catches_empty_l2_columns(self) -> None:
+        with fake_h4_stack.FakeH4Stack(faults={"consumo-l2-empty"}) as stack:
+            _code, steps, _out = run_e2e(stack, "--only", "consumo", "--ner", inspector=None)
+        step = self.step(steps, "16.8")
+        self.assertEqual(step["status"], "FALLO", step["detail"])
+        self.assertIn("l2_turns", step["detail"])
+
     def test_16_8_fills_the_l2_columns_when_the_stack_has_the_ner(self) -> None:
         with fake_h4_stack.FakeH4Stack(ner=True) as stack:
             _code, steps, _out = run_e2e(stack, "--only", "consumo", inspector=None)

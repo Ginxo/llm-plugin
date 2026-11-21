@@ -27,8 +27,10 @@ Un paso por criterio de aceptación del contrato (`contrato-fase-2-consumo.md`, 
         PLATFORM_ADMIN solo es USER), la auditoría no tiene ninguna fila nueva; un control positivo (el detalle por
         persona sí deja la fila) prueba que la auditoría la mostraría.
   16.8  L2 con el NER: con la pila del NER, las columnas `l2_*` suman lo que dice cada turno (`verification.l2`) en
-        plataforma y en la organización; sin NER (ningún turno trae `verification.l2`) el paso se **salta** con un
-        mensaje (`SALTADO`, sin contar como fallo).
+        plataforma y en la organización. Saltarlo depende de una **capacidad explícita**: sin `--ner` (ni
+        `BAAS_E2E_NER=1`) y sin ningún turno con `verification.l2`, el paso se **salta** con un mensaje (`SALTADO`, sin
+        contar como fallo); **con** `--ner`, que no llegue ningún `l2` es un **fallo** (el NER está declarado: un
+        `l2` que dejara de emitirse sería una regresión, no una pila sin NER).
 
 Cada paso con datos crea su organización (`consumo-<ejecución>-<paso>`, con usuarios de la semilla de desarrollo como
 miembros; las de 16.5, 16.6 y 16.8 con zona UTC, para que el informe de plataforma, en UTC, y el de la organización
@@ -679,7 +681,18 @@ def no_ner_message() -> str:
     return (
         "SALTADO (la pila no trae el NER): ningún turno trae verification.l2 (L2 no está desplegado o el proxy no lo "
         "emite), así que las columnas l2_* se quedan a cero y no hay nada que comprobar; con la pila del NER el paso "
-        "comprueba que se llenan y suman lo que dice cada turno"
+        "comprueba que se llenan y suman lo que dice cada turno. Para exigir el NER (y que su ausencia falle), "
+        "declara la capacidad con --ner o BAAS_E2E_NER=1"
+    )
+
+
+def ner_declared_message() -> str:
+    """16.8 con el NER declarado (`--ner` o `BAAS_E2E_NER=1`) y ningún turno con `verification.l2`: un fallo."""
+    return (
+        "se declaró el NER (--ner o BAAS_E2E_NER=1) y ningún turno trae verification.l2: o el NER no está "
+        "desplegado en esta pila, o no está encendido por omisión, o el proxy ha dejado de emitirlo (una regresión "
+        "que, sin esa declaración, este paso habría dado por «pila sin NER»); las columnas l2_* se quedan a cero. "
+        "Quita --ner solo si la pila de verdad no trae el NER"
     )
 
 
@@ -1211,6 +1224,7 @@ class ConsumoGroup:
             row = self.wait_row(org, len(sent))
             self.read_turns(org, sent)
             if not has_l2(sent):
+                check(not self.a.ner, ner_declared_message())  # con el NER declarado, que falte `l2` es un fallo
                 return no_ner_message()
             problems = state_problems(sent)
             check(not problems, "\n".join(problems))
@@ -1258,4 +1272,4 @@ class ConsumoGroup:
         )
         step("16.6 anonimizador de la organización = el de plataforma, con sus permisos", self.anonymizer, needs=base)
         step("16.7 las consultas globales y del anonimizador no dejan usage.viewed", self.not_viewed, needs=base)
-        step("16.8 con el NER, las columnas de L2 se llenan (se salta sin NER)", self.l2, needs=base)
+        step("16.8 con el NER, las columnas de L2 se llenan (se salta sin NER, salvo con --ner)", self.l2, needs=base)
