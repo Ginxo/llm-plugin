@@ -210,9 +210,9 @@ def _linked_org(proj: Path) -> str | None:
 
 def _duplicate_notice(path: Path) -> str:
     return (
-        f"AVISO: {path} ya tiene una entrada `{SERVER_NAME}`: con el ámbito global quedaría duplicada y la de"
-        f" proyecto manda en la CLI. No la he tocado; quítala borrando `mcpServers.{SERVER_NAME}` de ese fichero"
-        " (y de su `.gitignore`, si quieres)."
+        f"AVISO: {path} ya tiene una entrada `{SERVER_NAME}`: con el ámbito global quedaría duplicada"
+        f" (no se ha comprobado cuál usa la CLI). No la he tocado; quítala"
+        f" borrando `mcpServers.{SERVER_NAME}` de ese fichero (y de su `.gitignore`, si quieres)."
     )
 
 

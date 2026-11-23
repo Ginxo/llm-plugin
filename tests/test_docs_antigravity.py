@@ -44,6 +44,18 @@ def test_the_doc_gives_the_commands_for_the_extension_and_the_cli() -> None:
     assert "--print" in commands
     for needle in ("Google.google-antigravity", "agy", "/mcp", ".agents/mcp_config.json", ".agents/rules/baas.md"):
         assert needle in doc, needle
+    for needle in ("--scope project", "--replace"):
+        assert needle in commands, needle
+
+
+def test_the_doc_explains_why_the_default_scope_is_global_and_what_was_verified() -> None:
+    doc = text()
+    for needle in ("lee **solo** el global", "una sola organización", "1.13.0", "1.5.15", "2026-11-23"):
+        assert needle in doc, needle
+
+
+def test_the_doc_tells_how_to_get_the_repository_without_claude_code() -> None:
+    assert "git clone https://github.com/baas-ai-ip/llm-plugin" in "\n".join(blocks("bash"))
 
 
 def test_the_doc_says_what_antigravity_does_not_cover() -> None:
@@ -56,5 +68,6 @@ def test_the_doc_lists_the_manual_checks_and_the_open_questions() -> None:
     doc = text()
     assert "Lista de comprobación" in doc
     assert "- [ ]" in doc
-    for needle in ("carpeta sin confianza", "instructions", "mismo `mcp_config.json`", ".agents/skills"):
+    for needle in ("carpeta sin confianza", "instructions", ".agents/skills"):
         assert needle in doc, needle
+    assert "¿La extensión lee el mismo" not in doc, "esa pregunta ya está respondida: la extensión solo lee el global"
