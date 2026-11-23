@@ -45,6 +45,12 @@ def run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
 
 
 def setup(project: Path, *extra: str) -> list[str]:
+    """Ámbito de proyecto (`--scope project`): el `.agents/mcp_config.json` de la carpeta."""
+    return ["setup", "antigravity", "--project", str(project), "--scope", "project", *extra]
+
+
+def gsetup(project: Path, *extra: str) -> list[str]:
+    """Sin `--scope`: el ámbito por defecto, el global."""
     return ["setup", "antigravity", "--project", str(project), *extra]
 
 
@@ -380,3 +386,180 @@ def test_print_mentions_the_rule_and_writes_nothing(home, project, server, capsy
     assert RULE in out
     assert "always_on" in out
     assert list(project.iterdir()) == []
+
+
+# --- ámbito global (por defecto): ~/.gemini/config/mcp_config.json --------------------------------
+
+OTHER_SERVERS = {
+    "home-assistant": {
+        "serverUrl": "http://ha.local:8123/mcp",
+        "headers": {"Authorization": "Bearer ha-token-ficticio"},
+    },
+    "local": {"command": "npx", "args": ["-y", "x"], "env": {"SECRETO": "valor-ficticio"}},
+}
+
+
+def global_config(home: Path) -> Path:
+    return home / ".gemini" / "config" / "mcp_config.json"
+
+
+def read_global(home: Path) -> dict:
+    return json.loads(global_config(home).read_text(encoding="utf-8"))
+
+
+def test_global_is_the_default_and_writes_nothing_else_in_the_project_but_the_rule(
+    home, project, server, capsys
+) -> None:
+    key = save_key("analista@demo.test", server.url)
+    code, out = run(gsetup(project), capsys)
+    assert code == 0, out
+    assert read_global(home) == {
+        "mcpServers": {
+            "baas": {"serverUrl": f"{server.url}/org/demo/mcp", "headers": {"Authorization": f"Bearer {key}"}}
+        }
+    }
+    assert not (project / CONFIG).exists()
+    assert not (project / ".gitignore").exists(), "el global no pasa por el .gitignore del proyecto"
+    assert (project / RULE).exists(), "la regla sigue siendo de proyecto"
+    assert key not in out
+
+
+def test_global_keeps_other_servers_and_settings_and_leaves_no_backup(home, project, server, capsys) -> None:
+    key = save_key("analista@demo.test", server.url)
+    global_config(home).parent.mkdir(parents=True)
+    global_config(home).write_text(json.dumps({"mcpServers": OTHER_SERVERS, "ajuste": {"a": 1}}), encoding="utf-8")
+    code, out = run(gsetup(project), capsys)
+    assert code == 0, out
+    config = read_global(home)
+    assert config["ajuste"] == {"a": 1}
+    assert {k: v for k, v in config["mcpServers"].items() if k != "baas"} == OTHER_SERVERS
+    assert config["mcpServers"]["baas"]["headers"] == {"Authorization": f"Bearer {key}"}
+    assert [p.name for p in global_config(home).parent.iterdir()] == ["mcp_config.json"], (
+        "ni copias de seguridad ni temporales: acumularían los secretos de los otros servidores"
+    )
+    assert "ha-token-ficticio" not in out
+    assert "valor-ficticio" not in out
+
+
+@posix_only
+def test_global_file_ends_with_permissions_0600_even_if_it_was_open(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    global_config(home).parent.mkdir(parents=True)
+    global_config(home).write_text("{}\n", encoding="utf-8")
+    global_config(home).chmod(0o644)
+    assert run(gsetup(project), capsys)[0] == 0
+    assert mode_of(global_config(home)) == 0o600
+
+
+def test_global_is_idempotent_and_follows_a_rotated_key_of_the_same_organization(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(gsetup(project), capsys)[0] == 0
+    first = global_config(home).read_bytes()
+    code, out = run(gsetup(project), capsys)
+    assert code == 0, out
+    assert global_config(home).read_bytes() == first
+    assert "sin cambios" in out
+    new_key = dev_api_key("otro@demo.test")
+    envfile.update_env(envfile.BaasPaths.default(), {"BAAS_API_KEY": new_key})
+    server.state.users[2].email = "otro@demo.test"  # el servidor reconoce la clave nueva con el mismo usuario
+    assert run(gsetup(project), capsys)[0] == 0
+    assert read_global(home)["mcpServers"]["baas"]["headers"]["Authorization"] == f"Bearer {new_key}"
+
+
+def test_global_refuses_to_replace_another_organization_without_replace(home, project, server, capsys) -> None:
+    save_key("multi@demo.test", server.url)
+    assert run(gsetup(project, "--org", "demo"), capsys)[0] == 0
+    before = global_config(home).read_bytes()
+    code, out = run(gsetup(project, "--org", "otra"), capsys)
+    assert code == 2, out
+    assert "una sola organización" in out
+    assert "--replace" in out
+    assert global_config(home).read_bytes() == before
+    code, out = run(gsetup(project, "--org", "otra", "--replace"), capsys)
+    assert code == 0, out
+    assert read_global(home)["mcpServers"]["baas"]["serverUrl"] == f"{server.url}/org/otra/mcp"
+
+
+def test_global_warns_about_a_duplicate_in_the_project_and_does_not_remove_it(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(setup(project), capsys)[0] == 0
+    project_before = (project / CONFIG).read_bytes()
+    code, out = run(gsetup(project), capsys)
+    assert code == 0, out
+    assert "duplicada" in out
+    assert str(project / CONFIG) in out
+    assert (project / CONFIG).read_bytes() == project_before
+
+
+@pytest.mark.parametrize("content", ['{"mcpServers": {', "[]", '{"mcpServers": []}', '{"mcpServers": {"baas": 3}}'])
+def test_global_refuses_an_invalid_file_and_leaves_it_untouched(home, project, server, capsys, content) -> None:
+    save_key("analista@demo.test", server.url)
+    global_config(home).parent.mkdir(parents=True)
+    global_config(home).write_text(content, encoding="utf-8")
+    code, out = run(gsetup(project), capsys)
+    assert code == 7, out
+    assert global_config(home).read_text(encoding="utf-8") == content
+    assert not (project / RULE).exists(), "si algo falla no se escribe nada"
+
+
+def test_global_print_writes_nothing_and_never_shows_the_key(home, project, server, capsys) -> None:
+    key = save_key("analista@demo.test", server.url)
+    global_config(home).parent.mkdir(parents=True)
+    global_config(home).write_text(json.dumps({"mcpServers": OTHER_SERVERS}), encoding="utf-8")
+    before = global_config(home).read_bytes()
+    code, out = run(gsetup(project, "--print"), capsys)
+    assert code == 0, out
+    assert key not in out
+    assert "ha-token-ficticio" not in out
+    assert str(global_config(home)) in out
+    assert "Bearer <API key>" in out
+    assert global_config(home).read_bytes() == before
+    assert list(project.iterdir()) == []
+
+
+def test_global_never_leaks_the_key_through_stdout_stderr_or_arguments(
+    home, project, server, capsys, monkeypatch
+) -> None:
+    key = save_key("analista@demo.test", server.url)
+    spawned: list[object] = []
+    real_popen = subprocess.Popen
+
+    def spy(*args, **kwargs):
+        spawned.append((args, kwargs))
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    code = cli.main(gsetup(project))
+    captured = capsys.readouterr()
+    assert code == 0
+    assert key not in captured.out
+    assert key not in captured.err
+    assert key not in repr(spawned)
+
+
+@posix_only
+def test_global_writes_through_a_symlink_instead_of_replacing_it(home, project, server, capsys, tmp_path) -> None:
+    save_key("analista@demo.test", server.url)
+    real = tmp_path / "dotfiles" / "mcp_config.json"
+    real.parent.mkdir()
+    real.write_text(json.dumps({"mcpServers": OTHER_SERVERS}), encoding="utf-8")
+    global_config(home).parent.mkdir(parents=True)
+    global_config(home).symlink_to(real)
+    assert run(gsetup(project), capsys)[0] == 0
+    assert global_config(home).is_symlink()
+    assert "baas" in json.loads(real.read_text(encoding="utf-8"))["mcpServers"]
+
+
+def test_global_says_what_it_implies(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    code, out = run(gsetup(project), capsys)
+    assert code == 0, out
+    assert "todos los proyectos" in out
+    assert "una sola organización" in out
+    assert "en claro" in out
+    assert "sin anonimizar" in out
+
+
+def test_the_scope_must_be_global_or_project() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["setup", "antigravity", "--scope", "usuario"])

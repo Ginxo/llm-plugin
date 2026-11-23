@@ -32,7 +32,8 @@ class ClientTarget:
 
     name: str  # subcomando: `setup <name>`
     label: str  # nombre para la persona
-    config_path: tuple[str, ...]  # relativo a la raíz del proyecto; piezas, no una ruta POSIX
+    config_path: tuple[str, ...]  # el de proyecto, relativo a su raíz; piezas, no una ruta POSIX
+    global_config_path: tuple[str, ...]  # el global, relativo al HOME de la persona
     url_key: str  # campo de la URL del servidor remoto
     servers_key: str = "mcpServers"
     headers_key: str = "headers"
@@ -57,6 +58,7 @@ ANTIGRAVITY = ClientTarget(
     name="antigravity",
     label="Antigravity (extensión de VS Code y CLI `agy`)",
     config_path=(".agents", "mcp_config.json"),
+    global_config_path=(".gemini", "config", "mcp_config.json"),
     url_key="serverUrl",
     drop_keys=("url", "httpUrl", "command", "args", "env", "cwd"),
     rule_path=(".agents", "rules", "baas.md"),
@@ -145,6 +147,21 @@ def _restrict(path: Path) -> bool:
     return False
 
 
+def entry_url(target: ClientTarget, config: dict[str, Any]) -> str | None:
+    """La URL de la entrada `baas` de una configuración (con el alias `url`), si la hay y es una cadena."""
+    servers = config.get(target.servers_key)
+    entry = servers.get(SERVER_NAME) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    url = entry.get(target.url_key) or entry.get("url")
+    return url if isinstance(url, str) and url else None
+
+
+def writable_path(path: Path) -> Path:
+    """Si el fichero es un enlace simbólico (gestores de *dotfiles*), se escribe en su destino y el enlace sigue."""
+    return path.resolve() if path.is_symlink() else path
+
+
 # --- la regla de proyecto ---------------------------------------------------------------------------
 
 RULE_TEMPLATE = Path(__file__).resolve().parent / "templates" / "baas_rule.md"
@@ -191,6 +208,14 @@ def _linked_org(proj: Path) -> str | None:
     return org if isinstance(org, str) else None
 
 
+def _duplicate_notice(path: Path) -> str:
+    return (
+        f"AVISO: {path} ya tiene una entrada `{SERVER_NAME}`: con el ámbito global quedaría duplicada y la de"
+        f" proyecto manda en la CLI. No la he tocado; quítala borrando `mcpServers.{SERVER_NAME}` de ese fichero"
+        " (y de su `.gitignore`, si quieres)."
+    )
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     from . import cli  # import diferido: cli registra este comando
 
@@ -208,9 +233,28 @@ def cmd_setup(args: argparse.Namespace) -> int:
     hs = cli._handshake(app_url, creds.api_key)
     org = handshake.select_organization(hs, requested=args.org, current=_linked_org(proj))
 
-    config_file = proj.joinpath(*target.config_path)
-    new_config = merged_config(target, read_config(config_file), org.mcp_url, creds.api_key, config_file)
+    is_global = args.scope == "global"
+    project_file = proj.joinpath(*target.config_path)
+    config_file = (
+        writable_path(Path(os.path.expanduser("~")).joinpath(*target.global_config_path)) if is_global else project_file
+    )
+    current = read_config(config_file)
+    old_url = entry_url(target, current)
+    if is_global and old_url and old_url != org.mcp_url and not args.replace:
+        raise ConfigError(
+            f"{config_file} ya tiene `{SERVER_NAME}` apuntando a otro MCP ({old_url}): el global admite una sola"
+            " organización por usuario y la sustituirías (todos tus proyectos pasarían a usar la nueva).",
+            hint="Si es lo que quieres, repite con --replace. Si quieres una organización distinta solo en este"
+            " proyecto, usa --scope project (la CLI `agy` lo lee; la extensión de VS Code, no).",
+        )
+    new_config = merged_config(target, current, org.mcp_url, creds.api_key, config_file)
     content = _render(new_config)
+    duplicate = None
+    if is_global:  # una entrada `baas` también en el proyecto: la de proyecto manda y quedaría duplicada
+        try:
+            duplicate = project_file if entry_url(target, read_config(project_file)) else None
+        except ProjectSafetyError:
+            duplicate = None  # un fichero de proyecto dañado no es asunto de este comando
 
     rule_file = proj.joinpath(*target.rule_path) if target.rule_path else None
     rule_text = render_rule(target) if rule_file else None
@@ -222,13 +266,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
             f"{target.auth_scheme} {KEY_PLACEHOLDER}"
         )
         _p(
-            f"Lo que `setup {target.name}` escribiría en {config_file} (sin la clave):",
+            f"Lo que `setup {target.name}` escribiría en {config_file} (ámbito {args.scope}, sin la clave):",
             "",
             _render(shown).rstrip("\n"),
             "",
             f"«{KEY_PLACEHOLDER}» se sustituye por tu API key, leída de {paths.env_file}; no se imprime ni se pasa",
             "como argumento. Se conservan los demás servidores y ajustes del fichero.",
         )
+        if duplicate:
+            _p("", _duplicate_notice(duplicate))
         if rule_file and rule_text:
             _p(
                 "",
@@ -238,8 +284,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
             )
         return 0
 
-    project.check_not_tracked(proj, (target.config_entry,), command=f"`setup {target.name}`")
-    added = project.ensure_gitignore(proj, (target.config_entry,))
+    added: list[str] = []
+    if not is_global:  # el global está en el HOME de la persona, fuera de cualquier repositorio
+        project.check_not_tracked(proj, (target.config_entry,), command=f"`setup {target.name}`")
+        added = project.ensure_gitignore(proj, (target.config_entry,))
     config_file.parent.mkdir(parents=True, exist_ok=True)
     changed = not config_file.exists() or config_file.read_text(encoding="utf-8") != content
     if changed:
@@ -250,7 +298,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         atomic_write(rule_file, rule_text, mode=0o644)  # sin secretos: se puede versionar
 
     _p(
-        f"{target.label}: proyecto {proj}, organización {org.describe()}.",
+        f"{target.label}: ámbito {args.scope}, proyecto {proj}, organización {org.describe()}.",
         f"MCP `{SERVER_NAME}`: {org.mcp_url}",
         f"{config_file}: {'actualizado' if changed else 'sin cambios'} (permisos 0600"
         f"{', corregidos' if tightened else ''}).",
@@ -269,6 +317,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
         )
     for warning in handshake.kill_switch_warnings(hs, org):
         _p(f"AVISO: {warning}")
+    if is_global:
+        _p(
+            f"AVISO: `{SERVER_NAME}` queda disponible en todos los proyectos de este usuario y el global solo admite"
+            " una sola organización (la de esta orden).",
+        )
+    if duplicate:
+        _p(_duplicate_notice(duplicate))
     _p(
         f"AVISO: tu API key queda en claro en {config_file}: {target.label.split(' (')[0]} no admite variables de"
         " entorno ni un comando para el secreto. No lo subas a git ni lo compartas; si se expone, revócala en la"
@@ -289,6 +344,18 @@ def add_setup_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore[t
         t.add_argument("--project", help="Raíz del proyecto (por defecto, la raíz git o el directorio actual)")
         t.add_argument("--org", help="Slug de la organización (obligatorio si perteneces a varias)")
         t.add_argument("--app-url", help="URL de la webapp (por defecto, la guardada por /baas-init)")
+        t.add_argument(
+            "--scope",
+            choices=("global", "project"),
+            default="global",
+            help="Dónde escribir el servidor: `global` (por defecto, el del usuario: lo leen la extensión y la CLI) o"
+            " `project` (solo el del proyecto: lo lee la CLI)",
+        )
+        t.add_argument(
+            "--replace",
+            action="store_true",
+            help="Con `global`: sustituye un `baas` que apunta a otra organización (el global solo admite una)",
+        )
         t.add_argument(
             "--print",
             dest="print_only",
