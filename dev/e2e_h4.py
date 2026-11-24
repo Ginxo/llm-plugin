@@ -40,6 +40,12 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         distinto, reciben `401` y la 31.ª `429` con `Retry-After` en el proxy (`baas_auth_rate_limited`) y en el MCP
         (`RATE_LIMITED`); en una ráfaga lenta, el `429` puede llegar tras las fichas que volvieron mientras duraba. Una
         clave ya válida pasa desde la IP frenada; desde el equipo, una desconocida sigue en `401`.
+  15.   NER de la Fase 2 (L2, grupo «ner», `dev/e2e_ner.py`): los interruptores del NER con motivo y auditoría; un
+        nombre, una empresa y una dirección salen como tokens y vuelven restaurados (tres APIs, con y sin *streaming*);
+        el segundo turno solo analiza lo nuevo con el historial idéntico; con la caché de la efímera perdida el
+        historial sale igual y no se espera; con el servicio `ner` parado, `DEGRADE` da `DEGRADED` y `REJECT` da
+        `503`; la observación (`observed_detections`) sin cambiar el estado del turno; y la prueba en vivo con
+        `ALLOWLISTED`. Cada paso crea y elimina su organización (`ner-<ejecución>-…`).
   16.   Consumo de la plataforma (Fase 2, grupo «consumo», `dev/e2e_consumo.py`): el informe
         `GET /platform/usage` con `period` y datos hasta por tubería (16.0, y si falta se saltan los demás); turnos por
         modo (bypass, observación y anonimizado) que cuadran con los enviados (16.1); disco con media, máximo, última
@@ -50,13 +56,16 @@ Por HTTP directo (sin Claude Code), con las claves deterministas del contrato §
         L2 se llenan (16.8; se salta sin NER, salvo que se declare con `--ner` o `BAAS_E2E_NER=1`: entonces, que no
         llegue ningún `verification.l2` es un fallo). Cada paso crea y elimina su organización
         (`consumo-<ejecución>-…`); no mira dentro de los contenedores.
-
-  15.   NER de la Fase 2 (L2, grupo «ner», `dev/e2e_ner.py`): los interruptores del NER con motivo y auditoría; un
-        nombre, una empresa y una dirección salen como tokens y vuelven restaurados (tres APIs, con y sin *streaming*);
-        el segundo turno solo analiza lo nuevo con el historial idéntico; con la caché de la efímera perdida el
-        historial sale igual y no se espera; con el servicio `ner` parado, `DEGRADE` da `DEGRADED` y `REJECT` da
-        `503`; la observación (`observed_detections`) sin cambiar el estado del turno; y la prueba en vivo con
-        `ALLOWLISTED`. Cada paso crea y elimina su organización (`ner-<ejecución>-…`).
+  17.   (pasos 17.0–17.10) Catálogo de skills y conocimiento (grupo «catalogo», `dev/e2e_catalogo.py`): la API de
+        administración de la webapp (`/api/v1/orgs/<org>/catalog/…`) lista y detalla skills y conocimiento, solo para
+        ORG_ADMIN y PLATFORM_ADMIN; cambiar roles y desactivar una skill cambia quién lee por el MCP y qué retira el
+        `sync` del plugin; `409` en edición concurrente; `/internal/*` del MCP no sale por Caddy; ninguna respuesta
+        lleva cuerpos de ficheros, salvo las `200` de las dos rutas de contenido: la de ficheros de una skill (17.9: el
+        ORG_ADMIN lee el contenido de un fichero, sin caché, y cada lectura correcta queda en la auditoría como
+        `skill.file_read`; USER `403`, traversal y `_acl.yaml` `422`, más de 256 KiB `413`, binario `415`) y la de un
+        documento de conocimiento (17.10: lo mismo con `knowledge.file_read`, en forma corta y completa de la ruta, con
+        un `.md`, un `.sql` y un nombre con tildes). Cada paso crea y elimina su organización (`cat-<ejecución>-…`). No
+        mira dentro de los contenedores.
 
 Uso (pila de `deploy` con el proveedor falso: `scripts/dev-up.sh --fake-upstream`):
 
@@ -99,6 +108,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import e2e_acl
+import e2e_catalogo
 import e2e_consumo
 import e2e_h3 as h3
 import e2e_ner
@@ -111,7 +121,19 @@ from baas_plugin.mcp_client import McpClient
 DNI, EMAIL, IBAN, VALUES = h3.DNI, h3.EMAIL, h3.IBAN, h3.VALUES
 SENSITIVE_TEXT, TOKENS = h3.SENSITIVE_TEXT, h3.TOKENS
 APIS, API_NAMES = h3.APIS, h3.API_NAMES
-GROUPS = ("observacion", "interruptor", "eliminar", "originales", "huerfanos", "uso", "acl", "limite", "ner", "consumo")
+GROUPS = (
+    "observacion",
+    "interruptor",
+    "eliminar",
+    "originales",
+    "huerfanos",
+    "uso",
+    "acl",
+    "limite",
+    "ner",
+    "consumo",
+    "catalogo",
+)
 META_ORG = "baas-ai-ip"
 FORBIDDEN_TURN_KEYS = ("request_sent", "response_received", "request_original", "response_returned")
 VALUE_KEYS = ("original_value", "value")
@@ -1382,6 +1404,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Grupo consumo (16.8): declara que la pila trae el NER (también con BAAS_E2E_NER=1). Sin "
                         "esto, 16.8 se salta (OK con «SALTADO») si ningún turno trae verification.l2; con esto, "
                         "falla")  # fmt: skip
+    p.add_argument("--internal-token", default=e2e_catalogo.INTERNAL_TOKEN,
+                   help="Grupo catalogo (17.6): BAAS_INTERNAL_TOKEN de la pila (el de desarrollo); se envía a "
+                        "/internal/* por Caddy para comprobar que lo bloquea Caddy y no el token")  # fmt: skip
     p.add_argument("--json", type=Path, help="Escribe aquí el informe en JSON")
     ns = p.parse_args(argv)
     if ns.auth_fail_burst < 1 or not ns.auth_fail_per_minute > 0:
@@ -3330,6 +3355,8 @@ class E2EH4:
         logins += consumo.logins() if consumo else []
         ner = e2e_ner.NerGroup(self) if "ner" in groups else None
         logins += ner.logins() if ner else []
+        catalogo = e2e_catalogo.CatalogoGroup(self) if "catalogo" in groups else None
+        logins += catalogo.logins() if catalogo else []
         step(s3, lambda: self.login(*logins), needs=[s0])
         cases = [(api, stream) for api in APIS for stream in (False, True)]
         if groups & {"observacion", "interruptor", "originales"}:
@@ -3443,6 +3470,8 @@ class E2EH4:
             uso.register(runner, [s0, s1, s3])
         if consumo is not None:
             consumo.register(runner, [s0, s1, s3])
+        if catalogo is not None:
+            catalogo.register(runner, [s0, s3])
         if "acl" in groups and self.inspector is not None:
             e2e_acl.register(runner, self, [s0])
         if "limite" in groups and self.inspector is not None:

@@ -320,6 +320,7 @@ class ParseArgsTest(unittest.TestCase):
                 "limite",
                 "ner",
                 "consumo",
+                "catalogo",
             ],
         )
         self.assertEqual((ns.auth_fail_burst, ns.auth_fail_per_minute), (30, 10.0), "los valores del contrato §7.5")
@@ -1295,9 +1296,9 @@ class MissingInspectorTest(unittest.TestCase):
 # La pila simulada no simula la observabilidad de uso (Fase 4): el grupo «uso» se prueba contra la pila real y aquí
 # solo sus utilidades (tests/test_e2e_uso.py); lo mismo con «acl»
 # (tests/test_e2e_acl.py), con «consumo» (tests/test_e2e_consumo.py; la pila simulada sirve el informe de turnos por
-# modo de 16.0, 16.1 y 16.4, no el disco de 16.2 ni el CSV de 16.3) y con «ner» (tests/test_e2e_ner.py, sin NER en la
-# pila simulada). Sin `--only`, el recorrido es el de los grupos de H4.
-H4_GROUPS = ",".join(g for g in e2e_h4.GROUPS if g not in ("uso", "acl", "consumo", "ner"))
+# modo de 16.0, 16.1 y 16.4, no el disco de 16.2 ni el CSV de 16.3), con «ner» (tests/test_e2e_ner.py, sin NER en la
+# pila simulada) y con «catalogo» (tests/test_e2e_catalogo.py). Sin `--only`, el recorrido es el de los grupos de H4.
+H4_GROUPS = ",".join(g for g in e2e_h4.GROUPS if g not in ("uso", "acl", "consumo", "ner", "catalogo"))
 
 
 def run_e2e(
