@@ -1,7 +1,7 @@
 # Antigravity con BaaS-AI-IP
 
 > **Estado**: tarea T3 (#165) de «soporte de más herramientas». Comprobado a mano el **2026-11-23** en Linux con la
-> **extensión de VS Code 1.13.0** y la **CLI `agy` 1.5.15** (resultados en [Lo que se comprobó](#8-lo-que-se-comprobó)).
+> **extensión de VS Code 1.13.0** y la **CLI `agy` 1.5.15** (resultados en [Lo que se comprobó](#9-lo-que-se-comprobó)).
 > **Sin comprobar** todavía: Windows y macOS, una carpeta sin confianza y el campo `instructions` del MCP (al final).
 
 Antigravity se usa como **extensión de VS Code** (`Google.google-antigravity`, VS Code 1.90 o posterior, cuenta de Google)
@@ -122,7 +122,36 @@ tuyos. Tampoco explica `/baas-sync` ni el ejecutor de scripts, que son de Claude
 2. Lanza `agy` **desde esa carpeta**.
 3. Escribe `/mcp` (el gestor de MCP de la CLI): `baas` debe aparecer conectado. Pídele al agente «Llama a `baas_whoami`».
 
-## 5. La clave queda en claro (riesgo aceptado)
+## 5. Skills de la organización como skills nativas
+
+En Claude Code las skills de la organización salen como `/<organización>:<skill>` porque el MCP las publica como
+*prompts*. Antigravity **no documenta los *prompts* como comandos**: sus skills son carpetas con un `SKILL.md` y la CLI
+convierte cada una en `/<nombre>`. Este comando copia las que tus roles autorizan:
+
+```bash
+python3 "<ruta del plugin>/scripts/baas.py" sync --tool antigravity --dry-run   # solo muestra qué haría
+python3 "<ruta del plugin>/scripts/baas.py" sync --tool antigravity             # añade, actualiza y retira
+python3 "<ruta del plugin>/scripts/baas.py" sync --tool antigravity --org <slug> --force
+```
+
+Se ejecuta **a mano** (no hay *hooks*): repítelo cuando quieras traer cambios. Las deja en
+`~/.gemini/config/skills/<skill>/` (en Windows, `%USERPROFILE%\.gemini\config\skills\<skill>\`), el ámbito **global**
+que, según la documentación, leen la CLI y la extensión, igual que el MCP de `setup`. No hay `--scope project` para las
+skills (`<proyecto>/.agents/skills/`): en una carpeta de proyecto podrían acabar en un commit contenidos de la
+organización que no son públicos.
+Después, en `agy`, ejecuta `/skills reload` (o abre una conversación nueva).
+
+| Qué | Cómo |
+| :--- | :--- |
+| **Qué se copia** | Lo mismo que `/baas-sync` de Claude Code: las skills de `baas_list_skills` (tus roles) y, de forma transitiva, las que dependen de ellas **si tienes acceso**. Se verifica el **SHA-256** de cada fichero, se rechazan las rutas que salgan de la carpeta de la skill y nunca se crean enlaces simbólicos; cada skill se escribe en un temporal y se renombra (si falla, queda la versión anterior). Carpetas 0700 y ficheros 0600 |
+| **Nombre del comando** | La carpeta, **sin prefijo** de organización: así los enlaces `../otra/SKILL.md` y las citas `/otra` que ya traen las skills siguen valiendo, y solo hay una organización en el global. Sin `:` (Windows). Solo minúsculas, dígitos y guiones: el resto (`Mi_Skill`, `a.b`), los nombres reservados de Windows y los que taparían un comando de la CLI (`mcp`, `skills`) **no se instalan** y el comando los lista. El `name` del `SKILL.md` se iguala a la carpeta |
+| **Sin sus scripts** | **No se copia nada ejecutable**: ficheros marcados como ejecutables, carpetas `scripts/`, código y binarios por extensión (`.py`, `.sh`, `.js`, `.bat`, `.exe`…) y todo lo que empiece por `#!`. Plantillas, referencias y demás ficheros de texto o datos sí. El comando lista lo omitido y avisa de que esa skill **no funcionará completa**. Motivo: un script en disco lo ejecutaría el agente sin la comprobación del SHA-256 que hace `run-script` al ejecutarlo y seguiría ahí tras una revocación |
+| **`SKILL.md` adaptado** | Antigravity documenta `description` (obligatoria) y `name`: se escriben solo esos dos (`when_to_use` se une a la descripción) y el cuerpo queda tal cual. Los campos propios de Claude Code (`allowed-tools`, `hooks`, `argument-hint`…) se quitan y se avisa. Sin `description` no se instala. Una skill con `disable-model-invocation` (solo invocación manual) **no se instala**: Antigravity no puede respetarlo y el agente la usaría por su cuenta. Las referencias propias de Claude Code en el texto (`${CLAUDE_SKILL_DIR}`, `/<organización>:<skill>`) no se reescriben |
+| **No pisa lo tuyo** | Lo que gestiona queda en `~/.gemini/config/skills/.baas-skills.json` (organización, `package_sha256` y SHA-256 de lo escrito; sin secretos). Una carpeta con el mismo nombre que no figura ahí es **tuya**: se deja como está y el comando lo cuenta («no la toco»). Una skill gestionada que **editaste** (o a la que añadiste ficheros o enlaces) tampoco se sobrescribe ni se retira, salvo con `--force`; una tuya, nunca |
+| **Retirada** | Quitar un rol, retirar la skill o activar el kill switch la borra en la siguiente sincronización, solo si es de las gestionadas. Al cambiar de organización se retiran las de la anterior |
+| **Organización** | `--org`, si no la del `baas` del `mcp_config.json` global, si no la del proyecto vinculado con `/baas-init`, si no la única; con varias, error 3. Avisa si no coincide con la del MCP global |
+
+## 6. La clave queda en claro (riesgo aceptado)
 
 La documentación de Antigravity **no admite `${VAR}`** en las cabeceras ni un comando que dé el secreto (como el
 `headersHelper` de Claude Code): `Authorization` lleva la clave literal. Por eso:
@@ -138,21 +167,21 @@ La documentación de Antigravity **no admite `${VAR}`** en las cabeceras ni un c
   guarda otra (`set-key` o `/baas-init`) y repite `setup antigravity`.
 - Cuando el proxy admita credenciales de proyecto (#175) se podrá evitar guardar la clave personal aquí.
 
-## 6. Lo que NO cubre
+## 7. Lo que NO cubre
 
 - **Sin proxy ni AI-IP.** Las conversaciones de Antigravity van a Google **sin anonimizar**: nada se sustituye antes de
   salir, no hay trazas en la webapp (W8) y el kill switch, el bloqueo y la pausa de la organización **no cortan el
   modelo**. Solo cortan el MCP (`KILL_SWITCH_ACTIVE`). No pegues datos que no pegarías en una herramienta sin
   protección. (La protección para su CLI con clave de Gemini es el trabajo de #178.)
 - **Varias organizaciones a la vez en la extensión**: el global solo admite una.
-- **Las skills de la organización como comandos.** Hoy el servidor `baas` expone las skills como *prompts* del MCP
-  (`/mcp__baas__<skill>` en Claude Code) y la documentación de Antigravity no dice que los muestre. Llegarán como
-  **skills nativas** (`.agents/skills/<nombre>/SKILL.md`): es un seguimiento, no está hecho. Mientras tanto el agente
-  las consulta con `baas_list_skills` y `baas_get_skill`.
-- **El ejecutor de scripts** (`run-script`) y `/baas-sync` desde Antigravity.
+- **Las skills de la organización como comandos del MCP.** El servidor `baas` las expone como *prompts* del MCP
+  (`/mcp__baas__<skill>` en Claude Code) y la documentación de Antigravity no dice que los muestre: por eso se copian
+  como skills nativas (apartado 5), **sin sus scripts** y sin actualización automática. Mientras no estén copiadas, el
+  agente las consulta con `baas_list_skills` y `baas_get_skill`.
+- **El ejecutor de scripts** (`run-script`), `/baas-sync` y los *hooks* de sincronización desde Antigravity.
 - Windows y macOS: los probará T6 (#168), no esta guía.
 
-## 7. Solución de problemas
+## 8. Solución de problemas
 
 | Síntoma | Causa y solución |
 | :--- | :--- |
@@ -167,7 +196,7 @@ La documentación de Antigravity **no admite `${VAR}`** en las cabeceras ni un c
 | `KILL_SWITCH_ACTIVE` o 403 | La plataforma está detenida o tu organización bloqueada o pausada: habla con tu administrador |
 | El agente no conoce las tools `baas_*` | Falta `.agents/rules/baas.md` en ese proyecto o ya existía uno que no es de BaaS (el comando avisa): renómbralo y repite |
 
-## 8. Lo que se comprobó
+## 9. Lo que se comprobó
 
 Prueba manual del 2026-11-23, Linux, extensión de VS Code **1.13.0** y `agy` **1.5.15**:
 
@@ -179,7 +208,7 @@ Prueba manual del 2026-11-23, Linux, extensión de VS Code **1.13.0** y `agy` **
 - La extensión arranca `~/.gemini/bin/agy --hub … --add-dir=<proyecto>`: el motor es el mismo que el de la CLI; solo
   cambia qué configuración de MCP lee.
 
-## 9. Lista de comprobación manual
+## 10. Lista de comprobación manual
 
 Marca lo que compruebes (lo de Linux ya está hecho el 2026-11-23; falta Windows y lo que no se pudo probar):
 
@@ -189,6 +218,17 @@ Marca lo que compruebes (lo de Linux ya está hecho el 2026-11-23; falta Windows
 - [ ] Con otra organización ya en el global, se niega sin `--replace`; con `--replace` la cambia.
 - [ ] **Extensión**: `baas` aparece conectado tras recargar; «Llama a `baas_whoami`» devuelve tu usuario y organización.
 - [ ] **CLI**: `/mcp` muestra `baas` conectado; el mismo `baas_whoami` responde.
+- [ ] `sync --tool antigravity --dry-run` lista las skills y no escribe nada (ni crea `~/.gemini/config/skills/`).
+- [ ] `sync --tool antigravity` crea `~/.gemini/config/skills/<skill>/SKILL.md` (carpetas 0700, ficheros 0600) y
+      `.baas-skills.json`, **no copia ningún script** (el aviso los lista) y repetirlo dice «Todo al día».
+- [ ] **CLI**: tras `/skills reload`, `/skills` muestra la skill y **`/<skill>`** la lanza. Anota si el comando lleva otro
+      prefijo o si el `description` reescrito basta para que el agente la elija solo.
+- [ ] **Extensión**: anota si la extensión ofrece las skills como comando (`/<skill>`, menú de skills…) o solo las usa
+      el agente por su cuenta.
+- [ ] Una skill tuya con el mismo nombre queda intacta y el comando dice «no la toco»; una skill sincronizada que editas
+      no se pisa sin `--force`.
+- [ ] Quitar un rol (o retirar la skill) la borra en la siguiente sincronización; las tuyas siguen ahí.
+- [ ] Windows: `%USERPROFILE%\.gemini\config\skills\`, los nombres y las rutas salen bien.
 - [ ] El agente aplica la regla: ante una pregunta sobre la organización busca con `baas_search_knowledge`.
 - [ ] Con un recurso al que no tienes rol, el agente **se detiene** e informa de `AUTHORIZATION_DENIED` (sin buscar otra vía).
 - [ ] El acceso queda **auditado** (la webapp registra la llamada a la tool).
@@ -196,13 +236,15 @@ Marca lo que compruebes (lo de Linux ya está hecho el 2026-11-23; falta Windows
 - [ ] La clave **no** aparece en el chat, en ningún `.gitignore` ni en ningún otro fichero.
 - [ ] Windows: las rutas (`%USERPROFILE%\.gemini\config`) y el JSON salen bien; anota los permisos reales del fichero.
 
-## 10. Preguntas abiertas (la documentación no las responde)
+## 11. Preguntas abiertas (la documentación no las responde)
 
-La de si la extensión lee el mismo fichero que la CLI está **respondida** (apartado 8). Quedan dos:
+La de si la extensión lee el mismo fichero que la CLI está **respondida** (apartado 9). Quedan estas:
 
 | Pregunta | Cómo comprobarla |
 | :--- | :--- |
 | ¿Respeta el `.agents/mcp_config.json` de proyecto en una **carpeta sin confianza** (*Restricted Mode*)? | La extensión no lo lee ni con la confianza aceptada, así que el riesgo se limita a la CLI: abre una carpeta sin confianza con `agy` y mira si `baas` se conecta. Si lo hiciera, un repositorio ajeno podría traer su propio `.agents/mcp_config.json`: no confíes en uno que no hayas escrito tú |
+| ¿Ofrece la extensión las skills nativas como comando, o solo las usa el agente? | Tras `sync --tool antigravity`, mira en la extensión si aparece `/<skill>` o algún menú de skills; pídele al agente una tarea que encaje con la `description` y mira si la usa. Solo la CLI está documentada como comando |
+| ¿La CLI las lanza como `/<nombre>` (el de la carpeta) o con otro prefijo? | `/skills` en `agy` y prueba `/<skill>`. El plugin pone `name` = carpeta y no inventa prefijos |
 | ¿Usa el campo `instructions` del MCP? | La documentación solo dice que lo guarda en una caché (`instructions.md`); mira si el agente lo recibe sin la regla (borra `.agents/rules/baas.md` y pregúntale qué tools tiene) |
 
 Fuentes: <https://antigravity.google/docs/mcp>, <https://antigravity.google/docs/rules>, <https://antigravity.google/docs/skills>.

@@ -68,7 +68,7 @@ def test_the_doc_lists_the_manual_checks_and_the_open_questions() -> None:
     doc = text()
     assert "Lista de comprobación" in doc
     assert "- [ ]" in doc
-    for needle in ("carpeta sin confianza", "instructions", ".agents/skills"):
+    for needle in ("carpeta sin confianza", "instructions", "skills nativas", ".agents/skills/"):
         assert needle in doc, needle
     assert "¿La extensión lee el mismo" not in doc, "esa pregunta ya está respondida: la extensión solo lee el global"
 
