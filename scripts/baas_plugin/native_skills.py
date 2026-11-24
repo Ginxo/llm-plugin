@@ -634,6 +634,39 @@ def _global_mcp_url(name: str) -> str | None:
         return None
 
 
+def synced_server(tool: str, org_slug: str, skill: str) -> str:
+    """La URL del MCP de una skill sincronizada como skill nativa (la que escribió `sync` en el fichero de control).
+
+    Falla si la herramienta o la organización no son válidas, si no hay nada sincronizado de esa organización, si la
+    skill no figura entre las sincronizadas o si la URL no es segura (HTTPS, salvo en local): la clave de la persona
+    solo se envía a un MCP que `sync` anotó tras el *handshake*.
+    """
+    from .envfile import normalize_app_url
+
+    target = TARGETS.get(tool)
+    if target is None:
+        raise ConfigError(f"Herramienta desconocida: «{tool}».")
+    try:
+        slug = sync.validate_slug(org_slug)
+    except ConfigError:
+        raise ConfigError(f"Organización no válida: «{org_slug}».", hint="Es el slug de la organización.") from None
+    state = read_control(global_root(target), slug)
+    hint = f"Ejecuta `baas.py sync --tool {tool} --org {slug}`."
+    if state is None:
+        raise ConfigError(f"No hay skills de «{slug}» sincronizadas para {target.label}.", hint=hint)
+    if skill not in sync.local_skills(state):
+        raise ConfigError(f"La skill «{skill}» no figura entre las skills sincronizadas de «{slug}».", hint=hint)
+    server = state.get("server")
+    if not isinstance(server, str):
+        raise ConfigError(f"El fichero de control de «{slug}» no tiene la URL del MCP.", hint=hint)
+    try:
+        return normalize_app_url(server)
+    except ConfigError:
+        raise ConfigError(
+            f"El fichero de control de «{slug}» tiene una URL de MCP que no es segura.", hint=hint
+        ) from None
+
+
 def cmd_sync_native(args: Any) -> int:
     target = TARGETS[args.tool]
     opts = sync.SyncOptions(
