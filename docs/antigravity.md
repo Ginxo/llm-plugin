@@ -126,7 +126,7 @@ tuyos. Tampoco explica `/baas-sync` ni el ejecutor de scripts, que son de Claude
 
 En Claude Code las skills de la organización salen como `/<organización>:<skill>` porque el MCP las publica como
 *prompts*. Antigravity **no documenta los *prompts* como comandos**: sus skills son carpetas con un `SKILL.md` y la CLI
-convierte cada una en `/<nombre>`. Este comando copia las que tus roles autorizan:
+convierte cada una en `/<nombre>`. Este comando copia las que tus roles autorizan, de **una organización cada vez**:
 
 ```bash
 python3 "<ruta del plugin>/scripts/baas.py" sync --tool antigravity --dry-run   # solo muestra qué haría
@@ -135,21 +135,43 @@ python3 "<ruta del plugin>/scripts/baas.py" sync --tool antigravity --org <slug>
 ```
 
 Se ejecuta **a mano** (no hay *hooks*): repítelo cuando quieras traer cambios. Las deja en
-`~/.gemini/config/skills/<skill>/` (en Windows, `%USERPROFILE%\.gemini\config\skills\<skill>\`), el ámbito **global**
+`~/.gemini/config/skills/<organización>-<skill>/` (en Windows, `%USERPROFILE%\.gemini\config\skills\`), el ámbito **global**
 que, según la documentación, leen la CLI y la extensión, igual que el MCP de `setup`. No hay `--scope project` para las
 skills (`<proyecto>/.agents/skills/`): en una carpeta de proyecto podrían acabar en un commit contenidos de la
 organización que no son públicos.
-Después, en `agy`, ejecuta `/skills reload` (o abre una conversación nueva).
+Después, en `agy`, ejecuta `/skills reload` (o abre una conversación nueva); la skill `gestor` de la organización `demo` se lanza como `/demo-gestor`.
 
 | Qué | Cómo |
 | :--- | :--- |
 | **Qué se copia** | Lo mismo que `/baas-sync` de Claude Code: las skills de `baas_list_skills` (tus roles) y, de forma transitiva, las que dependen de ellas **si tienes acceso**. Se verifica el **SHA-256** de cada fichero, se rechazan las rutas que salgan de la carpeta de la skill y nunca se crean enlaces simbólicos; cada skill se escribe en un temporal y se renombra (si falla, queda la versión anterior). Carpetas 0700 y ficheros 0600 |
-| **Nombre del comando** | La carpeta, **sin prefijo** de organización: así los enlaces `../otra/SKILL.md` y las citas `/otra` que ya traen las skills siguen valiendo, y solo hay una organización en el global. Sin `:` (Windows). Solo minúsculas, dígitos y guiones: el resto (`Mi_Skill`, `a.b`), los nombres reservados de Windows y los que taparían un comando de la CLI (`mcp`, `skills`) **no se instalan** y el comando los lista. El `name` del `SKILL.md` se iguala a la carpeta |
+| **Nombre del comando** | `<organización>-<skill>` (el *slug* de la organización: `<slug>-<skill>`, p. ej. `enrique-mingorance-cano-gestor`), con el **prefijo obligatorio**: un usuario puede tener skills con el mismo nombre (`gestor`) en varias organizaciones, como pasa con `/<org>:<skill>` en Claude Code, y todas conviven en la misma carpeta. La carpeta, el `name` del `SKILL.md` y el comando son ese mismo nombre. **No es `<org>:<skill>`**: la documentación de Antigravity solo dice que `name` va en minúsculas y con guiones (no menciona `:` ni prefijos) y Windows no admite `:` en una carpeta. Solo minúsculas, dígitos y guiones en la skill: el resto (`Mi_Skill`, `a.b`) **no se instala** y el comando lo lista. Con el prefijo ya no hay choques con comandos de la CLI (`/mcp`, `/skills`) ni con nombres reservados de Windows. Efecto secundario: los enlaces relativos entre skills (`../gestor/SKILL.md`) y las citas `/gestor` del texto **no se reescriben** y apuntan al nombre sin prefijo |
 | **Sin sus scripts** | **No se copia nada ejecutable**: ficheros marcados como ejecutables, carpetas `scripts/`, código y binarios por extensión (`.py`, `.sh`, `.js`, `.bat`, `.exe`…) y todo lo que empiece por `#!`. Plantillas, referencias y demás ficheros de texto o datos sí. El comando lista lo omitido y avisa de que esa skill **no funcionará completa**. Motivo: un script en disco lo ejecutaría el agente sin la comprobación del SHA-256 que hace `run-script` al ejecutarlo y seguiría ahí tras una revocación |
-| **`SKILL.md` adaptado** | Antigravity documenta `description` (obligatoria) y `name`: se escriben solo esos dos (`when_to_use` se une a la descripción) y el cuerpo queda tal cual. Los campos propios de Claude Code (`allowed-tools`, `hooks`, `argument-hint`…) se quitan y se avisa. Sin `description` no se instala. Una skill con `disable-model-invocation` (solo invocación manual) **no se instala**: Antigravity no puede respetarlo y el agente la usaría por su cuenta. Las referencias propias de Claude Code en el texto (`${CLAUDE_SKILL_DIR}`, `/<organización>:<skill>`) no se reescriben |
-| **No pisa lo tuyo** | Lo que gestiona queda en `~/.gemini/config/skills/.baas-skills.json` (organización, `package_sha256` y SHA-256 de lo escrito; sin secretos). Una carpeta con el mismo nombre que no figura ahí es **tuya**: se deja como está y el comando lo cuenta («no la toco»). Una skill gestionada que **editaste** (o a la que añadiste ficheros o enlaces) tampoco se sobrescribe ni se retira, salvo con `--force`; una tuya, nunca |
-| **Retirada** | Quitar un rol, retirar la skill o activar el kill switch la borra en la siguiente sincronización, solo si es de las gestionadas. Al cambiar de organización se retiran las de la anterior |
-| **Organización** | `--org`, si no la del `baas` del `mcp_config.json` global, si no la del proyecto vinculado con `/baas-init`, si no la única; con varias, error 3. Avisa si no coincide con la del MCP global |
+| **`SKILL.md` adaptado** | Antigravity documenta `description` (obligatoria) y `name`: se escriben solo esos dos (`when_to_use` se une a la descripción) y el cuerpo queda tal cual, **precedido de una nota** que dice a qué organización pertenece la skill, que sus tools `baas_*` son las del MCP configurado y que, si `baas_whoami` no devuelve esa organización, el agente debe detenerse (ver «Varias organizaciones, un solo MCP»). Los campos propios de Claude Code (`allowed-tools`, `hooks`, `argument-hint`…) se quitan y se avisa. Sin `description` no se instala. Una skill con `disable-model-invocation` (solo invocación manual) **no se instala**: Antigravity no puede respetarlo y el agente la usaría por su cuenta. Las referencias propias de Claude Code en el texto (`${CLAUDE_SKILL_DIR}`, `/<organización>:<skill>`) no se reescriben |
+| **No pisa lo tuyo** | Lo que gestiona cada organización queda en `~/.gemini/config/skills/.baas-skills-<organización>.json` (`package_sha256` y SHA-256 de lo escrito; sin secretos). Una carpeta con el nombre de una skill que no figura en el fichero de **esa** organización es ajena: se deja como está y el comando lo cuenta («no la toco»). Es el caso de una tuya, y también el de una carpeta de otra organización cuando los nombres se solapan (`demo` + `x-y` y `demo-x` + `y` dan la misma `demo-x-y`). Una skill gestionada que **editaste** (o a la que añadiste ficheros o enlaces) tampoco se sobrescribe ni se retira, salvo con `--force`; una ajena, nunca |
+| **Retirada** | Quitar un rol, retirar la skill o activar el kill switch (o bloquear o pausar esa organización) la borra en la siguiente sincronización **de esa organización**, solo si es de las que gestiona. Sincronizar una organización no toca las skills ni el fichero de control de otra |
+| **Organización** | `--org <slug>` (una por ejecución: repite el comando para cada una), si no la del `baas` del `mcp_config.json` global, si no la del proyecto vinculado con `/baas-init`, si no la única; con varias, error 3 |
+
+### Varias organizaciones, un solo MCP (limitación conocida)
+
+Las skills de varias organizaciones conviven, pero `setup antigravity` solo admite **una** entrada `baas` en el
+`mcp_config.json` global (`--replace` para cambiarla, apartado 2). Una skill usa las tools `baas_*` del MCP configurado:
+si solo está el de `demo`, la skill `otra-gestor` **actuaría sobre `demo`** (leería y, con rol de administrador,
+escribiría documentos de la organización equivocada). Lo que se hace hoy para reducir el riesgo, sin cambiar el MCP:
+
+- Cada `SKILL.md` adaptado empieza con una nota: «comprueba con `baas_whoami` que la organización es la tuya; si no, detente».
+- La regla `baas.md` dice lo mismo para cualquier skill nativa.
+- `sync` avisa si el MCP global es de otra organización, o si no hay ninguno.
+
+Es una barrera de instrucciones (depende de que el agente las siga), no técnica. Opciones para resolverlo de raíz:
+
+| Opción | Qué cambia | Coste y riesgos |
+| :--- | :--- | :--- |
+| **A. Una entrada `baas` (la actual)** | Nada | Coste cero. Riesgo residual: depende de la nota |
+| **B. Una entrada por organización, `baas-<slug>`. Recomendada** | `setup antigravity` escribe y actualiza solo la entrada `baas-<slug>` (URL propia, misma clave personal); desaparece `--replace`, y la entrada `baas` antigua se renombra si su URL es la de una organización del usuario. La nota de cada `SKILL.md` nombra el servidor `baas-<slug>` y la regla `baas.md` explica que las tools `baas_*` están por servidor y que `baas_whoami` de cada uno dice su organización. La extensión y la CLI muestran las tools por servidor (con carga ansiosa se llaman `mcp_<servidor>_<tool>`; con la perezosa por defecto se invocan por servidor), así que no chocan | Cambio **pequeño-medio**, pero **rompe los tests de T3** (nombre de la entrada, conflicto y `--replace`: unos 15-20 tests) y reescribe la regla y esta guía. N organizaciones son N conexiones y más tools en el contexto (carga perezosa por defecto). La clave queda en claro **una vez por entrada** (más copias en el fichero global). Sigue habiendo riesgo de elegir mal el servidor, pero cada nombre lleva el *slug* y la skill dice cuál usar |
+| **C. Una organización activa y skills solo de ella** | Volver al nombre sin prefijo | **Descartada**: contradice la decisión de que las skills de varias organizaciones convivan |
+| **D. Un único MCP multiorganización con `org` en cada llamada** | Nada en el plugin | **No sirve**: el parámetro `org` exige ser ORG_ADMIN de esa organización o PLATFORM_ADMIN, no vale para un miembro normal |
+
+La opción B no está hecha: queda a la espera de decisión.
 
 ## 6. La clave queda en claro (riesgo aceptado)
 
@@ -173,7 +195,7 @@ La documentación de Antigravity **no admite `${VAR}`** en las cabeceras ni un c
   salir, no hay trazas en la webapp (W8) y el kill switch, el bloqueo y la pausa de la organización **no cortan el
   modelo**. Solo cortan el MCP (`KILL_SWITCH_ACTIVE`). No pegues datos que no pegarías en una herramienta sin
   protección. (La protección para su CLI con clave de Gemini es el trabajo de #178.)
-- **Varias organizaciones a la vez en la extensión**: el global solo admite una.
+- **Varias organizaciones a la vez con el MCP**: las skills sí conviven, pero el global solo admite un MCP `baas` (apartado 5, «Varias organizaciones, un solo MCP»).
 - **Las skills de la organización como comandos del MCP.** El servidor `baas` las expone como *prompts* del MCP
   (`/mcp__baas__<skill>` en Claude Code) y la documentación de Antigravity no dice que los muestre: por eso se copian
   como skills nativas (apartado 5), **sin sus scripts** y sin actualización automática. Mientras no estén copiadas, el
@@ -221,10 +243,13 @@ Marca lo que compruebes (lo de Linux ya está hecho el 2026-11-23; falta Windows
 - [ ] `sync --tool antigravity --dry-run` lista las skills y no escribe nada (ni crea `~/.gemini/config/skills/`).
 - [ ] `sync --tool antigravity` crea `~/.gemini/config/skills/<skill>/SKILL.md` (carpetas 0700, ficheros 0600) y
       `.baas-skills.json`, **no copia ningún script** (el aviso los lista) y repetirlo dice «Todo al día».
-- [ ] **CLI**: tras `/skills reload`, `/skills` muestra la skill y **`/<skill>`** la lanza. Anota si el comando lleva otro
-      prefijo o si el `description` reescrito basta para que el agente la elija solo.
+- [ ] **CLI**: tras `/skills reload`, `/skills` muestra la skill y **`/<organización>-<skill>`** la lanza. Anota si el comando lleva otro
+      prefijo distinto de `/<organización>-<skill>` o si el `description` reescrito basta para que el agente la elija solo.
 - [ ] **Extensión**: anota si la extensión ofrece las skills como comando (`/<skill>`, menú de skills…) o solo las usa
       el agente por su cuenta.
+- [ ] **Dos organizaciones** (si las tienes) con una skill del mismo nombre: `sync --tool antigravity --org <a>` y
+      `--org <b>` dejan `<a>-<skill>` y `<b>-<skill>`; retirar una no toca la otra. Con el MCP de solo una, el agente de
+      la otra skill comprueba `baas_whoami` y se detiene.
 - [ ] Una skill tuya con el mismo nombre queda intacta y el comando dice «no la toco»; una skill sincronizada que editas
       no se pisa sin `--force`.
 - [ ] Quitar un rol (o retirar la skill) la borra en la siguiente sincronización; las tuyas siguen ahí.
@@ -244,7 +269,7 @@ La de si la extensión lee el mismo fichero que la CLI está **respondida** (apa
 | :--- | :--- |
 | ¿Respeta el `.agents/mcp_config.json` de proyecto en una **carpeta sin confianza** (*Restricted Mode*)? | La extensión no lo lee ni con la confianza aceptada, así que el riesgo se limita a la CLI: abre una carpeta sin confianza con `agy` y mira si `baas` se conecta. Si lo hiciera, un repositorio ajeno podría traer su propio `.agents/mcp_config.json`: no confíes en uno que no hayas escrito tú |
 | ¿Ofrece la extensión las skills nativas como comando, o solo las usa el agente? | Tras `sync --tool antigravity`, mira en la extensión si aparece `/<skill>` o algún menú de skills; pídele al agente una tarea que encaje con la `description` y mira si la usa. Solo la CLI está documentada como comando |
-| ¿La CLI las lanza como `/<nombre>` (el de la carpeta) o con otro prefijo? | `/skills` en `agy` y prueba `/<skill>`. El plugin pone `name` = carpeta y no inventa prefijos |
+| ¿La CLI las lanza como `/<nombre>` (el de la carpeta, `<organización>-<skill>`) o con otro prefijo? | `/skills` en `agy` y prueba `/<skill>`. El plugin pone `name` = carpeta y no inventa otros prefijos |
 | ¿Usa el campo `instructions` del MCP? | La documentación solo dice que lo guarda en una caché (`instructions.md`); mira si el agente lo recibe sin la regla (borra `.agents/rules/baas.md` y pregúntale qué tools tiene) |
 
 Fuentes: <https://antigravity.google/docs/mcp>, <https://antigravity.google/docs/rules>, <https://antigravity.google/docs/skills>.
