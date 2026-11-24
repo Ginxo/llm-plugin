@@ -886,28 +886,25 @@ class NerGroup:
         api = self.main_api()
         with self.org("w8") as org:
             model = self.model(f"w8-antes-{api}")
-            self.sent_ok(org, api, model, case_text(TEXT_1, api))
+            self.sent_ok(org, api, model, case_text(TEXT_1, f"w8-antes-{api}"))
             problems = observed_problems(self.turn(org, model, 1).get("observed_detections"), OBSERVED_1)
             check(not problems, "antes de añadir el término:\n" + "\n".join(problems))
             res = self.e.admin_post(f"/api/v1/orgs/{org.slug}/ai-ip/allowlist", {"term": term})
             check(res.status == 201, f"añadir «{term}» a la allowlist → {describe(res)}")
-            term_id = ((res.json() or {}).get("term") or {}).get("id")
-            check(term_id, "la allowlist no devolvió el id del término")
-            try:
-                self.settle()
-                # Otra conversación: ni la caché de la anterior ni sus valores conocidos intervienen
-                model = self.model(f"w8-despues-{api}")
-                self.sent_ok(org, api, model, case_text(TEXT_1, api))
-                observed = self.turn(org, model, 1).get("observed_detections")
-                problems = allowlisted_problems(observed, term)
-                problems += observed_problems(observed, [o for o in OBSERVED_1 if o[1] != term])
-                check(not problems, f"con «{term}» en la allowlist:\n" + "\n".join(problems))
-            finally:
-                res = self.e.webapp("DELETE", f"/api/v1/orgs/{org.slug}/ai-ip/allowlist/{term_id}", self.admin)
-                check(res.status == 200, f"quitar el término de la allowlist → {describe(res)}")
+            check((res.json() or {}).get("propagated") is True, f"el término no se propagó al proxy: {describe(res)}")
+            self.settle()
+            # Otro primer mensaje: una conversación nueva (el mismo sería el turno 2 de la anterior). La caché del NER
+            # guarda la salida sin filtrar (D101): la allowlist se aplica después, haya acierto de caché o no.
+            model = self.model(f"w8-despues-{api}")
+            self.sent_ok(org, api, model, case_text(TEXT_1, f"w8-despues-{api}"))
+            observed = self.turn(org, model, 1).get("observed_detections")
+            problems = allowlisted_problems(observed, term)
+            problems += observed_problems(observed, [o for o in OBSERVED_1 if o[1] != term])
+            check(not problems, f"con «{term}» en la allowlist:\n" + "\n".join(problems))
+            # El término se va con la organización, que se elimina al salir
         return (
-            f"{h3.API_NAMES[api]}: «{term}» observado → añadido a la allowlist de la organización → el turno "
-            "siguiente observa solo la persona y la dirección"
+            f"{h3.API_NAMES[api]}: «{term}» observado → añadido a la allowlist de la organización (propagado) → el "
+            "turno siguiente, en otra conversación, observa solo la persona y la dirección"
         )
 
     # --- el recorrido ----------------------------------------------------------------------------------
