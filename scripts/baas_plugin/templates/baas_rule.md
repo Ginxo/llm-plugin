@@ -28,9 +28,11 @@ Este proyecto está conectado a una organización de BaaS-AI-IP. Su conocimiento
 - `NOT_FOUND`: el recurso o la organización no existen o no son accesibles (son indistinguibles a propósito).
 - `UNAVAILABLE`, HTTP 401 o el servidor `baas` no conectado: dilo al usuario. Si es 401, su clave puede estar revocada o haber caducado: tiene que volver a lanzar `baas.py setup` en una terminal (tú no puedes arreglarlo).
 
-## Scripts de las skills
+## Skills de la organización y sus scripts
 
-Los scripts de una skill de la organización **no se ejecutan desde esta herramienta**: no copies el contenido de `baas_get_script` ni de `baas_get_skill_files` a un fichero ni lo ejecutes a mano, porque se saltaría la comprobación del SHA-256 y el confinamiento que aplica el plugin. Si una skill necesita ejecutar un script, díselo al usuario y explícale qué script es.
+Las skills de la organización pueden aparecer también en tu lista de skills de esta herramienta (y como `/<nombre>`): las copia el usuario con `baas.py sync --tool antigravity` en una terminal; no lo ejecutes tú. Llegan **sin sus scripts** y con la cabecera reducida a `name` y `description`, porque no se copia nada ejecutable a propósito. La versión vigente de una skill es siempre la de `baas_get_skill`.
+
+Los scripts de una skill de la organización **no se ejecutan desde esta herramienta**: no reconstruyas un script que falta con `baas_get_script` o `baas_get_skill_files`, ni copies su contenido a un fichero y lo ejecutes, porque se saltaría la comprobación del SHA-256 y el confinamiento que aplica el plugin. Si una skill necesita ejecutar un script, díselo al usuario y explícale qué script es y que esa skill no funciona completa en esta herramienta.
 
 ## La API key
 

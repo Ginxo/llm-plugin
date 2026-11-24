@@ -71,3 +71,34 @@ def test_the_doc_lists_the_manual_checks_and_the_open_questions() -> None:
     for needle in ("carpeta sin confianza", "instructions", ".agents/skills"):
         assert needle in doc, needle
     assert "¿La extensión lee el mismo" not in doc, "esa pregunta ya está respondida: la extensión solo lee el global"
+
+
+def test_the_doc_explains_the_native_skills_command_and_its_limits() -> None:
+    doc = text()
+    commands = "\n".join(blocks("bash"))
+    assert "sync --tool antigravity" in commands
+    assert "--dry-run" in commands
+    for needle in (
+        "~/.gemini/config/skills/",
+        ".baas-skills.json",
+        "/skills reload",
+        "sin sus scripts",
+        "disable-model-invocation",
+        "sin prefijo",
+        "--force",
+        "no la toco",
+        "SHA-256",
+    ):
+        assert needle in doc, needle
+
+
+def test_the_doc_no_longer_lists_native_skills_as_a_follow_up_and_asks_to_check_them() -> None:
+    doc = text()
+    assert "Llegarán como" not in doc
+    for needle in ("`/skills`", "`/<skill>`", "extensión ofrece las skills"):
+        assert needle in doc, needle
+
+
+def test_the_readme_mentions_the_native_skills_command() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "sync --tool antigravity" in readme

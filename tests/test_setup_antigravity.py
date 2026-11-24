@@ -563,3 +563,14 @@ def test_global_says_what_it_implies(home, project, server, capsys) -> None:
 def test_the_scope_must_be_global_or_project() -> None:
     with pytest.raises(SystemExit):
         cli.main(["setup", "antigravity", "--scope", "usuario"])
+
+
+def test_the_rule_explains_native_skills_and_that_they_come_without_scripts(home, project, server, capsys) -> None:
+    save_key("analista@demo.test", server.url)
+    assert run(setup(project), capsys)[0] == 0
+    text = (project / RULE).read_text(encoding="utf-8")
+    assert "sync --tool antigravity" in text
+    assert "sin sus scripts" in text
+    assert "no lo ejecutes tú" in text, "traer contenido remoto al disco lo decide el usuario, no el agente"
+    assert "baas_get_script" in text
+    assert len(text.encode("utf-8")) <= RULE_MAX_BYTES
