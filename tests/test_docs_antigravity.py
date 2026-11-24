@@ -119,20 +119,41 @@ def test_the_doc_states_the_multi_organization_limitation_and_recommends_an_opti
         assert needle in doc, needle
 
 
-def test_the_doc_explains_the_script_rewrite_its_limits_and_what_the_user_must_check() -> None:
+def test_the_doc_explains_the_script_model_the_sandbox_and_what_the_user_must_check() -> None:
     doc = text()
     commands = "\n".join(blocks("bash"))
-    assert "run-script --tool antigravity --synced-org" in commands
+    assert "sync --tool antigravity --verify" in commands
+    assert "sync --tool antigravity --permissions" in commands
     for needle in (
         "${CLAUDE_SKILL_DIR}",
-        "--synced-org",
-        "sin reescribir",
+        "modelo de confianza",
+        "verificados al sincronizar",
         "knowledge/",
         "carpeta de trabajo",
-        "ruta de `baas.py`",
-        "solo funciona completa",
+        "desde la carpeta de la skill",
+        "sandbox",
+        "antigravity-cli/settings.json",
+        "permissions",
+        "command(",
+        "envoltorio",
+        "~/.local/state/contador/valor",
+        "NO comprobada",
         "no se amplía",
         "dicta",
+        "run-script",
+        "sin reescribir",
     ):
         assert needle in doc, needle
     assert "proyecto de cerebro" in doc, "la lista manual dice qué probar con `gestor`"
+    assert "`contador`" in doc
+
+
+def test_the_doc_no_longer_says_that_scripts_are_not_copied() -> None:
+    doc = text()
+    for stale in (
+        "**No se copia ni se descarga nada ejecutable",
+        "sin los scripts en disco",
+        "no se copian",
+        "--synced-org <organización> skills/<skill>",
+    ):
+        assert stale not in doc, stale

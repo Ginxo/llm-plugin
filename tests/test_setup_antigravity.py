@@ -565,7 +565,7 @@ def test_the_scope_must_be_global_or_project() -> None:
         cli.main(["setup", "antigravity", "--scope", "usuario"])
 
 
-def test_the_rule_explains_native_skills_and_that_scripts_run_only_with_the_executor(
+def test_the_rule_explains_native_skills_with_their_verified_scripts_and_the_sandbox(
     home, project, server, capsys
 ) -> None:
     save_key("analista@demo.test", server.url)
@@ -576,10 +576,13 @@ def test_the_rule_explains_native_skills_and_that_scripts_run_only_with_the_exec
     assert "baas_whoami" in text
     assert "otra organización" in text, "una skill de otra organización no debe actuar con el MCP de esta"
     assert "no lo ejecutes tú" in text, "traer contenido remoto al disco lo decide el usuario, no el agente"
-    assert "baas.py run-script" in text, "los scripts se ejecutan solo con el ejecutor, que verifica el SHA-256"
-    assert "baas_get_script" in text, "y nunca con el contenido de baas_get_script a mano"
-    assert "sin los scripts en disco" in text
+    assert "con sus scripts" in text
+    assert "verificados con su SHA-256 al sincronizar" in text
+    assert "carpeta de la skill" in text
+    assert "baas_get_script" in text, "y nunca se ejecuta a mano el contenido de baas_get_script"
+    assert "sandbox" in text, "qué hacer si una orden falla dentro del sandbox, en vez de improvisar"
+    assert "--verify" in text
     assert "knowledge" in text, "algunos scripts leen ficheros locales"
     assert "carpeta de trabajo" in text
-    assert "--synced-org" in text, "no se cambia la organización de la orden"
+    assert "--synced-org" not in text, "ya no se reescribe hacia `run-script`"
     assert len(text.encode("utf-8")) <= RULE_MAX_BYTES
