@@ -294,8 +294,14 @@ def resolve_plans(
     plugin_dir: Path,
     opts: SyncOptions,
     result: SyncResult,
+    skills_dir: Path | None = None,
 ) -> dict[str, SkillPlan]:
-    """Las skills que deben quedar instaladas: las listadas y, de forma transitiva, sus dependencias accesibles."""
+    """Las skills que deben quedar instaladas: las listadas y, de forma transitiva, sus dependencias accesibles.
+
+    `skills_dir` es donde está cada skill (por omisión `<plugin_dir>/skills`); las skills nativas de otras
+    herramientas (`native_skills`) comparten esta resolución con otra carpeta.
+    """
+    base = skills_dir if skills_dir is not None else plugin_dir / "skills"
     plans: dict[str, SkillPlan] = {}
     queue: deque[tuple[str, str | None]] = deque((name, None) for name in sorted(listed))
     unreachable: set[tuple[str, str]] = set()
@@ -311,7 +317,7 @@ def resolve_plans(
             continue
         entry = local.get(name)
         server_hash = listed.get(name)
-        intact = (plugin_dir / "skills" / name / "SKILL.md").is_file()
+        intact = (base / name / "SKILL.md").is_file()
         if not opts.force and entry and server_hash and entry.get("package_sha256") == server_hash and intact:
             deps = [d for d in entry.get("depends_on") or [] if isinstance(d, str)]
             plans[name] = SkillPlan(name, "keep", server_hash, depends_on=deps)
@@ -369,8 +375,12 @@ def _install_skill(client: Any, plugin_dir: Path, tmp_root: Path, name: str, man
     """
     staged = tmp_root / f"new-{name}"
     package_fetch.fetch_to_dir(client, manifest, staged)
-    final = plugin_dir / "skills" / name
-    backup = tmp_root / f"old-{name}"
+    swap_dir(staged, plugin_dir / "skills" / name, tmp_root / f"old-{name}")
+
+
+def swap_dir(staged: Path, final: Path, backup: Path) -> None:
+    """Pone `staged` en el lugar de `final` con renombrados (la versión anterior pasa por `backup`): si falla, `final`
+    queda como estaba. Un enlace simbólico en `final` se sustituye sin seguirlo."""
     had_previous = final.is_symlink() or final.exists()
     if had_previous:
         os.rename(final, backup)

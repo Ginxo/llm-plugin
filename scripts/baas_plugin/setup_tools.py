@@ -216,21 +216,26 @@ def _duplicate_notice(path: Path) -> str:
     )
 
 
-def cmd_setup(args: argparse.Namespace) -> int:
-    from . import cli  # import diferido: cli registra este comando
+def connect(args: argparse.Namespace) -> tuple[Path, BaasPaths, Any, handshake.Handshake]:
+    """`(proyecto, rutas de BaaS, credenciales, handshake)`: la clave sale de `~/baas-ai-ip/.env` (nunca de un
+    argumento) y, sin ella o con una carpeta que no existe, falla antes de tocar nada."""
+    from . import cli  # import diferido: cli registra estos comandos
 
-    target: ClientTarget = TARGETS[args.tool]
     proj = (
         Path(args.project).expanduser().resolve() if args.project else project.resolve_project_dir(None, cwd=Path.cwd())
     )
     if not proj.is_dir():
         raise ConfigError(f"El proyecto {proj} no existe.", hint="Indica la carpeta del proyecto con --project.")
-
     paths = BaasPaths.default()
     creds = load_credentials(paths)  # sin clave: error de configuración antes de tocar nada
     values, _ = read_env(paths)
-    app_url = cli._resolve_app_url(args.app_url, values)
-    hs = cli._handshake(app_url, creds.api_key)
+    app_url = cli._resolve_app_url(getattr(args, "app_url", None), values)
+    return proj, paths, creds, cli._handshake(app_url, creds.api_key)
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    target: ClientTarget = TARGETS[args.tool]
+    proj, paths, creds, hs = connect(args)
     org = handshake.select_organization(hs, requested=args.org, current=_linked_org(proj))
 
     is_global = args.scope == "global"
