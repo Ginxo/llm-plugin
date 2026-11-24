@@ -69,6 +69,9 @@ La pide sin mostrarla; también acepta `… | python3 …/baas.py set-key --stdi
 | `~/baas-ai-ip/bin/baas_desktop_credentials.py` | Solo con Claude Desktop en modo gateway (`desktop-config`): da a Desktop la API key de Anthropic y la cabecera `X-Baas-Api-Key` leyendo `.env` | No |
 | `<proyecto>/.claude/settings.local.json` (0600) | `ANTHROPIC_BASE_URL` (proxy de la organización) y `ANTHROPIC_CUSTOM_HEADERS` con `X-Baas-Api-Key`. Se conservan tus otros ajustes | **No**: el plugin lo añade a `.gitignore` y se niega a escribir si ya está versionado |
 | `<proyecto>/.claude/baas.local.json` | Organización y URLs (sin secretos) | **No** (`.gitignore`) |
+| `~/.gemini/config/mcp_config.json` (0600) | Solo con `setup antigravity` (ámbito global, por defecto): el servidor `baas` con la API key **en claro** en `Authorization` ([Antigravity](#antigravity-extensión-de-vs-code-y-cli-agy)). Se conservan los demás servidores | No: está en tu `HOME` (cuidado si versionas tus *dotfiles*) |
+| `<proyecto>/.agents/mcp_config.json` (0600) | Solo con `setup antigravity --scope project`: lo mismo, solo para la CLI `agy` | **No**: `.gitignore` y se niega si está versionado |
+| `<proyecto>/.agents/rules/baas.md` | Con `setup antigravity` (los dos ámbitos): la regla equivalente a `baas-brain` (sin secretos) | Puede versionarse |
 | `~/.claude.json` (ámbito *local* del proyecto) | Servidor MCP `baas` (URL y `headersHelper`, **sin** la clave) | No |
 | `~/.claude/skills/<organización>/` (0700) | *(H5)* El plugin de usuario con las skills sincronizadas: `.claude-plugin/plugin.json`, `.baas-managed` y `skills/<skill>/…` | No: está en tu `HOME` |
 | `~/.claude/settings.json` | *(H5)* Solo `enabledPlugins["<organización>@skills-dir"] = false` (el plugin queda apagado a nivel de usuario). Se conserva el resto del fichero y se escribe de forma atómica | No |
@@ -127,6 +130,16 @@ Límite aceptado: un script ya ejecutado no se puede «revocar» (riesgo S6); la
 ## Codex (OpenAI)
 
 El plugin `baas` es de Claude Code, pero **Codex CLI** también puede pasar por el proxy de OpenAI de tu organización con un perfil de usuario y `env_http_headers` (la clave de BaaS-AI-IP solo en el entorno de Codex, nunca en un fichero): ver [docs/codex.md](docs/codex.md).
+
+## Antigravity (extensión de VS Code y CLI `agy`)
+
+**Solo cerebro, sin protección.** Antigravity se conecta al MCP de tu organización (skills y conocimiento) con una orden, pero **no pasa por el proxy ni por AI-IP**: sus conversaciones van a Google sin anonimizar. La extensión de VS Code lee **solo** el `mcp_config.json` global (`~/.gemini/config/`); la CLI `agy` lee el global y el de proyecto. Por eso `setup` escribe por defecto en el **global**:
+
+```bash
+python3 "<ruta del plugin>/scripts/baas.py" setup antigravity --project <proyecto> [--org <slug>] [--scope global|project] [--replace] [--print]
+```
+
+El global solo admite **una organización** por usuario (con otra ya configurada se niega sin `--replace`); `--scope project` escribe en `<proyecto>/.agents/mcp_config.json` (solo lo lee la CLI). En los dos casos escribe la regla `<proyecto>/.agents/rules/baas.md` (el equivalente de `baas-brain`). **La clave queda en claro en ese fichero** (Antigravity no admite variables ni un comando para el secreto): el plugin lo deja en 0600; el de proyecto además va al `.gitignore` y no se escribe si está versionado, mientras que el global está en tu HOME, fuera de cualquier `.gitignore`. Sin Claude Code basta con `git clone https://github.com/baas-ai-ip/llm-plugin`. Las skills de la organización se copian como **skills nativas** de Antigravity (`/<organización>-<skill>` en `agy`, con el prefijo obligatorio para que convivan las de varias organizaciones) con `sync --tool antigravity [--dry-run] [--org <slug>] [--force]`: van a `~/.gemini/config/skills/`, **con sus scripts**, como en Claude Code: se verifica el SHA-256 de cada fichero al sincronizar (modelo de confianza igual al de Claude Code) y el `SKILL.md` se reescribe para llamarlos desde la carpeta de la skill (`${CLAUDE_SKILL_DIR}` y las rutas relativas «desde la carpeta de la skill» pasan a la ruta absoluta; los enlaces y citas a otras skills de la organización llevan el prefijo). **Nunca pisan una skill tuya** (lo que gestionan queda en `.baas-skills-<org>.json`), retiran lo que ya no es accesible y `--verify` recomprueba lo copiado sin red. `agy` ejecuta las órdenes en un sandbox que oculta tu HOME: `--permissions` imprime (sin escribirla) la regla de `~/.gemini/antigravity-cli/settings.json` que permite ejecutar solo esos scripts fuera de él (sintaxis no comprobada con `agy` real). Algunos scripts leen ficheros locales como `knowledge/…`, así que la skill solo funciona completa en un proyecto que tenga ese cerebro como carpeta de trabajo. Una skill usa las tools del MCP configurado, que puede ser el de otra organización: el global solo admite un MCP (limitación conocida en la guía). Pasos, lo comprobado (extensión 1.13.0 y `agy` 1.5.15, 2026-11-23), lo que no cubre y la lista de comprobación manual en [docs/antigravity.md](docs/antigravity.md).
 
 ## Claude Desktop (pestaña Code)
 

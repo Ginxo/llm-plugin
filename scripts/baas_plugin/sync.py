@@ -45,7 +45,7 @@ import shutil
 import signal
 import sys
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -297,8 +297,17 @@ def resolve_plans(
     plugin_dir: Path,
     opts: SyncOptions,
     result: SyncResult,
+    skills_dir: Path | None = None,
+    folder_of: Callable[[str], str] | None = None,
 ) -> dict[str, SkillPlan]:
-    """Las skills que deben quedar instaladas: las listadas y, de forma transitiva, sus dependencias accesibles."""
+    """Las skills que deben quedar instaladas: las listadas y, de forma transitiva, sus dependencias accesibles.
+
+    `skills_dir` es donde está cada skill (por omisión `<plugin_dir>/skills`) y `folder_of` da el nombre de su carpeta
+    (por omisión, el de la skill); las skills nativas de otras herramientas (`native_skills`) comparten esta
+    resolución con otra carpeta y otros nombres.
+    """
+    base = skills_dir if skills_dir is not None else plugin_dir / "skills"
+    folder_of = folder_of or (lambda name: name)
     plans: dict[str, SkillPlan] = {}
     queue: deque[tuple[str, str | None]] = deque((name, None) for name in sorted(listed))
     unreachable: set[tuple[str, str]] = set()
@@ -314,7 +323,7 @@ def resolve_plans(
             continue
         entry = local.get(name)
         server_hash = listed.get(name)
-        intact = (plugin_dir / "skills" / name / "SKILL.md").is_file()
+        intact = (base / folder_of(name) / "SKILL.md").is_file()
         if not opts.force and entry and server_hash and entry.get("package_sha256") == server_hash and intact:
             deps = [d for d in entry.get("depends_on") or [] if isinstance(d, str)]
             plans[name] = SkillPlan(name, "keep", server_hash, depends_on=deps)
@@ -372,8 +381,12 @@ def _install_skill(client: Any, plugin_dir: Path, tmp_root: Path, name: str, man
     """
     staged = tmp_root / f"new-{name}"
     package_fetch.fetch_to_dir(client, manifest, staged)
-    final = plugin_dir / "skills" / name
-    backup = tmp_root / f"old-{name}"
+    swap_dir(staged, plugin_dir / "skills" / name, tmp_root / f"old-{name}")
+
+
+def swap_dir(staged: Path, final: Path, backup: Path) -> None:
+    """Pone `staged` en el lugar de `final` con renombrados (la versión anterior pasa por `backup`): si falla, `final`
+    queda como estaba. Un enlace simbólico en `final` se sustituye sin seguirlo."""
     had_previous = final.is_symlink() or final.exists()
     if had_previous:
         os.rename(final, backup)
@@ -707,6 +720,10 @@ def claude_paths(args: argparse.Namespace) -> ClaudePaths:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    if getattr(args, "tool", "claude") != "claude":
+        from .native_skills import cmd_sync_native  # import diferido: es de otras herramientas (T19, #192)
+
+        return cmd_sync_native(args)
     baas = BaasPaths.default()
     creds = load_credentials(baas)
     proj = project.resolve_project_dir(args.project or os.environ.get("CLAUDE_PROJECT_DIR"), cwd=Path.cwd())
@@ -756,5 +773,25 @@ def add_sync_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore[ty
         "--timeout", type=float, default=15.0, help="Segundos máximos de espera del MCP antes de renunciar (15)"
     )
     p.add_argument("--trigger", default="manual", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--tool",
+        choices=("claude", "antigravity"),
+        default="claude",
+        help="Dónde dejar las skills: `claude` (por omisión, el plugin de Claude Code del proyecto vinculado) o"
+        " `antigravity` (skills nativas en ~/.gemini/config/skills/, para la CLI `agy` y la extensión)",
+    )
+    p.add_argument(
+        "--org", help="Con `--tool antigravity`: slug de la organización (obligatorio si perteneces a varias)"
+    )
+    p.add_argument(
+        "--verify",
+        action="store_true",
+        help="Con `--tool antigravity`: recomprueba las skills copiadas contra el fichero de control (sin red)",
+    )
+    p.add_argument(
+        "--permissions",
+        action="store_true",
+        help="Con `--tool antigravity`: imprime la regla de permisos sugerida para `agy` (sin red; no la escribe)",
+    )
     add_claude_home_args(p)
     p.set_defaults(func=cmd_sync)

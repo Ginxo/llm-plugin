@@ -236,17 +236,42 @@ def run_script(
     return execute(package, rel, list(args or []), cwd=cwd)
 
 
+def _synced_mcp_url(ns: argparse.Namespace) -> str | None:
+    """El MCP de una skill nativa sincronizada (`--tool` y `--synced-org`), o `None` si no se pidió.
+
+    Sale del fichero de control que escribió `sync --tool <herramienta>`, nunca de un argumento: una URL elegida por
+    quien escribe el `SKILL.md` podría llevarse la clave. Solo vale para las skills sincronizadas de esa organización.
+    """
+    tool, synced = getattr(ns, "tool", None), getattr(ns, "synced_org", None)
+    if not tool and not synced:
+        return None
+    if not (tool and synced):
+        raise ConfigError("`--tool` y `--synced-org` van juntas.", hint="Las genera `sync --tool antigravity`.")
+    if ns.org:
+        raise ConfigError(
+            "`--org` no se combina con `--synced-org`: el MCP es el de la organización sincronizada.",
+            hint="Quita `--org`.",
+        )
+    from .native_skills import synced_server
+
+    skill, _ = split_script_path(ns.path)
+    return synced_server(tool, synced, skill)
+
+
 def cmd_run_script(ns: argparse.Namespace) -> int:
     from . import project
     from .envfile import BaasPaths, load_credentials
 
     creds = load_credentials(BaasPaths.default())
-    proj = project.resolve_project_dir(ns.project or os.environ.get("CLAUDE_PROJECT_DIR"), cwd=Path.cwd())
-    binding = project.read_binding(proj)
-    if not binding or not binding.get("mcp_url"):
-        raise ConfigError(f"El proyecto {proj} no está vinculado a BaaS-AI-IP: lanza /baas-init.")
+    mcp_url = _synced_mcp_url(ns)
+    if mcp_url is None:
+        proj = project.resolve_project_dir(ns.project or os.environ.get("CLAUDE_PROJECT_DIR"), cwd=Path.cwd())
+        binding = project.read_binding(proj)
+        if not binding or not binding.get("mcp_url"):
+            raise ConfigError(f"El proyecto {proj} no está vinculado a BaaS-AI-IP: lanza /baas-init.")
+        mcp_url = str(binding["mcp_url"])
     return run_script(
-        str(binding["mcp_url"]),
+        mcp_url,
         creds.api_key,
         ns.path,
         args=list(ns.script_args),
@@ -265,6 +290,18 @@ def add_run_script_parser(sub: argparse._SubParsersAction) -> None:  # type: ign
     p.add_argument("--org", help="Otra organización (exige ORG_ADMIN en ella o PLATFORM_ADMIN)")
     p.add_argument("--project", help="Raíz del proyecto (por defecto CLAUDE_PROJECT_DIR o la raíz git)")
     p.add_argument("--cwd", help="Directorio de trabajo del script (por defecto, el del proceso)")
+    from .native_skills import TARGETS  # herramientas con skills nativas (T20): no necesitan un proyecto vinculado
+
+    p.add_argument(
+        "--tool",
+        choices=sorted(TARGETS),
+        help="Skill sincronizada como skill nativa de esta herramienta (con `--synced-org`; sin proyecto vinculado)",
+    )
+    p.add_argument(
+        "--synced-org",
+        metavar="ORG",
+        help="Organización de la que se sincronizó la skill: el MCP sale de su fichero de control, no de un argumento",
+    )
     p.epilog = (
         "Los argumentos para el script van al final, tras `--`. El código de salida es el del script; "
         "un error del plugin añade una línea BAAS_ERROR=<código> en stderr."
