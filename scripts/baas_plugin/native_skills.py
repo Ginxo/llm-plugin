@@ -21,14 +21,22 @@ Lo que añade, porque aquí el destino es una carpeta **del usuario** y no un pl
   la misma carpeta. No es `<org>:<skill>` porque la documentación de Antigravity no dice que `:` valga en `name` (solo
   «minúsculas» y «guiones») y Windows no lo admite en una carpeta. Solo minúsculas, dígitos y guiones; lo demás no se
   instala y se cuenta. Cada organización tiene su fichero de control y retira solo lo suyo.
-- **Sin scripts.** No se copia nada que pueda ejecutarse sin la comprobación que hace el plugin al ejecutar
+- **Sin scripts en disco.** No se copia nada que pueda ejecutarse sin la comprobación que hace el plugin al ejecutar
   (`run-script`): ficheros marcados como ejecutables, carpetas `scripts/`, extensiones de código o binarios y todo lo
-  que empiece por `#!`. Se listan y se avisa de que esa skill no funcionará completa en la herramienta.
+  que empiece por `#!`. Se listan. Las llamadas que el `SKILL.md` hace a esos scripts
+  (`python3 "${CLAUDE_SKILL_DIR}/scripts/x.py" …`) se reescriben para que pasen por `baas.py run-script`
+  (`skill_rewrite`): el ejecutor descarga el script, comprueba su SHA-256, lo corre en una carpeta temporal privada y lo
+  borra siempre. Lo que no se reconoce con certeza se deja intacto y se cuenta.
 - **`SKILL.md` adaptado.** Antigravity documenta `description` (obligatorio) y `name` (opcional): se escriben solo esos
-  dos (`name` = la carpeta; `when_to_use` se une a la descripción) y el cuerpo queda tal cual, precedido de una nota que
-  dice a qué organización pertenece la skill (las tools `baas_*` son las del MCP configurado, que puede ser el de otra
-  organización). Los campos propios de Claude Code se quitan y se avisa; una skill que pide invocación solo manual
-  (`disable-model-invocation`) no se instala porque Antigravity no puede respetarlo.
+  dos (`name` = la carpeta; `when_to_use` se une a la descripción). El cuerpo se deja tal cual salvo lo que
+  `skill_rewrite` reescribe con certeza (llamadas a scripts, enlaces y citas a otras skills de la organización) y va
+  precedido de una nota que dice a qué organización pertenece la skill (las tools `baas_*` son las del MCP configurado,
+  que puede ser el de otra organización). Los campos propios de Claude Code se quitan y se avisa; una skill que pide
+  invocación solo manual (`disable-model-invocation`) no se instala porque Antigravity no puede respetarlo.
+- **Idempotente.** El resultado depende del texto original, del prefijo, de la ruta de `baas.py` (si hay llamadas a
+  scripts) y de qué skills citadas están sincronizadas: una huella (`adapt_fp`) por skill lo resume en el fichero de
+  control y, si cambia (se movió el plugin, otra skill citada se ha sincronizado, cambió el adaptador), la siguiente
+  sincronización vuelve a adaptar esa skill y solo esa.
 
 Solo toca `~/.gemini/config/skills/` (y `~/baas-ai-ip/sync.lock`). Un cambio se ve con `/skills reload` en `agy`.
 """
@@ -49,7 +57,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import claude_home, handshake, package_fetch, setup_tools, skillmeta, sync
+from . import claude_home, handshake, package_fetch, setup_tools, skill_rewrite, skillmeta, sync
 from .envfile import BaasPaths
 from .errors import (
     BaasError,
@@ -85,6 +93,47 @@ ORG_NOTE = (
     " herramienta. Antes de actuar, comprueba con `baas_whoami` que la organización es «{org}». Detente e informa al"
     " usuario si no lo es o si el MCP no está conectado, y no uses el parámetro `org` para saltártelo."
 )
+# Solo en las skills con llamadas a scripts reescritas: el ejecutor y lo que necesitan en el equipo
+SCRIPTS_NOTE = (
+    "> Los scripts de esta skill se ejecutan **solo** con `baas.py run-script` (las órdenes de abajo ya vienen así,"
+    " con la comprobación del SHA-256): no los copies a disco ni ejecutes el contenido de `baas_get_script` a mano."
+    " Algunos leen ficheros locales del proyecto (por ejemplo `knowledge/…`): la skill solo funciona completa si el"
+    " directorio de trabajo es un proyecto que los tenga."
+)
+BAAS_PY = Path(__file__).resolve().parent.parent / "baas.py"  # el que se escribe en las órdenes `run-script`
+ADAPTER_VERSION = 1  # súbela al cambiar lo que escribe el adaptador: obliga a volver a adaptar las skills
+
+
+def python_command() -> str:
+    """El intérprete que se escribe delante de `baas.py` en las órdenes (el de Windows no se llama `python3`)."""
+    return "python" if os.name == "nt" else "python3"
+
+
+def org_note(org_slug: str, with_scripts: bool) -> str:
+    note = ORG_NOTE.format(org=org_slug)
+    return f"{note}\n>\n{SCRIPTS_NOTE}" if with_scripts else note
+
+
+def current_runner(target: NativeSkillTarget) -> skill_rewrite.RunnerCommand | None:
+    """Cómo se invoca hoy el ejecutor, o `None` si la ruta de `baas.py` no se puede escribir con seguridad."""
+    return skill_rewrite.safe_runner(python_command(), str(BAAS_PY), target.name)
+
+
+def adapt_fingerprint(
+    org_slug: str,
+    runner: skill_rewrite.RunnerCommand | None,
+    refs: list[str],
+    uses_runner: bool,
+    synced: frozenset[str],
+) -> str:
+    """Resume de qué depende el texto adaptado además del original: si cambia, hay que volver a adaptar la skill.
+
+    La ruta de `baas.py` solo cuenta si la skill llama a scripts, y de las skills citadas, solo las sincronizadas.
+    """
+    payload: list[Any] = [ADAPTER_VERSION, org_slug, sorted(r for r in refs if r in synced)]
+    if uses_runner:
+        payload.append([runner.python, runner.baas_py, runner.tool] if runner else None)
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -159,12 +208,15 @@ def _yaml_string(value: str) -> str:
     return text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").replace("\x85", "\\x85")
 
 
-def adapt_skill_md(text: str, name: str, org_slug: str) -> tuple[str, list[str]]:
+def adapt_skill_md(
+    text: str, name: str, org_slug: str, ctx: skill_rewrite.RewriteContext | None = None
+) -> tuple[str, list[str], skill_rewrite.RewriteReport | None]:
     """El `SKILL.md` con la cabecera de Antigravity (`name` y `description`), una nota con la organización y el cuerpo
     intacto.
 
-    Devuelve `(texto, campos de Claude Code que se han quitado)`. Lanza `PackageError` si no tiene una cabecera o una
-    `description` válidas y `NotAdaptable` si pide invocación solo manual.
+    Devuelve `(texto, campos de Claude Code que se han quitado, informe de la reescritura)`; con `ctx` se reescriben
+    las llamadas a scripts y los enlaces y citas a otras skills (`skill_rewrite`). Lanza `PackageError` si no tiene
+    una cabecera o una `description` válidas y `NotAdaptable` si pide invocación solo manual.
     """
     text = text.removeprefix("\ufeff")
     fm = skillmeta.parse_frontmatter(text)
@@ -187,10 +239,13 @@ def adapt_skill_md(text: str, name: str, org_slug: str) -> tuple[str, list[str]]
         description = f"{description} {when}"
     description = " ".join(description.split())
     _, body = skillmeta.split_frontmatter(text)
-    note = ORG_NOTE.format(org=org_slug)
+    report = None
+    if ctx is not None:
+        body, report = skill_rewrite.rewrite(body, ctx)
+    note = org_note(org_slug, with_scripts=bool(report and report.scripts))
     adapted = f"---\nname: {name}\ndescription: {_yaml_string(description)}\n---\n\n{note}\n\n{body}"
     dropped = [str(k) for k in data if k not in FRONTMATTER_KEPT]
-    return adapted, dropped
+    return adapted, dropped, report
 
 
 def _file_sha256(path: Path) -> str:
@@ -277,13 +332,17 @@ def read_control(root: Path, org_slug: str) -> dict[str, Any] | None:
     return data
 
 
-def write_control(root: Path, org: str, mcp_url: str, skills: dict[str, Any], warnings: list[str]) -> None:
+def write_control(
+    root: Path, org: str, mcp_url: str, skills: dict[str, Any], warnings: list[str], baas_py: str = ""
+) -> None:
     data = {
         "managed_by": MANAGED_BY,
         "format": CONTROL_FORMAT,
         "org": org,
         "server": mcp_url,
         "synced_at": sync.now_iso(),
+        "adapter": ADAPTER_VERSION,
+        "baas_py": baas_py,  # la ruta que llevan las órdenes `run-script` de los SKILL.md
         "skills": skills,
         "warnings": warnings,
     }
@@ -300,6 +359,8 @@ class NativeResult(sync.SyncResult):
     modified: dict[str, str] = field(default_factory=dict)  # skill gestionada editada por el usuario → qué
     excluded: dict[str, str] = field(default_factory=dict)  # skill que no se instala → por qué
     omitted: dict[str, list[dict[str, str]]] = field(default_factory=dict)  # skill → ficheros que no se copian
+    rewrites: dict[str, skill_rewrite.RewriteReport] = field(default_factory=dict)  # skill → qué se reescribió
+    runner_ok: bool = True  # ¿se pudo escribir la ruta de baas.py en las órdenes?
 
     def cmd(self, skill: str) -> str:
         """El nombre de la carpeta y del comando de la skill (`<organización>-<skill>`)."""
@@ -336,9 +397,32 @@ class NativeResult(sync.SyncResult):
         for name, files in sorted(self.omitted.items()):
             shown = ", ".join(f["path"] for f in files[:SHOWN_OMITTED])
             more = f" y {len(files) - SHOWN_OMITTED} más" if len(files) > SHOWN_OMITTED else ""
+            rewritten = len(self.rewrites[name].scripts) if name in self.rewrites else 0
+            tail = (
+                "se ejecutan solo con `baas.py run-script` (se comprueba su SHA-256 y no se guardan)."
+                if rewritten
+                else f"esta skill no funcionará completa en {self.tool.label}."
+            )
             lines.append(
                 f"AVISO: «{self.cmd(name)}»: no se copian {len(files)} fichero(s) ejecutables o scripts"
-                f" ({shown}{more}): esta skill no funcionará completa en {self.tool.label}."
+                f" ({shown}{more}): {tail}"
+            )
+        for name, report in sorted(self.rewrites.items()):
+            if report.unresolved:
+                lines.append(
+                    f"AVISO: «{self.cmd(name)}»: {report.unresolved} referencia(s) a `${{CLAUDE_SKILL_DIR}}` sin"
+                    f" reescribir (menciones sueltas, scripts que no están en el paquete…): {self.tool.label} no"
+                    " define esa variable."
+                )
+            if report.relative_scripts:
+                lines.append(
+                    f"AVISO: «{self.cmd(name)}»: {report.relative_scripts} llamada(s) a scripts con ruta relativa"
+                    " (`scripts/…`) sin reescribir: no se sabe a qué carpeta se refieren."
+                )
+        if not self.runner_ok and any(r.runner_candidates for r in self.rewrites.values()):
+            lines.append(
+                "AVISO: la ruta de baas.py tiene caracteres que un shell reinterpretaría (comillas, `$`, `%`…): las"
+                " llamadas a scripts no se reescriben. Mueve el plugin a una ruta sin ellos y repite el comando."
             )
         lines += [f"AVISO: {w}" for w in self.warnings]
         lines += self.notes
@@ -358,13 +442,28 @@ class NativeResult(sync.SyncResult):
 # --- sincronización ----------------------------------------------------------------------------------
 
 
-def _stage_skill(
-    client: Any, tmp_root: Path, org_slug: str, name: str, manifest: Manifest
-) -> tuple[Path, list[dict[str, str]], list[dict[str, str]], list[str]]:
-    """Descarga lo copiable de la skill a un temporal y la deja lista para renombrar.
+@dataclass
+class Staged:
+    """Una skill descargada y adaptada en un temporal, lista para renombrar."""
 
-    Devuelve `(carpeta, ficheros escritos con su SHA-256, ficheros omitidos con el motivo, campos quitados)`.
-    """
+    path: Path
+    files: list[dict[str, str]]  # lo escrito, con su SHA-256 (el `SKILL.md` ya adaptado)
+    omitted: list[dict[str, str]]  # lo que no se copia, con el motivo
+    dropped: list[str]  # campos de Claude Code quitados de la cabecera
+    report: skill_rewrite.RewriteReport
+    meta: dict[str, Any]  # lo que se anota en el control: hash del original, citas y huella de la adaptación
+
+
+def _stage_skill(
+    client: Any,
+    tmp_root: Path,
+    org_slug: str,
+    name: str,
+    manifest: Manifest,
+    synced: frozenset[str],
+    runner: skill_rewrite.RunnerCommand | None,
+) -> Staged:
+    """Descarga lo copiable de la skill a un temporal, la adapta y la deja lista para renombrar."""
     kept, omitted = [], []
     for f in manifest.files:
         reason = omission_reason(f.path, f.executable)
@@ -394,9 +493,25 @@ def _stage_skill(
         text = md_path.read_bytes().decode("utf-8")
     except UnicodeDecodeError:
         raise PackageError("el SKILL.md no es UTF-8.") from None
-    adapted, dropped = adapt_skill_md(text, folder, org_slug)
+    ctx = skill_rewrite.RewriteContext(
+        org=org_slug,
+        skill=name,
+        synced=synced,
+        scripts=frozenset(f.path for f in manifest.files),
+        runner=runner,
+        executable=frozenset(manifest.executable_paths()),
+    )
+    adapted, dropped, report = adapt_skill_md(text, folder, org_slug, ctx)
+    assert report is not None
     md_path.write_bytes(adapted.encode("utf-8"))
-    return staged, tree_records(staged), sorted(omitted, key=lambda o: o["path"]), dropped
+    uses_runner = report.runner_candidates > 0
+    meta = {
+        "original_sha256": skill_md.sha256,
+        "refs": report.refs,
+        "runner": uses_runner,
+        "adapt_fp": adapt_fingerprint(org_slug, runner, report.refs, uses_runner, synced),
+    }
+    return Staged(staged, tree_records(staged), sorted(omitted, key=lambda o: o["path"]), dropped, report, meta)
 
 
 def _managed_state(skills: dict[str, dict[str, Any]], name: str, plan: sync.SkillPlan, **extra: Any) -> None:
@@ -414,7 +529,8 @@ def sync_native(
     from .mcp_client import McpClient
 
     slug = sync.validate_slug(org.slug)  # entra en el nombre de una carpeta: solo minúsculas, dígitos y guiones
-    result = NativeResult(slug, root, dry_run=opts.dry_run, tool=target)
+    runner = current_runner(target)
+    result = NativeResult(slug, root, dry_run=opts.dry_run, tool=target, runner_ok=runner is not None)
     with sync._lock(baas, enabled=not opts.dry_run) as acquired:
         if not acquired:
             result.skipped = "Otra sincronización está en curso; no se hace nada. Vuelve a intentarlo en unos segundos."
@@ -447,6 +563,7 @@ def sync_native(
                     if problem:
                         result.excluded[name] = problem
                         del plans[name]
+                _refresh_stale(client, slug, plans, managed, runner, result)
             except McpToolError as exc:
                 if exc.code != sync.KILL_SWITCH:
                     raise
@@ -454,8 +571,42 @@ def sync_native(
                 result.failed.clear()
                 plans = {}
             client.timeout = opts.transfer_timeout
-            _apply(client, target, org, root, state, managed, plans, opts, result)
+            _apply(client, target, org, root, state, managed, plans, opts, result, runner)
     return result
+
+
+def _refresh_stale(
+    client: Any,
+    slug: str,
+    plans: dict[str, sync.SkillPlan],
+    managed: dict[str, dict[str, Any]],
+    runner: skill_rewrite.RunnerCommand | None,
+    result: NativeResult,
+) -> None:
+    """Una skill sin cambios en el servidor puede necesitar adaptarse de nuevo: se movió el plugin (ruta de `baas.py`),
+    se ha sincronizado otra skill que cita, cambió el adaptador o el control es de antes de esta adaptación. Se compara
+    la huella guardada con la de ahora y, si difiere, se pasa la skill a `update` (solo esa)."""
+    synced = frozenset(plans)
+    for name, plan in sorted(plans.items()):
+        if plan.action != "keep":
+            continue
+        entry = managed.get(name) or {}
+        refs = [r for r in entry.get("refs") or [] if isinstance(r, str)]
+        now = adapt_fingerprint(slug, runner, refs, bool(entry.get("runner")), synced)
+        if entry.get("adapt_fp") == now:
+            continue
+        try:
+            manifest = package_fetch.fetch_manifest(client, name)
+        except McpToolError as exc:
+            if exc.code not in sync.NOT_FOR_YOU:
+                raise
+            continue  # ya no se puede leer: se queda como está hasta que `resolve_plans` la retire
+        except PackageError as exc:
+            result.failed[name] = exc.message
+            continue
+        plans[name] = sync.SkillPlan(
+            name, "update", manifest.package_sha256, manifest, [d.name for d in manifest.dependencies]
+        )
 
 
 def _classify(
@@ -509,8 +660,10 @@ def _apply(
     plans: dict[str, sync.SkillPlan],
     opts: sync.SyncOptions,
     result: NativeResult,
+    runner: skill_rewrite.RunnerCommand | None,
 ) -> None:
     slug = org.slug
+    synced = frozenset(plans)
     to_install, to_retire = _classify(root, slug, managed, plans, opts, result)
     result.unchanged = sorted(
         n for n, p in plans.items() if p.action == "keep" and n not in result.failed and n not in result.modified
@@ -556,7 +709,7 @@ def _apply(
             plan = plans[name]
             assert plan.manifest is not None
             try:
-                staged, files, omitted, dropped = _stage_skill(client, tmp_root, slug, name, plan.manifest)
+                staged = _stage_skill(client, tmp_root, slug, name, plan.manifest, synced, runner)
             except NotAdaptable as exc:
                 result.excluded[name] = str(exc)
                 result.added = [n for n in result.added if n != name]
@@ -574,28 +727,35 @@ def _apply(
                 result.failed[name] = exc.message
                 continue
             folder = folder_name(slug, name)
-            sync.swap_dir(staged, root / folder, tmp_root / f"old-{folder}")
-            _managed_state(skills, name, plan, files=files, omitted=omitted)
-            if omitted:
-                result.omitted[name] = omitted
-            if dropped:
+            sync.swap_dir(staged.path, root / folder, tmp_root / f"old-{folder}")
+            _managed_state(skills, name, plan, files=staged.files, omitted=staged.omitted, **staged.meta)
+            result.rewrites[name] = staged.report
+            if staged.omitted:
+                result.omitted[name] = staged.omitted
+            if staged.report.scripts:
+                count = len(staged.report.scripts)
+                result.details[name] = result.details.get(name, "") + f", {count} llamada(s) a scripts → run-script"
+            if staged.dropped:
                 result.notes.append(
                     f"«{folder}»: se quitan del SKILL.md los campos de Claude Code que {target.label} no documenta:"
-                    f" {', '.join(dropped)}."
+                    f" {', '.join(staged.dropped)}."
                 )
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
         result.added = [n for n in result.added if n not in result.failed]
         result.updated = [n for n in result.updated if n not in result.failed]
         warnings = list(result.warnings)
+        baas_py = str(BAAS_PY)
         unchanged_state = state is not None and (
             state.get("org"),
             state.get("server"),
             state.get("skills"),
             state.get("warnings"),
-        ) == (org.slug, org.mcp_url, skills, warnings)
+            state.get("baas_py"),
+            state.get("adapter"),
+        ) == (org.slug, org.mcp_url, skills, warnings, baas_py, ADAPTER_VERSION)
         if (skills or state is not None) and not unchanged_state:  # un ciclo sin novedades no escribe nada
-            write_control(root, org.slug, org.mcp_url, skills, warnings)
+            write_control(root, org.slug, org.mcp_url, skills, warnings, baas_py)
 
 
 def _retire_managed(
