@@ -42,6 +42,7 @@ class ClientTarget:
     drop_keys: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()  # avisos de lo que esta conexión no cubre
     doc: str = "docs/antigravity.md"
+    skills_tool: str | None = None  # valor de `sync --tool` que deja las skills de la organización como nativas
     # Regla de proyecto con las instrucciones de `baas-brain`: el cuerpo es común (`templates/baas_rule.md`) y la
     # cabecera es del formato de cada herramienta. Sin `rule_path`, no se escribe regla.
     rule_path: tuple[str, ...] | None = None
@@ -59,6 +60,7 @@ ANTIGRAVITY = ClientTarget(
     label="Antigravity (extensión de VS Code y CLI `agy`)",
     config_path=(".agents", "mcp_config.json"),
     global_config_path=(".gemini", "config", "mcp_config.json"),
+    skills_tool="antigravity",
     url_key="serverUrl",
     drop_keys=("url", "httpUrl", "command", "args", "env", "cwd"),
     rule_path=(".agents", "rules", "baas.md"),
@@ -336,6 +338,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         *(f"AVISO: {note}" for note in target.notes),
         f"Guía de uso y comprobación: {target.doc}",
     )
+    if target.skills_tool:
+        baas_py = Path(__file__).resolve().parent.parent / "baas.py"
+        _p(
+            "Para traer también las skills de la organización como skills nativas (sin sus scripts):"
+            f" python3 {baas_py} sync --tool {target.skills_tool}"
+        )
     return 0
 
 

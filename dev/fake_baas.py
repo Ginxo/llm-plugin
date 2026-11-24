@@ -539,7 +539,7 @@ def make_handler(state: FakeBaas) -> type[BaseHTTPRequestHandler]:
                     continue
                 if state.list_filter is not None and name not in state.list_filter:
                     continue
-                skill_md_file = pkg.files["SKILL.md"]
+                skill_md_file = pkg.files.get("SKILL.md")  # un paquete de prueba puede no tenerlo
                 scripts = [
                     {"name": p.removeprefix("scripts/"), "path": f"skills/{name}/{p}", "sha256": f.sha256,
                      "size": len(f.content)}
@@ -553,7 +553,7 @@ def make_handler(state: FakeBaas) -> type[BaseHTTPRequestHandler]:
                         "description": "Skill de ejemplo",
                         "path": f"skills/{name}/SKILL.md",
                         "roles": pkg.roles,
-                        "sha256": skill_md_file.sha256,
+                        "sha256": skill_md_file.sha256 if skill_md_file else "",
                         "scripts": scripts,
                         "package_sha256": pkg.package_sha256,
                         "status": pkg.status,

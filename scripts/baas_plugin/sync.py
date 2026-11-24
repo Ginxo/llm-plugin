@@ -714,6 +714,10 @@ def claude_paths(args: argparse.Namespace) -> ClaudePaths:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    if getattr(args, "tool", "claude") != "claude":
+        from .native_skills import cmd_sync_native  # import diferido: es de otras herramientas (T19, #192)
+
+        return cmd_sync_native(args)
     baas = BaasPaths.default()
     creds = load_credentials(baas)
     proj = project.resolve_project_dir(args.project or os.environ.get("CLAUDE_PROJECT_DIR"), cwd=Path.cwd())
@@ -763,5 +767,15 @@ def add_sync_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore[ty
         "--timeout", type=float, default=15.0, help="Segundos máximos de espera del MCP antes de renunciar (15)"
     )
     p.add_argument("--trigger", default="manual", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--tool",
+        choices=("claude", "antigravity"),
+        default="claude",
+        help="Dónde dejar las skills: `claude` (por omisión, el plugin de Claude Code del proyecto vinculado) o"
+        " `antigravity` (skills nativas en ~/.gemini/config/skills/, para la CLI `agy` y la extensión)",
+    )
+    p.add_argument(
+        "--org", help="Con `--tool antigravity`: slug de la organización (obligatorio si perteneces a varias)"
+    )
     add_claude_home_args(p)
     p.set_defaults(func=cmd_sync)
