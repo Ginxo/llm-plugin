@@ -1,4 +1,4 @@
-"""Grupo «ner» (pasos 15.1–15.7) de `dev/e2e_h4.py`: L2 (NER) de la Fase 2 contra la pila real con el proveedor de eco.
+"""Grupo «ner» (pasos 15.1–15.8) de `dev/e2e_h4.py`: L2 (NER) de la Fase 2 contra la pila real con el proveedor de eco.
 
 Un paso por criterio de aceptación del diseño (`fase-2-ner-diseno.md`, §8) y del contrato (`contratos-fase-1.md`, §5.2,
 §6 y §7.2) que se pueden probar de punta a punta:
@@ -18,6 +18,9 @@ Un paso por criterio de aceptación del diseño (`fase-2-ner-diseno.md`, §8) y 
         `observed_detections` llega en `turn.completed` y el estado del turno no cambia (criterio 8).
   15.7  la prueba en vivo devuelve coincidencias de NER con su capa y `ALLOWLISTED` con un término de la *allowlist*
         (criterio 9).
+  15.8  W8 (#71): un valor que el NER observó se añade a la *allowlist* de la organización (el mismo `POST` que el
+        botón «Añadir a la allowlist» del detalle del turno) y el turno siguiente, en otra conversación, ya no lo
+        observa; los demás valores sí.
 
 Cada paso crea su organización (`ner-<ejecución>-<paso>`, con un usuario de la semilla de desarrollo como miembro) y la
 elimina al terminar, así que el grupo no depende de los datos de la semilla. Los pasos 15.4 y 15.5 miran o paran
@@ -234,6 +237,18 @@ def observed_problems(observed: Any, expected: Sequence[tuple[str, str]]) -> lis
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             problems.append(f"{label}: count {count!r} (se esperaba un entero ≥ 1)")
     return problems
+
+
+def allowlisted_problems(observed: Any, term: str) -> list[str]:
+    """15.8: `term`, ya en la *allowlist*, no puede estar entre lo observado (sin distinguir mayúsculas)."""
+    if not isinstance(observed, list):
+        return []
+    wanted = term.casefold()
+    return [
+        f"«{d.get('original_value')}» ({d.get('token_type')}) está en la allowlist y se sigue observando"
+        for d in observed
+        if isinstance(d, dict) and str(d.get("original_value", "")).casefold() == wanted
+    ]
 
 
 def hidden_problems(observed: Any) -> list[str]:
@@ -865,6 +880,36 @@ class NerGroup:
             "la allowlist, ALLOWLISTED sin token y el resto sigue REPLACED · al quitarlo, vuelve a REPLACED"
         )
 
+    # --- 15.8 añadir desde W8 a la allowlist ----------------------------------------------------------------
+    def observed_allowlist(self) -> str:
+        term = VALUES["ORG"]
+        api = self.main_api()
+        with self.org("w8") as org:
+            model = self.model(f"w8-antes-{api}")
+            self.sent_ok(org, api, model, case_text(TEXT_1, api))
+            problems = observed_problems(self.turn(org, model, 1).get("observed_detections"), OBSERVED_1)
+            check(not problems, "antes de añadir el término:\n" + "\n".join(problems))
+            res = self.e.admin_post(f"/api/v1/orgs/{org.slug}/ai-ip/allowlist", {"term": term})
+            check(res.status == 201, f"añadir «{term}» a la allowlist → {describe(res)}")
+            term_id = ((res.json() or {}).get("term") or {}).get("id")
+            check(term_id, "la allowlist no devolvió el id del término")
+            try:
+                self.settle()
+                # Otra conversación: ni la caché de la anterior ni sus valores conocidos intervienen
+                model = self.model(f"w8-despues-{api}")
+                self.sent_ok(org, api, model, case_text(TEXT_1, api))
+                observed = self.turn(org, model, 1).get("observed_detections")
+                problems = allowlisted_problems(observed, term)
+                problems += observed_problems(observed, [o for o in OBSERVED_1 if o[1] != term])
+                check(not problems, f"con «{term}» en la allowlist:\n" + "\n".join(problems))
+            finally:
+                res = self.e.webapp("DELETE", f"/api/v1/orgs/{org.slug}/ai-ip/allowlist/{term_id}", self.admin)
+                check(res.status == 200, f"quitar el término de la allowlist → {describe(res)}")
+        return (
+            f"{h3.API_NAMES[api]}: «{term}» observado → añadido a la allowlist de la organización → el turno "
+            "siguiente observa solo la persona y la dirección"
+        )
+
     # --- el recorrido ----------------------------------------------------------------------------------
     def register(self, runner: Runner, base: list[str]) -> None:
         step = runner.step
@@ -882,6 +927,8 @@ class NerGroup:
         step("15.6 observación (NER apagado, en OBSERVE y anonimizador apagado): observed_detections y mismo estado",
              self.observe, needs=base)  # fmt: skip
         step("15.7 la prueba en vivo devuelve coincidencias de NER y ALLOWLISTED", self.live_test, needs=base)
+        step("15.8 añadir desde W8 a la allowlist un valor observado: el turno siguiente ya no lo observa",
+             self.observed_allowlist, needs=base)  # fmt: skip
 
 
 def org_of(res: Http) -> dict[str, Any]:
