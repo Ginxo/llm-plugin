@@ -128,6 +128,7 @@ class _Rewriter:
         self.report = RewriteReport()
         self._refs: set[str] = set()
         self._last_prose = ""
+        self._hint_indent: int | None = None  # sangría de la línea con la pista: sus sub-elementos la heredan
         self._block_hint = False
         self._block_cwd = False
 
@@ -247,7 +248,7 @@ class _Rewriter:
         self.report.citations += 1
         return f"/{self.ctx.org}-{name}"
 
-    def prose_line(self, line: str) -> str:
+    def prose_line(self, line: str, hint: bool = False) -> str:
         spans = [(m.start(), m.end(), m.start("body"), m.end("body")) for m in _CODE_SPAN.finditer(line)]
         edits: list[tuple[int, int, str]] = []
         for _start, _end, body_start, body_end in spans:
@@ -277,14 +278,14 @@ class _Rewriter:
                 edits.append((d.start("target"), d.end("target"), new_target))
         for start, end, text in sorted(edits, reverse=True):
             line = line[:start] + text + line[end:]
-        return self._folder_in_prose(line)
+        return self._folder_in_prose(line, hint)
 
-    def _folder_in_prose(self, line: str) -> str:
+    def _folder_in_prose(self, line: str, inherited: bool = False) -> str:
         """La carpeta de la skill en una línea de texto: dentro de los fragmentos de código se trata como un comando
         (llamadas y comillas); fuera de ellos, un simple reemplazo."""
         if "CLAUDE_SKILL_DIR" not in line and not _RELATIVE_ANY.search(line):
             return line
-        hint = bool(_HINT.search(line))
+        hint = inherited or bool(_HINT.search(line))
         out: list[str] = []
         last = 0
         for m in _CODE_SPAN.finditer(line):
@@ -317,17 +318,30 @@ class _Rewriter:
             opened = _FENCE_OPEN.match(line)
             if opened and not (opened.group("fence")[0] == "`" and "`" in opened.group("info")):
                 fence = (opened.group("fence")[0], len(opened.group("fence")))
-                self._block_hint = bool(_HINT.search(self._last_prose))
+                nested = self._hint_indent is not None and self._indent(line) > self._hint_indent
+                self._block_hint = bool(_HINT.search(self._last_prose)) or nested
                 self._block_cwd = False
                 out.append(line)
                 continue
+            inherited = False
             if line.strip():
                 self._last_prose = line
-            out.append(self.prose_line(line))
+                indent = self._indent(line)
+                if _HINT.search(line):
+                    self._hint_indent = indent
+                elif self._hint_indent is not None and indent > self._hint_indent:
+                    inherited = True  # un sub-elemento de la línea con la pista
+                else:
+                    self._hint_indent = None
+            out.append(self.prose_line(line, inherited))
         result = "\n".join(out)
         self.report.unresolved = len(_VAR_RE.findall(result))
         self.report.refs = sorted(self._refs)
         return result
+
+    @staticmethod
+    def _indent(line: str) -> int:
+        return len(line) - len(line.lstrip(" \t"))
 
     @staticmethod
     def _cwd_after(line: str, current: bool) -> bool:

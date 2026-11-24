@@ -417,3 +417,67 @@ def test_a_document_without_anything_to_rewrite_is_returned_unchanged() -> None:
     out, report = rewrite(src, ctx())
     assert out == src
     assert (report.calls, report.links, report.citations, report.unresolved) == ([], 0, 0, 0)
+
+
+# --- la pista en un elemento de lista y sus sub-elementos (estructura real de `contador`) ----------------------
+
+
+LIST = (
+    "1. Lee el estado.\n"
+    "2. Ejecuta el script desde la carpeta de la skill:\n"
+    "   - Sin argumento: `python3 scripts/gestor-facturas.py`\n"
+    "   - Con `suma`: `python3 scripts/gestor-facturas.py suma`\n"
+    "3. Otra cosa: `python3 scripts/gestor-facturas.py x`\n"
+)
+
+
+def test_the_sub_items_of_a_list_item_with_the_hint_inherit_it_but_not_the_next_item() -> None:
+    out, report = rewrite(LIST, ctx())
+    assert out == (
+        "1. Lee el estado.\n"
+        "2. Ejecuta el script desde la carpeta de la skill:\n"
+        f'   - Sin argumento: `python3 "{DIR}/scripts/gestor-facturas.py"`\n'
+        f'   - Con `suma`: `python3 "{DIR}/scripts/gestor-facturas.py" suma`\n'
+        "3. Otra cosa: `python3 scripts/gestor-facturas.py x`\n"
+    )
+    assert len(report.calls) == 2
+    assert report.relative_scripts == 1, "el elemento 3 no dice desde dónde"
+
+
+def test_a_loose_list_with_blank_lines_keeps_the_scope_of_the_hint() -> None:
+    src = (
+        "2. Ejecuta el script desde la carpeta de la skill:\n\n"
+        "   - A: `python3 scripts/gestor-facturas.py a`\n\n"
+        "   - B: `python3 scripts/gestor-facturas.py b`\n\n"
+        "Otro párrafo: `python3 scripts/gestor-facturas.py c`\n"
+    )
+    out, _ = rewrite(src, ctx())
+    assert f'`python3 "{DIR}/scripts/gestor-facturas.py" a`' in out
+    assert f'`python3 "{DIR}/scripts/gestor-facturas.py" b`' in out
+    assert "`python3 scripts/gestor-facturas.py c`" in out, "un párrafo sin sangría ya no es un sub-elemento"
+
+
+def test_the_scope_of_the_hint_ends_when_the_list_goes_back_to_its_level() -> None:
+    src = (
+        "2. Ejecuta el script desde la carpeta de la skill:\n"
+        "3. Siguiente paso\n"
+        "   - `python3 scripts/gestor-facturas.py x`\n"
+    )
+    out, _ = rewrite(src, ctx())
+    assert out == src
+
+
+def test_a_nested_code_block_inside_the_list_item_inherits_the_hint() -> None:
+    src = (
+        "2. Ejecuta el script desde la carpeta de la skill:\n\n"
+        "   ```bash\n"
+        "   python3 scripts/gestor-facturas.py a\n"
+        "   ```\n"
+        "3. Otro paso:\n\n"
+        "   ```bash\n"
+        "   python3 scripts/gestor-facturas.py b\n"
+        "   ```\n"
+    )
+    out, _ = rewrite(src, ctx())
+    assert f'   python3 "{DIR}/scripts/gestor-facturas.py" a' in out
+    assert "   python3 scripts/gestor-facturas.py b" in out
