@@ -544,8 +544,15 @@ def _apply(
         shutil.rmtree(tmp_root, ignore_errors=True)
         result.added = [n for n in result.added if n not in result.failed]
         result.updated = [n for n in result.updated if n not in result.failed]
-        if skills or state is not None:
-            write_control(root, org.slug, org.mcp_url, skills, list(result.warnings))
+        warnings = list(result.warnings)
+        unchanged_state = state is not None and (
+            state.get("org"),
+            state.get("server"),
+            state.get("skills"),
+            state.get("warnings"),
+        ) == (org.slug, org.mcp_url, skills, warnings)
+        if (skills or state is not None) and not unchanged_state:  # un ciclo sin novedades no escribe nada
+            write_control(root, org.slug, org.mcp_url, skills, warnings)
 
 
 def _retire_managed(root: Path, name: str, entry: dict[str, Any], opts: sync.SyncOptions, result: NativeResult) -> bool:

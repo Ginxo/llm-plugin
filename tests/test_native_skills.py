@@ -646,3 +646,17 @@ def test_a_managed_skill_replaced_by_a_symlink_is_not_followed_or_replaced(env: 
     assert "enlace simbólico" in out
     assert (env.root / "facturacion").is_symlink()
     assert env.tree(moved) == before
+
+
+def test_an_unchanged_sync_rewrites_nothing_not_even_the_control_file(env: Env, monkeypatch) -> None:
+    env.publish()
+    ticks = iter(f"2026-01-01T00:00:{n:02d}Z" for n in range(60))
+    monkeypatch.setattr("baas_plugin.sync.now_iso", lambda: next(ticks))  # cada llamada, un instante distinto
+    assert env.run()[0] == 0
+    before = env.tree()
+    control = env.root / CONTROL
+    stamp = (control.stat().st_ino, control.stat().st_mtime_ns)
+    code, out = env.run()
+    assert code == 0, out
+    assert env.tree() == before
+    assert (control.stat().st_ino, control.stat().st_mtime_ns) == stamp, "un ciclo sin novedades no escribe"
