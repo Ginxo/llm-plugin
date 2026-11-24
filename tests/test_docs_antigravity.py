@@ -80,9 +80,8 @@ def test_the_doc_explains_the_native_skills_command_and_its_limits() -> None:
     assert "--dry-run" in commands
     for needle in (
         "~/.gemini/config/skills/",
-        ".baas-skills.json",
         "/skills reload",
-        "sin sus scripts",
+        "run-script",
         "disable-model-invocation",
         "prefijo obligatorio",
         "<slug>-<skill>",
@@ -118,3 +117,22 @@ def test_the_doc_states_the_multi_organization_limitation_and_recommends_an_opti
         "Recomendada",
     ):
         assert needle in doc, needle
+
+
+def test_the_doc_explains_the_script_rewrite_its_limits_and_what_the_user_must_check() -> None:
+    doc = text()
+    commands = "\n".join(blocks("bash"))
+    assert "run-script --tool antigravity --synced-org" in commands
+    for needle in (
+        "${CLAUDE_SKILL_DIR}",
+        "--synced-org",
+        "sin reescribir",
+        "knowledge/",
+        "carpeta de trabajo",
+        "ruta de `baas.py`",
+        "solo funciona completa",
+        "no se amplía",
+        "dicta",
+    ):
+        assert needle in doc, needle
+    assert "proyecto de cerebro" in doc, "la lista manual dice qué probar con `gestor`"

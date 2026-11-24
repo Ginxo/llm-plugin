@@ -103,8 +103,9 @@ enseña al agente las tools `baas_*` y a **detenerse** ante `AUTHORIZATION_DENIE
 mismo contenido por otra vía. La regla es **de proyecto** también con el MCP global: Antigravity la lee en cada
 proyecto donde exista (comprobado con la extensión), así que ejecuta `setup` una vez por proyecto. Ocupa unos 5 KB;
 Antigravity admite 24 000 bytes por regla y trunca lo que pase. No usa `AGENTS.md` ni `GEMINI.md` para no pisar los
-tuyos. Tampoco explica `/baas-sync` ni el ejecutor de scripts, que son de Claude Code: la regla le dice al agente que
-**no ejecute** los scripts de las skills de la organización.
+tuyos. Tampoco explica `/baas-sync`, que es de Claude Code. Sí explica el ejecutor de scripts: los scripts de las
+skills se ejecutan **solo** con `baas.py run-script` (que comprueba el SHA-256), nunca copiándolos a disco ni
+ejecutando a mano el contenido de `baas_get_script` (ver «Scripts, enlaces y citas del `SKILL.md`»).
 
 ## 3. Extensión de VS Code
 
@@ -144,12 +145,63 @@ Después, en `agy`, ejecuta `/skills reload` (o abre una conversación nueva); l
 | Qué | Cómo |
 | :--- | :--- |
 | **Qué se copia** | Lo mismo que `/baas-sync` de Claude Code: las skills de `baas_list_skills` (tus roles) y, de forma transitiva, las que dependen de ellas **si tienes acceso**. Se verifica el **SHA-256** de cada fichero, se rechazan las rutas que salgan de la carpeta de la skill y nunca se crean enlaces simbólicos; cada skill se escribe en un temporal y se renombra (si falla, queda la versión anterior). Carpetas 0700 y ficheros 0600 |
-| **Nombre del comando** | `<organización>-<skill>` (el *slug* de la organización: `<slug>-<skill>`, p. ej. `enrique-mingorance-cano-gestor`), con el **prefijo obligatorio**: un usuario puede tener skills con el mismo nombre (`gestor`) en varias organizaciones, como pasa con `/<org>:<skill>` en Claude Code, y todas conviven en la misma carpeta. La carpeta, el `name` del `SKILL.md` y el comando son ese mismo nombre. **No es `<org>:<skill>`**: la documentación de Antigravity solo dice que `name` va en minúsculas y con guiones (no menciona `:` ni prefijos) y Windows no admite `:` en una carpeta. Solo minúsculas, dígitos y guiones en la skill: el resto (`Mi_Skill`, `a.b`) **no se instala** y el comando lo lista. Con el prefijo ya no hay choques con comandos de la CLI (`/mcp`, `/skills`) ni con nombres reservados de Windows. Efecto secundario: los enlaces relativos entre skills (`../gestor/SKILL.md`) y las citas `/gestor` del texto **no se reescriben** y apuntan al nombre sin prefijo |
-| **Sin sus scripts** | **No se copia nada ejecutable**: ficheros marcados como ejecutables, carpetas `scripts/`, código y binarios por extensión (`.py`, `.sh`, `.js`, `.bat`, `.exe`…) y todo lo que empiece por `#!`. Plantillas, referencias y demás ficheros de texto o datos sí. El comando lista lo omitido y avisa de que esa skill **no funcionará completa**. Motivo: un script en disco lo ejecutaría el agente sin la comprobación del SHA-256 que hace `run-script` al ejecutarlo y seguiría ahí tras una revocación |
-| **`SKILL.md` adaptado** | Antigravity documenta `description` (obligatoria) y `name`: se escriben solo esos dos (`when_to_use` se une a la descripción) y el cuerpo queda tal cual, **precedido de una nota** que dice a qué organización pertenece la skill, que sus tools `baas_*` son las del MCP configurado y que, si `baas_whoami` no devuelve esa organización, el agente debe detenerse (ver «Varias organizaciones, un solo MCP»). Los campos propios de Claude Code (`allowed-tools`, `hooks`, `argument-hint`…) se quitan y se avisa. Sin `description` no se instala. Una skill con `disable-model-invocation` (solo invocación manual) **no se instala**: Antigravity no puede respetarlo y el agente la usaría por su cuenta. Las referencias propias de Claude Code en el texto (`${CLAUDE_SKILL_DIR}`, `/<organización>:<skill>`) no se reescriben |
+| **Nombre del comando** | `<organización>-<skill>` (el *slug* de la organización: `<slug>-<skill>`, p. ej. `enrique-mingorance-cano-gestor`), con el **prefijo obligatorio**: un usuario puede tener skills con el mismo nombre (`gestor`) en varias organizaciones, como pasa con `/<org>:<skill>` en Claude Code, y todas conviven en la misma carpeta. La carpeta, el `name` del `SKILL.md` y el comando son ese mismo nombre. **No es `<org>:<skill>`**: la documentación de Antigravity solo dice que `name` va en minúsculas y con guiones (no menciona `:` ni prefijos) y Windows no admite `:` en una carpeta. Solo minúsculas, dígitos y guiones en la skill: el resto (`Mi_Skill`, `a.b`) **no se instala** y el comando lo lista. Con el prefijo ya no hay choques con comandos de la CLI (`/mcp`, `/skills`) ni con nombres reservados de Windows. Los enlaces y las citas a otras skills de la misma organización se reescriben al nombre con prefijo (ver «Scripts, enlaces y citas del `SKILL.md`») |
+| **Scripts: no en disco, sí con `run-script`** | **No se copia ni se descarga nada ejecutable en el `sync`**: ficheros marcados como ejecutables, carpetas `scripts/`, código y binarios por extensión (`.py`, `.sh`, `.js`, `.bat`, `.exe`…) y todo lo que empiece por `#!`. Plantillas, referencias y demás ficheros de texto o datos sí. El comando lista lo omitido. Las llamadas del `SKILL.md` a esos scripts se **reescriben** para usar `baas.py run-script` (ver «Scripts, enlaces y citas»); si alguna no se pudo reescribir, el comando lo cuenta y esa parte de la skill **no funcionará**. Motivo: un script en disco lo ejecutaría el agente sin la comprobación del SHA-256 y seguiría ahí tras una revocación |
+| **`SKILL.md` adaptado** | Antigravity documenta `description` (obligatoria) y `name`: se escriben solo esos dos (`when_to_use` se une a la descripción) y el cuerpo queda tal cual, **precedido de una nota** que dice a qué organización pertenece la skill, que sus tools `baas_*` son las del MCP configurado y que, si `baas_whoami` no devuelve esa organización, el agente debe detenerse (ver «Varias organizaciones, un solo MCP»). Si la skill llama a scripts, la nota añade que se ejecutan **solo** con `baas.py run-script` (las órdenes ya vienen así) y que algunos leen ficheros locales del proyecto. Los campos propios de Claude Code (`allowed-tools`, `hooks`, `argument-hint`…) se quitan y se avisa. Sin `description` no se instala. Una skill con `disable-model-invocation` (solo invocación manual) **no se instala**: Antigravity no puede respetarlo y el agente la usaría por su cuenta. El resto del cuerpo se reescribe solo en lo que se reconoce con certeza (ver «Scripts, enlaces y citas del `SKILL.md`») |
 | **No pisa lo tuyo** | Lo que gestiona cada organización queda en `~/.gemini/config/skills/.baas-skills-<organización>.json` (`package_sha256` y SHA-256 de lo escrito; sin secretos). Una carpeta con el nombre de una skill que no figura en el fichero de **esa** organización es ajena: se deja como está y el comando lo cuenta («no la toco»). Es el caso de una tuya, y también el de una carpeta de otra organización cuando los nombres se solapan (`demo` + `x-y` y `demo-x` + `y` dan la misma `demo-x-y`). Una skill gestionada que **editaste** (o a la que añadiste ficheros o enlaces) tampoco se sobrescribe ni se retira, salvo con `--force`; una ajena, nunca |
 | **Retirada** | Quitar un rol, retirar la skill o activar el kill switch (o bloquear o pausar esa organización) la borra en la siguiente sincronización **de esa organización**, solo si es de las que gestiona. Sincronizar una organización no toca las skills ni el fichero de control de otra |
 | **Organización** | `--org <slug>` (una por ejecución: repite el comando para cada una), si no la del `baas` del `mcp_config.json` global, si no la del proyecto vinculado con `/baas-init`, si no la única; con varias, error 3 |
+
+### Scripts, enlaces y citas del `SKILL.md`
+
+Un `SKILL.md` de la organización está escrito para Claude Code: llama a sus scripts con
+`python3 "${CLAUDE_SKILL_DIR}/scripts/x.py" args…` (variable que Antigravity no define, y el script no está en disco) y
+enlaza o cita a otras skills por su nombre (`../facturacion/SKILL.md`, `/gestor`). El `sync` lo reescribe de forma
+**determinista y conservadora**: solo lo que reconoce con certeza; lo demás queda tal cual y el comando lo cuenta por skill.
+
+```bash
+python3 "<ruta del plugin>/scripts/baas.py" run-script --tool antigravity --synced-org <organización> skills/<skill>/scripts/<script> -- <argumentos>
+```
+
+| Se reescribe | A qué |
+| :--- | :--- |
+| `python3`, `python`, `bash`, `sh` o `node` + `"${CLAUDE_SKILL_DIR}/scripts/x"` (con o sin comillas, con `$CLAUDE_SKILL_DIR`), en un bloque de código o en un fragmento de código en línea, también tras `&&`, `;` o `\|`; y la llamada directa `"${CLAUDE_SKILL_DIR}/scripts/x.sh" args` | `python3 "<baas.py>" run-script --tool antigravity --synced-org <org> skills/<skill>/scripts/x -- args…`. Los **argumentos originales quedan como texto**, sin reinterpretar. El intérprete debe corresponder a la extensión (`python3` con `.py`, `bash`/`sh` con `.sh`, `node` con `.js`) y el script debe existir en el paquete |
+| Enlaces markdown `../<skill>/…` a otras skills **sincronizadas de la misma organización** | `../<org>-<skill>/…` (se conserva el resto y el `#fragmento`) |
+| Citas `` `/<skill>` `` (el fragmento de código es exactamente eso) o `[/<skill>](…)`, solo si es una skill sincronizada | `/<org>-<skill>` |
+
+| Se deja **intacto** (y se cuenta en la salida) | Por qué |
+| :--- | :--- |
+| Una mención suelta `${CLAUDE_SKILL_DIR}/scripts/x.py` en prosa, un título o un fragmento de código sin argumentos | No es una orden |
+| `python3 -u "…"`, `FOO=1 python3 "…"`, comillas simples, un script que no está en el paquete, un intérprete que no corresponde, una ruta con `..`, espacios o `$` | No se sabe con certeza qué ejecuta |
+| `python3 scripts/x.py` (ruta relativa) | No se sabe a qué carpeta se refiere |
+| `${CLAUDE_SKILL_DIR}/templates/…` y otras rutas que no son un script | Antigravity no define la variable: se avisa («referencias a `${CLAUDE_SKILL_DIR}` sin reescribir»); la skill sigue teniendo esos ficheros en su carpeta, pero la orden no los encuentra sola |
+| Enlaces a ficheros del cerebro (`../../../knowledge/…`) | Son **locales**: apuntan a un proyecto que tenga ese cerebro, no a la carpeta de la skill |
+| Enlaces y citas dentro de bloques de código, citas `/gestor` en prosa suelta, citas de skills que no están sincronizadas | Podrían ser ejemplos ajenos o rutas |
+
+**`run-script --tool antigravity --synced-org <org>`** no necesita un proyecto vinculado con `/baas-init`. El MCP sale
+del fichero de control que escribió `sync` para esa organización (`.baas-skills-<org>.json`), nunca de un argumento
+(una URL elegida por quien escribe un `SKILL.md` podría llevarse la clave), y solo vale para las skills **sincronizadas**
+de esa organización; `--org` no se combina con él. Después es el ejecutor de siempre: descarga el paquete de la skill,
+**verifica el SHA-256 de cada fichero**, lo escribe en una carpeta temporal privada, ejecuta el script **sin la clave en
+su entorno**, devuelve su código de salida y lo borra siempre. El script corre en el **directorio de trabajo actual**.
+
+- **Qué necesitan los scripts.** Algunos leen y escriben ficheros locales (por ejemplo `knowledge/fiscal/…` en
+  `gestor` y `facturacion`): la skill **solo funciona completa** en un proyecto que tenga ese cerebro como carpeta de
+  trabajo (abre el proyecto de cerebro en VS Code o lanza `agy` desde él). No se asumen rutas.
+- **Si mueves el plugin.** La ruta de `baas.py` queda escrita en cada `SKILL.md` que llama a scripts y en el fichero de
+  control (`baas_py`). Si el plugin cambia de sitio (una actualización de Claude Code, por ejemplo), esas órdenes dejan
+  de funcionar hasta que repitas `sync --tool antigravity`: lo detecta como cambio y vuelve a adaptar **solo esas**
+  skills. Lo mismo ocurre si se sincroniza una skill que otra cita (su enlace pasa a tener prefijo).
+- **Windows.** El intérprete que se escribe es `python` (no `python3`) y la ruta de `baas.py` va entre comillas dobles,
+  con espacios y paréntesis. Una ruta con caracteres que un shell reinterpretaría (`"`, `$`, `` ` ``, `%`, `!`, y `\` en
+  POSIX) **no se reescribe**: el comando lo avisa y hay que mover el plugin.
+- **Seguridad.** Un `SKILL.md` remoto dicta órdenes al agente, y eso ya era así sin esta reescritura: el agente lee el
+  texto de la skill y ejecuta lo que dice (con el permiso de Antigravity para ejecutar comandos). La superficie
+  **no se amplía**: cada pieza de la orden generada se valida (nombres con la misma expresión que las carpetas, `scripts/…`
+  con una lista corta de caracteres y sin `.`/`..`, y que el script exista en el paquete), `run-script` solo ejecuta
+  scripts del paquete de skills sincronizadas, verificados por hash, y no se copia ningún script a disco. No impide que
+  una skill maliciosa pida otra cosa (`curl | bash`): la confianza está en quien administra la organización y en la
+  confirmación de órdenes de Antigravity, que conviene mantener activa.
 
 ### Varias organizaciones, un solo MCP (limitación conocida)
 
@@ -198,9 +250,10 @@ La documentación de Antigravity **no admite `${VAR}`** en las cabeceras ni un c
 - **Varias organizaciones a la vez con el MCP**: las skills sí conviven, pero el global solo admite un MCP `baas` (apartado 5, «Varias organizaciones, un solo MCP»).
 - **Las skills de la organización como comandos del MCP.** El servidor `baas` las expone como *prompts* del MCP
   (`/mcp__baas__<skill>` en Claude Code) y la documentación de Antigravity no dice que los muestre: por eso se copian
-  como skills nativas (apartado 5), **sin sus scripts** y sin actualización automática. Mientras no estén copiadas, el
+  como skills nativas (apartado 5), con los scripts ejecutándose por `run-script` y sin actualización automática. Mientras no estén copiadas, el
   agente las consulta con `baas_list_skills` y `baas_get_skill`.
-- **El ejecutor de scripts** (`run-script`), `/baas-sync` y los *hooks* de sincronización desde Antigravity.
+- **`/baas-sync` y los *hooks* de sincronización** desde Antigravity: el `sync` es manual.
+- **Lo no reescrito** del `SKILL.md` (tabla del apartado 5): `${CLAUDE_SKILL_DIR}` fuera de las llamadas a scripts (plantillas), rutas relativas `scripts/…` y citas `/gestor` en prosa suelta.
 - Windows y macOS: los probará T6 (#168), no esta guía.
 
 ## 8. Solución de problemas
@@ -216,6 +269,9 @@ La documentación de Antigravity **no admite `${VAR}`** en las cabeceras ni un c
 | `baas` no aparece | Recarga la ventana o reinicia `agy` desde la carpeta del proyecto; comprueba que el JSON es válido |
 | Falla con 401 | La clave del fichero está revocada: renuévala y repite `setup antigravity` |
 | `KILL_SWITCH_ACTIVE` o 403 | La plataforma está detenida o tu organización bloqueada o pausada: habla con tu administrador |
+| `run-script`: «no figura entre las skills sincronizadas» o «no hay skills… sincronizadas» | Repite `sync --tool antigravity --org <organización>`: el ejecutor solo ejecuta scripts de skills sincronizadas de esa organización |
+| La orden de una skill falla porque no encuentra `baas.py` | Se movió el plugin: repite `sync --tool antigravity` (actualiza solo las skills con scripts) |
+| El script dice que no encuentra `knowledge/…` | La skill necesita el cerebro como carpeta de trabajo: abre ese proyecto (o lanza `agy` desde él) |
 | El agente no conoce las tools `baas_*` | Falta `.agents/rules/baas.md` en ese proyecto o ya existía uno que no es de BaaS (el comando avisa): renómbralo y repite |
 
 ## 9. Lo que se comprobó
@@ -241,8 +297,9 @@ Marca lo que compruebes (lo de Linux ya está hecho el 2026-11-23; falta Windows
 - [ ] **Extensión**: `baas` aparece conectado tras recargar; «Llama a `baas_whoami`» devuelve tu usuario y organización.
 - [ ] **CLI**: `/mcp` muestra `baas` conectado; el mismo `baas_whoami` responde.
 - [ ] `sync --tool antigravity --dry-run` lista las skills y no escribe nada (ni crea `~/.gemini/config/skills/`).
-- [ ] `sync --tool antigravity` crea `~/.gemini/config/skills/<skill>/SKILL.md` (carpetas 0700, ficheros 0600) y
-      `.baas-skills.json`, **no copia ningún script** (el aviso los lista) y repetirlo dice «Todo al día».
+- [ ] `sync --tool antigravity` crea `~/.gemini/config/skills/<organización>-<skill>/SKILL.md` (carpetas 0700, ficheros 0600) y
+      `.baas-skills-<organización>.json`, **no copia ningún script** (el aviso los lista y cuenta las llamadas
+      reescritas) y repetirlo dice «Todo al día».
 - [ ] **CLI**: tras `/skills reload`, `/skills` muestra la skill y **`/<organización>-<skill>`** la lanza. Anota si el comando lleva otro
       prefijo distinto de `/<organización>-<skill>` o si el `description` reescrito basta para que el agente la elija solo.
 - [ ] **Extensión**: anota si la extensión ofrece las skills como comando (`/<skill>`, menú de skills…) o solo las usa
@@ -250,10 +307,21 @@ Marca lo que compruebes (lo de Linux ya está hecho el 2026-11-23; falta Windows
 - [ ] **Dos organizaciones** (si las tienes) con una skill del mismo nombre: `sync --tool antigravity --org <a>` y
       `--org <b>` dejan `<a>-<skill>` y `<b>-<skill>`; retirar una no toca la otra. Con el MCP de solo una, el agente de
       la otra skill comprueba `baas_whoami` y se detiene.
+- [ ] **`gestor` en tu proyecto de cerebro** (el que tiene `knowledge/fiscal/…`; lanza `agy` desde él o ábrelo en VS Code):
+      el `SKILL.md` de `~/.gemini/config/skills/<organización>-gestor/` ya no contiene `${CLAUDE_SKILL_DIR}` en las
+      órdenes (ahora son `python3 "<ruta>/baas.py" run-script … skills/gestor/scripts/gestor-facturas.py -- …`), los
+      enlaces a `facturacion` y `md-to-doc` llevan el prefijo y las citas `/gestor` pasan a `/<organización>-gestor`.
+- [ ] Pídele al agente `/<organización>-gestor` «estado del año»: ejecuta la orden `run-script` **tal cual** (sin copiar
+      el script), lee el cerebro del directorio de trabajo y responde; el script no queda en disco
+      (`ls ~/.gemini/config/skills/<organización>-gestor/`) ni en `/tmp`.
+- [ ] Lo mismo con `facturacion`, `md-to-doc`, `smart-tech` y `auditor` (`auditor.sh` es una llamada directa): anota
+      cuáles siguen avisando de referencias sin reescribir y si eso estorba.
+- [ ] Mueve o renombra el plugin (o simula que cambia su ruta) y repite `sync`: solo se vuelven a adaptar las skills con
+      scripts y las órdenes llevan la ruta nueva.
 - [ ] Una skill tuya con el mismo nombre queda intacta y el comando dice «no la toco»; una skill sincronizada que editas
       no se pisa sin `--force`.
 - [ ] Quitar un rol (o retirar la skill) la borra en la siguiente sincronización; las tuyas siguen ahí.
-- [ ] Windows: `%USERPROFILE%\.gemini\config\skills\`, los nombres y las rutas salen bien.
+- [ ] Windows: `%USERPROFILE%\.gemini\config\skills\`, los nombres y las rutas salen bien; la orden de `run-script` usa `python` y la ruta de `baas.py` entre comillas funciona (con espacios).
 - [ ] El agente aplica la regla: ante una pregunta sobre la organización busca con `baas_search_knowledge`.
 - [ ] Con un recurso al que no tienes rol, el agente **se detiene** e informa de `AUTHORIZATION_DENIED` (sin buscar otra vía).
 - [ ] El acceso queda **auditado** (la webapp registra la llamada a la tool).
