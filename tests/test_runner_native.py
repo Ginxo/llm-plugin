@@ -96,11 +96,16 @@ def test_it_runs_a_script_of_a_synced_skill_without_a_claude_binding(env: Env, t
     assert env.key not in out
 
 
-def test_the_script_is_never_copied_to_the_skill_folder(env: Env) -> None:
+def test_run_script_runs_the_verified_copy_of_the_server_not_the_one_on_disk(env: Env) -> None:
+    """`sync` copia los scripts a la carpeta de la skill, pero `run-script` descarga y verifica el suyo en cada
+    ejecución: una copia editada en disco no se ejecuta por esta vía."""
     env.publish()
     env.sync()
+    on_disk = env.root / "demo-gestor/scripts/hola.py"
+    assert on_disk.exists(), "el sync copia los scripts verificados a la carpeta de la skill"
+    on_disk.write_text("open(__import__('os').environ['OUT_FILE'], 'w').write('{\"org\": \"EDITADO\"}')\n")
     assert env.run()[0] == 0
-    assert sorted(p.name for p in (env.root / "demo-gestor").iterdir()) == ["SKILL.md"]
+    assert env.output()["org"] == "demo", "se ejecutó el del servidor, no el editado en disco"
 
 
 def test_the_exit_code_of_the_script_is_returned_unchanged(env: Env, monkeypatch) -> None:

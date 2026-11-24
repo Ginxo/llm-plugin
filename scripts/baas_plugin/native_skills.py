@@ -21,22 +21,27 @@ Lo que añade, porque aquí el destino es una carpeta **del usuario** y no un pl
   la misma carpeta. No es `<org>:<skill>` porque la documentación de Antigravity no dice que `:` valga en `name` (solo
   «minúsculas» y «guiones») y Windows no lo admite en una carpeta. Solo minúsculas, dígitos y guiones; lo demás no se
   instala y se cuenta. Cada organización tiene su fichero de control y retira solo lo suyo.
-- **Sin scripts en disco.** No se copia nada que pueda ejecutarse sin la comprobación que hace el plugin al ejecutar
-  (`run-script`): ficheros marcados como ejecutables, carpetas `scripts/`, extensiones de código o binarios y todo lo
-  que empiece por `#!`. Se listan. Las llamadas que el `SKILL.md` hace a esos scripts
-  (`python3 "${CLAUDE_SKILL_DIR}/scripts/x.py" …`) se reescriben para que pasen por `baas.py run-script`
-  (`skill_rewrite`): el ejecutor descarga el script, comprueba su SHA-256, lo corre en una carpeta temporal privada y lo
-  borra siempre. Lo que no se reconoce con certeza se deja intacto y se cuenta.
+- **Scripts verificados, copiados.** Como Claude Code, `sync` copia el paquete entero de cada skill (también los
+  scripts y los ejecutables) a su carpeta, verificando el SHA-256 de cada fichero contra el manifiesto
+  (`package_fetch`), con carpetas 0700 y ficheros 0600 (0700 solo los que el manifiesto marca como ejecutables), sin
+  seguir enlaces ni salir de la carpeta. La confianza se da al sincronizar y no en cada ejecución; `--verify`
+  recomprueba lo copiado contra el control. Sin ellos en disco, el agente improvisaba (`baas_get_script` y ejecución a
+  mano), que es lo que la regla prohíbe. `baas.py run-script` sigue disponible como vía opcional que verifica en cada
+  ejecución.
 - **`SKILL.md` adaptado.** Antigravity documenta `description` (obligatorio) y `name` (opcional): se escriben solo esos
   dos (`name` = la carpeta; `when_to_use` se une a la descripción). El cuerpo se deja tal cual salvo lo que
-  `skill_rewrite` reescribe con certeza (llamadas a scripts, enlaces y citas a otras skills de la organización) y va
-  precedido de una nota que dice a qué organización pertenece la skill (las tools `baas_*` son las del MCP configurado,
-  que puede ser el de otra organización). Los campos propios de Claude Code se quitan y se avisa; una skill que pide
+  `skill_rewrite` reescribe con certeza (`${CLAUDE_SKILL_DIR}` y las llamadas relativas «desde la carpeta de la skill»
+  → la ruta absoluta de la carpeta nativa; enlaces y citas a otras skills de la organización) y va precedido de una
+  nota que dice a qué organización pertenece la skill (las tools `baas_*` son las del MCP configurado, que puede ser el
+  de otra) y dónde están sus scripts. Los campos propios de Claude Code se quitan y se avisa; una skill que pide
   invocación solo manual (`disable-model-invocation`) no se instala porque Antigravity no puede respetarlo.
-- **Idempotente.** El resultado depende del texto original, del prefijo, de la ruta de `baas.py` (si hay llamadas a
-  scripts) y de qué skills citadas están sincronizadas: una huella (`adapt_fp`) por skill lo resume en el fichero de
-  control y, si cambia (se movió el plugin, otra skill citada se ha sincronizado, cambió el adaptador), la siguiente
-  sincronización vuelve a adaptar esa skill y solo esa.
+- **Idempotente.** El resultado depende del texto original, del prefijo, de la carpeta de la skill (si el texto o el
+  paquete dependen de ella) y de qué skills citadas están sincronizadas: una huella (`adapt_fp`) por skill lo resume
+  en el fichero de control y, si cambia (se movió el HOME, otra skill citada se ha sincronizado, cambió el
+  adaptador), la siguiente sincronización vuelve a adaptar esa skill y solo esa.
+- **Sandbox.** `agy` ejecuta las órdenes dentro de un sandbox (sin red y con el HOME oculto fuera del proyecto) salvo
+  que una regla `command(...)` las permita; `sync` imprime (sin escribirla: son permisos de la persona) la regla que
+  permitiría solo los scripts de estas carpetas.
 
 Solo toca `~/.gemini/config/skills/` (y `~/baas-ai-ip/sync.lock`). Un cambio se ve con `/skills reload` en `agy`.
 """
@@ -44,7 +49,6 @@ Solo toca `~/.gemini/config/skills/` (y `~/baas-ai-ip/sync.lock`). Un cambio se 
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import hashlib
 import json
 import os
@@ -54,7 +58,7 @@ import shutil
 import signal
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from . import claude_home, handshake, package_fetch, setup_tools, skill_rewrite, skillmeta, sync
@@ -77,15 +81,6 @@ CONTROL_FORMAT = 1
 MANAGED_BY = "baas-llm-plugin"
 NATIVE_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MAX_SKILL_MD = 1024 * 1024  # un SKILL.md más grande no es una skill razonable (y se lee entero en memoria)
-SHOWN_OMITTED = 8  # ficheros omitidos que se nombran en pantalla (todos quedan en el fichero de control)
-# Código y binarios ejecutables: no se copian (ni siquiera sin el bit de ejecución: `python3 x.py` no lo necesita)
-EXECUTABLE_EXTENSIONS = frozenset(
-    {
-        ".py", ".pyw", ".sh", ".bash", ".zsh", ".fish", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php", ".lua",
-        ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".wsf", ".exe", ".dll", ".so", ".dylib", ".msi", ".jar", ".com",
-        ".scr", ".appimage",
-    }
-)  # fmt: skip
 FRONTMATTER_KEPT = ("name", "description", "when_to_use")
 # Las tools `baas_*` son las del MCP configurado en la herramienta, que puede ser el de otra organización
 ORG_NOTE = (
@@ -93,46 +88,42 @@ ORG_NOTE = (
     " herramienta. Antes de actuar, comprueba con `baas_whoami` que la organización es «{org}». Detente e informa al"
     " usuario si no lo es o si el MCP no está conectado, y no uses el parámetro `org` para saltártelo."
 )
-# Solo en las skills con llamadas a scripts reescritas: el ejecutor y lo que necesitan en el equipo
+# En las skills que traen scripts: dónde están y cómo se ejecutan
 SCRIPTS_NOTE = (
-    "> Los scripts de esta skill se ejecutan **solo** con `baas.py run-script` (las órdenes de abajo ya vienen así,"
-    " con la comprobación del SHA-256): no los copies a disco ni ejecutes el contenido de `baas_get_script` a mano."
-    " Algunos leen ficheros locales del proyecto (por ejemplo `knowledge/…`): la skill solo funciona completa si el"
-    " directorio de trabajo es un proyecto que los tenga."
+    "> Los scripts de esta skill están en su carpeta{where}, verificados con su SHA-256 al sincronizar: ejecútalos"
+    " desde ahí, tal como indican las órdenes de abajo. No copies el contenido de `baas_get_script` o"
+    " `baas_get_skill_files` ni lo ejecutes: si falta un script o algo no cuadra, dile al usuario que ejecute"
+    " `baas.py sync --tool antigravity` (o `--verify`). Algunos leen ficheros locales del proyecto (por ejemplo"
+    " `knowledge/…`): la skill solo funciona completa si el directorio de trabajo es un proyecto que los tenga."
 )
-BAAS_PY = Path(__file__).resolve().parent.parent / "baas.py"  # el que se escribe en las órdenes `run-script`
-ADAPTER_VERSION = 1  # súbela al cambiar lo que escribe el adaptador: obliga a volver a adaptar las skills
+ADAPTER_VERSION = 2  # súbela al cambiar lo que escribe el adaptador: obliga a volver a adaptar las skills
+SETTINGS_FILE = "~/.gemini/antigravity-cli/settings.json"  # donde `agy` lee `permissions` (según su documentación)
 
 
-def python_command() -> str:
-    """El intérprete que se escribe delante de `baas.py` en las órdenes (el de Windows no se llama `python3`)."""
-    return "python" if os.name == "nt" else "python3"
+def _windows() -> bool:
+    """¿Es Windows? (una función para poder simularlo en las pruebas)"""
+    return os.name == "nt"
 
 
-def org_note(org_slug: str, with_scripts: bool) -> str:
+def org_note(org_slug: str, skill_dir: str | None, with_scripts: bool) -> str:
     note = ORG_NOTE.format(org=org_slug)
-    return f"{note}\n>\n{SCRIPTS_NOTE}" if with_scripts else note
-
-
-def current_runner(target: NativeSkillTarget) -> skill_rewrite.RunnerCommand | None:
-    """Cómo se invoca hoy el ejecutor, o `None` si la ruta de `baas.py` no se puede escribir con seguridad."""
-    return skill_rewrite.safe_runner(python_command(), str(BAAS_PY), target.name)
+    if not with_scripts:
+        return note
+    where = f" (`{skill_dir}`)" if skill_dir else ""
+    return f"{note}\n>\n{SCRIPTS_NOTE.format(where=where)}"
 
 
 def adapt_fingerprint(
-    org_slug: str,
-    runner: skill_rewrite.RunnerCommand | None,
-    refs: list[str],
-    uses_runner: bool,
-    synced: frozenset[str],
+    org_slug: str, skill_dir: str | None, windows: bool, refs: list[str], needs_dir: bool, synced: frozenset[str]
 ) -> str:
     """Resume de qué depende el texto adaptado además del original: si cambia, hay que volver a adaptar la skill.
 
-    La ruta de `baas.py` solo cuenta si la skill llama a scripts, y de las skills citadas, solo las sincronizadas.
+    La carpeta de la skill (y el intérprete de Windows) solo cuentan si el texto o el paquete dependen de ella, y de las
+    skills citadas, solo las sincronizadas.
     """
     payload: list[Any] = [ADAPTER_VERSION, org_slug, sorted(r for r in refs if r in synced)]
-    if uses_runner:
-        payload.append([runner.python, runner.baas_py, runner.tool] if runner else None)
+    if needs_dir:
+        payload.append([skill_rewrite.safe_dir(skill_dir, windows=windows), windows])
     return hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]
 
 
@@ -180,24 +171,6 @@ def name_problem(target: NativeSkillTarget, org_slug: str, name: str) -> str | N
     return None
 
 
-def omission_reason(path: str, executable: bool) -> str | None:
-    """Por qué un fichero del paquete no se copia (por su ruta y su marca), o `None`."""
-    if executable:
-        return "marcado como ejecutable"
-    parts = [p.lower() for p in path.split("/")]
-    if "scripts" in parts[:-1]:
-        return "carpeta scripts/"
-    suffix = PurePosixPath(path).suffix.lower()
-    if suffix in EXECUTABLE_EXTENSIONS:
-        return f"código o binario ejecutable ({suffix})"
-    return None
-
-
-def has_shebang(path: Path) -> bool:
-    with open(path, "rb") as fh:
-        return fh.read(2) == b"#!"
-
-
 class NotAdaptable(Exception):  # noqa: N818 (no es un error: la skill se deja fuera y se cuenta)
     """La skill no se puede dejar como skill nativa sin cambiar lo que su autor pidió."""
 
@@ -242,7 +215,12 @@ def adapt_skill_md(
     report = None
     if ctx is not None:
         body, report = skill_rewrite.rewrite(body, ctx)
-    note = org_note(org_slug, with_scripts=bool(report and report.scripts))
+    has_scripts = bool(ctx and (any(p.startswith("scripts/") for p in ctx.scripts) or ctx.executable))
+    note = org_note(
+        org_slug,
+        ctx.skill_dir if ctx and skill_rewrite.safe_dir(ctx.skill_dir, windows=ctx.windows) else None,
+        has_scripts,
+    )
     adapted = f"---\nname: {name}\ndescription: {_yaml_string(description)}\n---\n\n{note}\n\n{body}"
     dropped = [str(k) for k in data if k not in FRONTMATTER_KEPT]
     return adapted, dropped, report
@@ -256,49 +234,73 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def tree_records(base: Path) -> list[dict[str, str]]:
-    """`[{path, sha256}]` de todos los ficheros bajo `base` (sin seguir enlaces)."""
-    records = []
+def _is_executable(path: Path) -> bool:
+    return os.name == "posix" and bool(path.stat().st_mode & 0o100)
+
+
+def tree_records(base: Path) -> list[dict[str, Any]]:
+    """`[{path, sha256[, executable]}]` de todos los ficheros bajo `base` (sin seguir enlaces)."""
+    records: list[dict[str, Any]] = []
     for dirpath, _dirs, files in os.walk(base):
         for f in files:
             p = Path(dirpath) / f
-            records.append({"path": p.relative_to(base).as_posix(), "sha256": _file_sha256(p)})
+            record: dict[str, Any] = {"path": p.relative_to(base).as_posix(), "sha256": _file_sha256(p)}
+            if _is_executable(p):
+                record["executable"] = True
+            records.append(record)
     return sorted(records, key=lambda r: r["path"])
 
 
-def local_changes(folder: Path, entry: dict[str, Any]) -> str | None:
-    """Por qué la carpeta de una skill gestionada ya no es lo que el plugin escribió, o `None` si está intacta.
+def scan_changes(folder: Path, entry: dict[str, Any], *, check_modes: bool = False) -> list[str]:
+    """Todo lo que difiere entre la carpeta de una skill gestionada y lo que el plugin escribió (vacío si está intacta).
 
-    Compara con lo registrado (SHA-256 de cada fichero) y no sigue enlaces simbólicos.
+    Compara con lo registrado (SHA-256 de cada fichero) y no sigue enlaces simbólicos. Con `check_modes` (solo POSIX)
+    comprueba también los permisos: que sean ejecutables solo los que el manifiesto marcaba y que nada sea escribible
+    por el grupo o por otros.
     """
     if folder.is_symlink():
-        return "ahora es un enlace simbólico"
+        return ["ahora es un enlace simbólico"]
     if not folder.is_dir():
-        return "ya no es una carpeta"
-    recorded = {
-        f["path"]: f["sha256"]
+        return ["ya no es una carpeta"]
+    recorded: dict[str, dict[str, Any]] = {
+        f["path"]: f
         for f in entry.get("files") or []
         if isinstance(f, dict) and isinstance(f.get("path"), str) and isinstance(f.get("sha256"), str)
     }
     if not recorded:
-        return "no hay registro de sus ficheros"
-    seen: dict[str, str] = {}
+        return ["no hay registro de sus ficheros"]
+    problems: list[str] = []
+    seen: dict[str, Path] = {}
     for dirpath, dirs, files in os.walk(folder):
         for entry_name in [*dirs, *files]:
             p = Path(dirpath) / entry_name
             if p.is_symlink():
-                return f"contiene un enlace simbólico ({p.relative_to(folder).as_posix()})"
+                problems.append(f"contiene un enlace simbólico ({p.relative_to(folder).as_posix()})")
         for f in files:
             p = Path(dirpath) / f
-            seen[p.relative_to(folder).as_posix()] = _file_sha256(p)
+            if not p.is_symlink():
+                seen[p.relative_to(folder).as_posix()] = p
     for rel in sorted(seen):
-        if rel in recorded and seen[rel] != recorded[rel]:
-            return f"has editado {rel}"
-    for rel in sorted(set(recorded) - set(seen)):
-        return f"falta {rel}"
-    for rel in sorted(set(seen) - set(recorded)):
-        return f"has añadido {rel}"
-    return None
+        if rel in recorded and _file_sha256(seen[rel]) != recorded[rel]["sha256"]:
+            problems.append(f"has editado {rel}")
+    problems += [f"falta {rel}" for rel in sorted(set(recorded) - set(seen))]
+    problems += [f"has añadido {rel}" for rel in sorted(set(seen) - set(recorded))]
+    if check_modes and os.name == "posix":
+        for rel, p in sorted(seen.items()):
+            mode = p.stat().st_mode
+            if rel in recorded and bool(mode & 0o100) != bool(recorded[rel].get("executable")):
+                problems.append(
+                    f"{rel} {'es ejecutable sin serlo' if mode & 0o100 else 'ya no es ejecutable'} en el manifiesto"
+                )
+            if mode & 0o022:
+                problems.append(f"{rel} es escribible por el grupo o por otros (permisos {oct(mode & 0o777)})")
+    return problems
+
+
+def local_changes(folder: Path, entry: dict[str, Any]) -> str | None:
+    """La primera diferencia (ver `scan_changes`), o `None` si la carpeta está intacta."""
+    problems = scan_changes(folder, entry)
+    return problems[0] if problems else None
 
 
 # --- estado: .baas-skills-<organización>.json -----------------------------------------------------------------------
@@ -332,9 +334,7 @@ def read_control(root: Path, org_slug: str) -> dict[str, Any] | None:
     return data
 
 
-def write_control(
-    root: Path, org: str, mcp_url: str, skills: dict[str, Any], warnings: list[str], baas_py: str = ""
-) -> None:
+def write_control(root: Path, org: str, mcp_url: str, skills: dict[str, Any], warnings: list[str]) -> None:
     data = {
         "managed_by": MANAGED_BY,
         "format": CONTROL_FORMAT,
@@ -342,7 +342,6 @@ def write_control(
         "server": mcp_url,
         "synced_at": sync.now_iso(),
         "adapter": ADAPTER_VERSION,
-        "baas_py": baas_py,  # la ruta que llevan las órdenes `run-script` de los SKILL.md
         "skills": skills,
         "warnings": warnings,
     }
@@ -358,9 +357,8 @@ class NativeResult(sync.SyncResult):
     collisions: dict[str, str] = field(default_factory=dict)  # skill de la organización → por qué choca
     modified: dict[str, str] = field(default_factory=dict)  # skill gestionada editada por el usuario → qué
     excluded: dict[str, str] = field(default_factory=dict)  # skill que no se instala → por qué
-    omitted: dict[str, list[dict[str, str]]] = field(default_factory=dict)  # skill → ficheros que no se copian
     rewrites: dict[str, skill_rewrite.RewriteReport] = field(default_factory=dict)  # skill → qué se reescribió
-    runner_ok: bool = True  # ¿se pudo escribir la ruta de baas.py en las órdenes?
+    dir_ok: bool = True  # ¿la ruta de las carpetas de las skills se puede escribir en las órdenes sin riesgo?
 
     def cmd(self, skill: str) -> str:
         """El nombre de la carpeta y del comando de la skill (`<organización>-<skill>`)."""
@@ -394,35 +392,23 @@ class NativeResult(sync.SyncResult):
             for n, why in sorted(self.modified.items())
         ]
         lines += [f"  · {n}: no se instala ({why})" for n, why in sorted(self.excluded.items())]
-        for name, files in sorted(self.omitted.items()):
-            shown = ", ".join(f["path"] for f in files[:SHOWN_OMITTED])
-            more = f" y {len(files) - SHOWN_OMITTED} más" if len(files) > SHOWN_OMITTED else ""
-            rewritten = len(self.rewrites[name].scripts) if name in self.rewrites else 0
-            tail = (
-                "se ejecutan solo con `baas.py run-script` (se comprueba su SHA-256 y no se guardan)."
-                if rewritten
-                else f"esta skill no funcionará completa en {self.tool.label}."
-            )
-            lines.append(
-                f"AVISO: «{self.cmd(name)}»: no se copian {len(files)} fichero(s) ejecutables o scripts"
-                f" ({shown}{more}): {tail}"
-            )
         for name, report in sorted(self.rewrites.items()):
             if report.unresolved:
                 lines.append(
                     f"AVISO: «{self.cmd(name)}»: {report.unresolved} referencia(s) a `${{CLAUDE_SKILL_DIR}}` sin"
-                    f" reescribir (menciones sueltas, scripts que no están en el paquete…): {self.tool.label} no"
+                    f" reescribir (entre comillas simples, sin poder entrecomillar la ruta…): {self.tool.label} no"
                     " define esa variable."
                 )
             if report.relative_scripts:
                 lines.append(
                     f"AVISO: «{self.cmd(name)}»: {report.relative_scripts} llamada(s) a scripts con ruta relativa"
-                    " (`scripts/…`) sin reescribir: no se sabe a qué carpeta se refieren."
+                    " (`scripts/…`) sin reescribir: el texto no dice con certeza que se ejecuten desde la carpeta de"
+                    " la skill."
                 )
-        if not self.runner_ok and any(r.runner_candidates for r in self.rewrites.values()):
+        if not self.dir_ok and any(r.uses_dir for r in self.rewrites.values()):
             lines.append(
-                "AVISO: la ruta de baas.py tiene caracteres que un shell reinterpretaría (comillas, `$`, `%`…): las"
-                " llamadas a scripts no se reescriben. Mueve el plugin a una ruta sin ellos y repite el comando."
+                f"AVISO: la ruta de {self.plugin_dir} tiene caracteres que un shell reinterpretaría (comillas, `$`,"
+                " `%`…): no se resuelve la carpeta de las skills en sus órdenes. Usa una ruta sin ellos."
             )
         lines += [f"AVISO: {w}" for w in self.warnings]
         lines += self.notes
@@ -447,11 +433,10 @@ class Staged:
     """Una skill descargada y adaptada en un temporal, lista para renombrar."""
 
     path: Path
-    files: list[dict[str, str]]  # lo escrito, con su SHA-256 (el `SKILL.md` ya adaptado)
-    omitted: list[dict[str, str]]  # lo que no se copia, con el motivo
+    files: list[dict[str, Any]]  # lo escrito, con su SHA-256 (el `SKILL.md` ya adaptado)
     dropped: list[str]  # campos de Claude Code quitados de la cabecera
     report: skill_rewrite.RewriteReport
-    meta: dict[str, Any]  # lo que se anota en el control: hash del original, citas y huella de la adaptación
+    meta: dict[str, Any]  # lo que se anota en el control: hash del original, citas, llamadas y huella de la adaptación
 
 
 def _stage_skill(
@@ -461,33 +446,20 @@ def _stage_skill(
     name: str,
     manifest: Manifest,
     synced: frozenset[str],
-    runner: skill_rewrite.RunnerCommand | None,
+    skill_dir: str,
+    windows: bool,
 ) -> Staged:
-    """Descarga lo copiable de la skill a un temporal, la adapta y la deja lista para renombrar."""
-    kept, omitted = [], []
-    for f in manifest.files:
-        reason = omission_reason(f.path, f.executable)
-        if reason:
-            omitted.append({"path": f.path, "reason": reason})
-        else:
-            kept.append(f)
-    skill_md = next((f for f in kept if f.path == "SKILL.md"), None)
+    """Descarga el paquete entero de la skill a un temporal, lo adapta y lo deja listo para renombrar."""
+    skill_md = manifest.file("SKILL.md")
     if skill_md is None:
         raise PackageError("el paquete no tiene SKILL.md.")
     if skill_md.size > MAX_SKILL_MD:
         raise PackageError(f"el SKILL.md es demasiado grande ({skill_md.size} bytes; el máximo es {MAX_SKILL_MD}).")
     folder = folder_name(org_slug, name)
     staged = tmp_root / f"new-{folder}"
-    # El SHA-256 de cada fichero se verifica al descargarlo (`package_fetch`); solo se pide lo que se va a copiar.
-    package_fetch.fetch_to_dir(client, dataclasses.replace(manifest, files=kept), staged)
-    for f in kept:  # un script con otro nombre (`#!` al principio) tampoco se copia
-        path = staged.joinpath(*f.path.split("/"))
-        if f.path != "SKILL.md" and has_shebang(path):
-            path.unlink()
-            omitted.append({"path": f.path, "reason": "empieza por #!"})
-    for dirpath, _dirs, _files in os.walk(staged, topdown=False):
-        if dirpath != str(staged) and not any(Path(dirpath).iterdir()):
-            os.rmdir(dirpath)
+    # El SHA-256 de cada fichero se verifica al descargarlo (`package_fetch`), las rutas no salen de la carpeta, no se
+    # crean enlaces y solo llevan el bit de ejecución los que el manifiesto marca como ejecutables.
+    package_fetch.fetch_to_dir(client, manifest, staged)
     md_path = staged / "SKILL.md"
     try:
         text = md_path.read_bytes().decode("utf-8")
@@ -498,20 +470,27 @@ def _stage_skill(
         skill=name,
         synced=synced,
         scripts=frozenset(f.path for f in manifest.files),
-        runner=runner,
+        skill_dir=skill_dir,
         executable=frozenset(manifest.executable_paths()),
+        windows=windows,
     )
     adapted, dropped, report = adapt_skill_md(text, folder, org_slug, ctx)
     assert report is not None
     md_path.write_bytes(adapted.encode("utf-8"))
-    uses_runner = report.runner_candidates > 0
+    needs_dir = report.uses_dir or has_scripts(manifest)
     meta = {
         "original_sha256": skill_md.sha256,
         "refs": report.refs,
-        "runner": uses_runner,
-        "adapt_fp": adapt_fingerprint(org_slug, runner, report.refs, uses_runner, synced),
+        "needs_dir": needs_dir,
+        "calls": [[interp, rel] for interp, rel in report.calls],
+        "adapt_fp": adapt_fingerprint(org_slug, skill_dir, windows, report.refs, needs_dir, synced),
     }
-    return Staged(staged, tree_records(staged), sorted(omitted, key=lambda o: o["path"]), dropped, report, meta)
+    return Staged(staged, tree_records(staged), dropped, report, meta)
+
+
+def has_scripts(manifest: Manifest) -> bool:
+    """¿El paquete trae scripts o ejecutables? (su nota dice dónde están)"""
+    return any(f.path.startswith("scripts/") or f.executable for f in manifest.files)
 
 
 def _managed_state(skills: dict[str, dict[str, Any]], name: str, plan: sync.SkillPlan, **extra: Any) -> None:
@@ -529,8 +508,14 @@ def sync_native(
     from .mcp_client import McpClient
 
     slug = sync.validate_slug(org.slug)  # entra en el nombre de una carpeta: solo minúsculas, dígitos y guiones
-    runner = current_runner(target)
-    result = NativeResult(slug, root, dry_run=opts.dry_run, tool=target, runner_ok=runner is not None)
+    windows = _windows()
+    result = NativeResult(
+        slug,
+        root,
+        dry_run=opts.dry_run,
+        tool=target,
+        dir_ok=skill_rewrite.safe_dir(str(root), windows=windows) is not None,
+    )
     with sync._lock(baas, enabled=not opts.dry_run) as acquired:
         if not acquired:
             result.skipped = "Otra sincronización está en curso; no se hace nada. Vuelve a intentarlo en unos segundos."
@@ -563,7 +548,7 @@ def sync_native(
                     if problem:
                         result.excluded[name] = problem
                         del plans[name]
-                _refresh_stale(client, slug, plans, managed, runner, result)
+                _refresh_stale(client, slug, root, windows, plans, managed, result)
             except McpToolError as exc:
                 if exc.code != sync.KILL_SWITCH:
                     raise
@@ -571,28 +556,31 @@ def sync_native(
                 result.failed.clear()
                 plans = {}
             client.timeout = opts.transfer_timeout
-            _apply(client, target, org, root, state, managed, plans, opts, result, runner)
+            _apply(client, target, org, root, state, managed, plans, opts, result, windows)
     return result
 
 
 def _refresh_stale(
     client: Any,
     slug: str,
+    root: Path,
+    windows: bool,
     plans: dict[str, sync.SkillPlan],
     managed: dict[str, dict[str, Any]],
-    runner: skill_rewrite.RunnerCommand | None,
     result: NativeResult,
 ) -> None:
-    """Una skill sin cambios en el servidor puede necesitar adaptarse de nuevo: se movió el plugin (ruta de `baas.py`),
-    se ha sincronizado otra skill que cita, cambió el adaptador o el control es de antes de esta adaptación. Se compara
-    la huella guardada con la de ahora y, si difiere, se pasa la skill a `update` (solo esa)."""
+    """Una skill sin cambios en el servidor puede necesitar adaptarse de nuevo: se movió el HOME (carpeta de la skill),
+    se ha sincronizado otra skill que cita, cambió el adaptador o el control es de antes de esta adaptación (T19 y
+    T20 no copiaban los scripts). Se compara la huella guardada con la de ahora y, si difiere, se pasa la skill a
+    `update` (solo esa)."""
     synced = frozenset(plans)
     for name, plan in sorted(plans.items()):
         if plan.action != "keep":
             continue
         entry = managed.get(name) or {}
         refs = [r for r in entry.get("refs") or [] if isinstance(r, str)]
-        now = adapt_fingerprint(slug, runner, refs, bool(entry.get("runner")), synced)
+        folder = str(root / folder_name(slug, name))
+        now = adapt_fingerprint(slug, folder, windows, refs, bool(entry.get("needs_dir")), synced)
         if entry.get("adapt_fp") == now:
             continue
         try:
@@ -660,7 +648,7 @@ def _apply(
     plans: dict[str, sync.SkillPlan],
     opts: sync.SyncOptions,
     result: NativeResult,
-    runner: skill_rewrite.RunnerCommand | None,
+    windows: bool,
 ) -> None:
     slug = org.slug
     synced = frozenset(plans)
@@ -671,11 +659,8 @@ def _apply(
     for name in to_install:
         manifest = plans[name].manifest
         assert manifest is not None
-        copied = [f for f in manifest.files if not omission_reason(f.path, f.executable)]
-        result.details[name] = f", {len(copied)} ficheros, {sync._human_size(sum(f.size for f in copied))}"
-        left = [{"path": f.path, "reason": omission_reason(f.path, f.executable) or ""} for f in manifest.files]
-        if any(item["reason"] for item in left):
-            result.omitted[name] = sorted((i for i in left if i["reason"]), key=lambda i: i["path"])
+        size = sync._human_size(sum(f.size for f in manifest.files))
+        result.details[name] = f", {len(manifest.files)} ficheros, {size}"
     result.added = [n for n in to_install if n not in managed]
     result.updated = [n for n in to_install if n in managed]
     result.removed = list(to_retire)
@@ -695,7 +680,6 @@ def _apply(
     for stale in root.glob(f"{sync.TMP_PREFIX}*"):  # restos de una ejecución interrumpida (hay bloqueo)
         sync._remove(stale)
     skills = {n: dict(e) for n, e in managed.items()}
-    result.omitted = {}
     try:
         for name in to_retire:  # primero lo local: no depende de que las descargas salgan bien
             sync._remove(root / folder_name(slug, name))
@@ -709,7 +693,8 @@ def _apply(
             plan = plans[name]
             assert plan.manifest is not None
             try:
-                staged = _stage_skill(client, tmp_root, slug, name, plan.manifest, synced, runner)
+                folder = folder_name(slug, name)
+                staged = _stage_skill(client, tmp_root, slug, name, plan.manifest, synced, str(root / folder), windows)
             except NotAdaptable as exc:
                 result.excluded[name] = str(exc)
                 result.added = [n for n in result.added if n != name]
@@ -728,13 +713,13 @@ def _apply(
                 continue
             folder = folder_name(slug, name)
             sync.swap_dir(staged.path, root / folder, tmp_root / f"old-{folder}")
-            _managed_state(skills, name, plan, files=staged.files, omitted=staged.omitted, **staged.meta)
+            _managed_state(skills, name, plan, files=staged.files, **staged.meta)
             result.rewrites[name] = staged.report
-            if staged.omitted:
-                result.omitted[name] = staged.omitted
-            if staged.report.scripts:
-                count = len(staged.report.scripts)
-                result.details[name] = result.details.get(name, "") + f", {count} llamada(s) a scripts → run-script"
+            if staged.report.calls:
+                count = len(staged.report.calls)
+                result.details[name] = (
+                    result.details.get(name, "") + f", {count} llamada(s) a scripts → carpeta de la skill"
+                )
             if staged.dropped:
                 result.notes.append(
                     f"«{folder}»: se quitan del SKILL.md los campos de Claude Code que {target.label} no documenta:"
@@ -745,17 +730,15 @@ def _apply(
         result.added = [n for n in result.added if n not in result.failed]
         result.updated = [n for n in result.updated if n not in result.failed]
         warnings = list(result.warnings)
-        baas_py = str(BAAS_PY)
         unchanged_state = state is not None and (
             state.get("org"),
             state.get("server"),
             state.get("skills"),
             state.get("warnings"),
-            state.get("baas_py"),
             state.get("adapter"),
-        ) == (org.slug, org.mcp_url, skills, warnings, baas_py, ADAPTER_VERSION)
+        ) == (org.slug, org.mcp_url, skills, warnings, ADAPTER_VERSION)
         if (skills or state is not None) and not unchanged_state:  # un ciclo sin novedades no escribe nada
-            write_control(root, org.slug, org.mcp_url, skills, warnings, baas_py)
+            write_control(root, org.slug, org.mcp_url, skills, warnings)
 
 
 def _retire_managed(
@@ -773,6 +756,82 @@ def _retire_managed(
     result.removed.append(name)
     result.details[name] = ""
     return True
+
+
+# --- verificación local y permisos del sandbox ------------------------------------------------------------------
+
+
+def control_orgs(root: Path) -> list[str]:
+    """Las organizaciones que tienen fichero de control en la carpeta de skills."""
+    if not root.is_dir():
+        return []
+    slugs = []
+    for path in sorted(root.glob(f"{CONTROL_PREFIX}*.json")):
+        slug = path.name[len(CONTROL_PREFIX) : -len(".json")]
+        if sync.SLUG_RE.match(slug):
+            slugs.append(slug)
+    return slugs
+
+
+def verify_native(target: NativeSkillTarget, org: str | None) -> tuple[list[str], int]:
+    """Recomprueba lo copiado contra el fichero de control (solo lectura, sin red ni clave): `(líneas, diferencias)`."""
+    root = global_root(target)
+    slugs = [sync.validate_slug(org)] if org else control_orgs(root)
+    if not slugs:
+        return [f"No hay skills sincronizadas para {target.label} en {root}: nada que verificar."], 0
+    lines = [f"Verificación local de las skills nativas de {target.label} en {root} (no se modifica nada):"]
+    bad = 0
+    for slug in slugs:
+        state = read_control(root, slug)
+        managed = sync.local_skills(state)
+        if state is None:
+            lines.append(f"  «{slug}»: no hay fichero de control (nada que verificar).")
+            continue
+        for name, entry in sorted(managed.items()):
+            folder = root / folder_name(slug, name)
+            exists = folder.is_symlink() or folder.exists()
+            problems = scan_changes(folder, entry, check_modes=True) if exists else ["falta la carpeta"]
+            if problems:
+                bad += 1
+                lines.append(f"  ✗ {folder_name(slug, name)}: {'; '.join(problems)}")
+            else:
+                lines.append(f"  ✓ {folder_name(slug, name)} ({len(entry.get('files') or [])} ficheros)")
+    return lines, bad
+
+
+def permission_rules(root: Path, org_slug: str, skills: dict[str, Any]) -> list[str]:
+    """Las reglas `command(...)` que permiten ejecutar fuera del sandbox solo las llamadas a scripts que los
+    `SKILL.md` de la organización hacen desde su carpeta (una por llamada: la documentación solo admite `*` como
+    comodín global)."""
+    rules: list[str] = []
+    for name in sorted(skills):
+        folder = (root / folder_name(org_slug, name)).as_posix()
+        for call in skills[name].get("calls") or []:
+            if isinstance(call, list) and len(call) == 2 and isinstance(call[1], str):
+                target = f"{folder}/{call[1]}"
+                rule = f"command({call[0]} {target})" if call[0] else f"command({target})"
+                if rule not in rules:
+                    rules.append(rule)
+    return rules
+
+
+def permission_suggestion(target: NativeSkillTarget, root: Path, rules: list[str]) -> list[str]:
+    """Texto de la sugerencia de permisos para `agy` (se imprime; nunca se escribe en los ajustes de la persona)."""
+    block = json.dumps({"permissions": {"allow": rules}}, indent=2, ensure_ascii=False)
+    lines = [
+        f"Permisos de `agy` (sugerencia: NO he escrito nada en {SETTINGS_FILE}; son tus permisos):",
+        "  Sin una regla `command(...)`, `agy` ejecuta estos scripts dentro de su sandbox (sin red y con tu HOME oculto"
+        " fuera del proyecto) y, si fallan ahí, te pide salir de él. Para permitir fuera del sandbox solo los scripts"
+        f" de estas carpetas, añade a `permissions.allow` de {SETTINGS_FILE}:",
+        *(f"  {line}" for line in block.splitlines()),
+        "  Sintaxis según la documentación de Antigravity (`command(...)` casa por prefijo, palabra a palabra, y deja"
+        " ejecutar la orden con o sin sandbox). NO comprobada con `agy` real: la documentación no dice cómo se tratan"
+        " las comillas ni las rutas con espacios, ni admite `*` dentro de un patrón (por eso hay una regla por"
+        " llamada); si una orden lleva la ruta entrecomillada y la regla no casa, `agy` te lo preguntará.",
+    ]
+    if re.search(r"\s", str(root)):
+        lines.append("  AVISO: la ruta tiene espacios y la documentación no dice cómo escribirlos en una regla.")
+    return lines
 
 
 # --- CLI ---------------------------------------------------------------------------------------------
@@ -827,8 +886,34 @@ def synced_server(tool: str, org_slug: str, skill: str) -> str:
         ) from None
 
 
+def cmd_local_native(target: NativeSkillTarget, args: Any) -> int:
+    """`--verify` y `--permissions`: solo leen el fichero de control y los ficheros copiados (sin red ni clave)."""
+    root = global_root(target)
+    bad = 0
+    if args.verify:
+        lines, bad = verify_native(target, args.org)
+        for line in lines:
+            print(line)
+    if args.permissions:
+        for slug in [sync.validate_slug(args.org)] if args.org else control_orgs(root):
+            rules = permission_rules(root, slug, sync.local_skills(read_control(root, slug)))
+            if rules:
+                for line in permission_suggestion(target, root, rules):
+                    print(line)
+            else:
+                print(f"«{slug}»: ninguna skill sincronizada llama a scripts desde su carpeta: nada que permitir.")
+    if bad:
+        raise ScriptIntegrityError(
+            f"{bad} skill(s) no coinciden con el fichero de control: no las uses sin revisarlas.",
+            hint="Revisa lo que cambió; `sync --tool antigravity --force` las restaura (sobrescribe tus cambios).",
+        )
+    return 0
+
+
 def cmd_sync_native(args: Any) -> int:
     target = TARGETS[args.tool]
+    if getattr(args, "verify", False) or getattr(args, "permissions", False):
+        return cmd_local_native(target, args)
     opts = sync.SyncOptions(
         dry_run=args.dry_run, force=args.force, quiet=args.quiet, timeout=args.timeout, trigger=args.trigger
     )
@@ -866,6 +951,12 @@ def cmd_sync_native(args: Any) -> int:
             )
         for warning in handshake.kill_switch_warnings(hs, org):
             print(f"AVISO: {warning}")
+        if result.changed and not opts.dry_run:  # la regla de permisos, solo si algo cambió (`--permissions` la repite)
+            root = global_root(target)
+            rules = permission_rules(root, org.slug, sync.local_skills(read_control(root, org.slug)))
+            if rules:
+                for line in permission_suggestion(target, root, rules):
+                    print(line)
     if result.failed:
         why = "; ".join(f"{result.cmd(n)}: {w}" for n, w in sorted(result.failed.items()))
         error = SyncIncompleteError(

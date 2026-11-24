@@ -1,16 +1,19 @@
-"""Reescritura determinista del `SKILL.md` de Claude Code para las skills nativas de Antigravity (T20 · #194).
+"""Reescritura determinista del `SKILL.md` de Claude Code para las skills nativas de Antigravity (T20 y T22).
 
 Funciones puras: sin servidor, sin disco. Los fragmentos son sintéticos (sin datos reales).
+
+Los scripts se copian a la carpeta nativa de la skill (verificados al sincronizar), así que `${CLAUDE_SKILL_DIR}` y las
+llamadas con ruta relativa pasan a la ruta absoluta de esa carpeta, bien entrecomillada.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from baas_plugin.skill_rewrite import RewriteContext, RunnerCommand, rewrite, safe_runner
+from baas_plugin.skill_rewrite import RewriteContext, rewrite, safe_dir
 
-BAAS_PY = "/opt/baas plugin/scripts/baas.py"  # con espacios a propósito
-RUNNER = RunnerCommand("python3", BAAS_PY, "antigravity")
+DIR = "/home/u/.gemini/config/skills/demo-gestor"
+SPACED = "/home/mi usuario/(x)/.gemini/config/skills/demo-gestor"
 SCRIPTS = frozenset(
     {
         "scripts/gestor-facturas.py",
@@ -30,57 +33,81 @@ def ctx(**overrides) -> RewriteContext:
         "skill": "gestor",
         "synced": SYNCED,
         "scripts": SCRIPTS,
-        "runner": RUNNER,
+        "skill_dir": DIR,
         "executable": frozenset({"scripts/sin-extension"}),
     }
     return RewriteContext(**{**base, **overrides})
-
-
-def cmd(rel: str, rest: str = "") -> str:
-    """El comando reescrito para `rel` (el que debe producir el adaptador)."""
-    return f'python3 "{BAAS_PY}" run-script --tool antigravity --synced-org demo skills/gestor/{rel} --{rest}'
 
 
 def fence(*lines: str) -> str:
     return "```bash\n" + "\n".join(lines) + "\n```\n"
 
 
-# --- invocaciones de scripts -----------------------------------------------------------------------
+# --- ${CLAUDE_SKILL_DIR} -----------------------------------------------------------------------------
 
 
-def test_a_double_quoted_python_call_in_a_code_block_becomes_run_script_and_keeps_its_arguments() -> None:
-    src = fence(
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" mark-paid --id "2026-11/001" --date 2026-11-15'
-    )
-    out, report = rewrite(src, ctx())
-    assert out == fence(cmd("scripts/gestor-facturas.py", ' mark-paid --id "2026-11/001" --date 2026-11-15'))
+def test_a_double_quoted_call_gets_the_absolute_folder_and_keeps_its_arguments() -> None:
+    line = 'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" mark-paid --id "2026-11/001" --date 2026-11-15'
+    out, report = rewrite(fence(line), ctx())
+    assert out == fence(f'python3 "{DIR}/scripts/gestor-facturas.py" mark-paid --id "2026-11/001" --date 2026-11-15')
     assert "CLAUDE_SKILL_DIR" not in out
-    assert report.scripts == ["scripts/gestor-facturas.py"]
+    assert report.calls == [("python3", "scripts/gestor-facturas.py")]
 
 
 @pytest.mark.parametrize(
-    "path",
+    ("path", "expected"),
     [
-        '"${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py"',
-        "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py",
-        '"$CLAUDE_SKILL_DIR/scripts/gestor-facturas.py"',
-        "$CLAUDE_SKILL_DIR/scripts/gestor-facturas.py",
+        ('"${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py"', f'"{DIR}/scripts/gestor-facturas.py"'),
+        ("${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py", f"{DIR}/scripts/gestor-facturas.py"),
+        ('"$CLAUDE_SKILL_DIR/scripts/gestor-facturas.py"', f'"{DIR}/scripts/gestor-facturas.py"'),
+        ("$CLAUDE_SKILL_DIR/scripts/gestor-facturas.py", f"{DIR}/scripts/gestor-facturas.py"),
     ],
 )
-def test_quoted_unquoted_and_braceless_variants_are_recognised(path: str) -> None:
+def test_quoted_unquoted_and_braceless_variants_are_all_resolved(path: str, expected: str) -> None:
     out, _ = rewrite(fence(f"python3 {path} status --year 2026"), ctx())
-    assert out == fence(cmd("scripts/gestor-facturas.py", " status --year 2026"))
+    assert out == fence(f"python3 {expected} status --year 2026")
 
 
-def test_a_call_without_arguments_still_ends_with_the_separator() -> None:
+def test_a_folder_with_spaces_is_quoted_when_the_original_was_not() -> None:
+    src = fence(
+        "python3 ${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py a",
+        'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" b',
+    )
+    out, _ = rewrite(src, ctx(skill_dir=SPACED))
+    assert out == fence(
+        f'python3 "{SPACED}/scripts/gestor-facturas.py" a',
+        f'python3 "{SPACED}/scripts/gestor-facturas.py" b',
+    )
+
+
+def test_an_unquoted_variable_followed_by_a_quote_in_a_folder_with_spaces_is_left_alone() -> None:
+    src = fence('python3 ${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py"extra" a')
+    out, report = rewrite(src, ctx(skill_dir=SPACED))
+    assert out == src, "no se puede entrecomillar con certeza"
+    assert report.unresolved == 1
+
+
+def test_single_quotes_are_left_alone_because_the_shell_would_not_expand_them() -> None:
+    src = fence("python3 '${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py' x")
+    out, report = rewrite(src, ctx())
+    assert out == src
+    assert report.unresolved == 1
+
+
+def test_a_call_without_arguments_and_arguments_with_shell_syntax_are_not_touched() -> None:
     out, _ = rewrite(fence('python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py"'), ctx())
-    assert out == fence(cmd("scripts/gestor-facturas.py"))
-
-
-def test_arguments_are_never_reinterpreted() -> None:
+    assert out == fence(f'python3 "{DIR}/scripts/gestor-facturas.py"')
     args = " --name 'O\\'Brien' --x \"a  b\" $(date) `id` > out.txt 2>&1"
     out, _ = rewrite(fence(f'python3 "${{CLAUDE_SKILL_DIR}}/scripts/gestor-facturas.py"{args}'), ctx())
-    assert out == fence(cmd("scripts/gestor-facturas.py", args))
+    assert out == fence(f'python3 "{DIR}/scripts/gestor-facturas.py"{args}')
+
+
+def test_other_paths_of_the_skill_folder_in_the_arguments_are_resolved_too() -> None:
+    src = fence(
+        'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" --template "${CLAUDE_SKILL_DIR}/templates/x.typ"'
+    )
+    out, _ = rewrite(src, ctx())
+    assert out == fence(f'python3 "{DIR}/scripts/gestor-facturas.py" --template "{DIR}/templates/x.typ"')
 
 
 def test_indentation_a_prompt_line_continuations_and_pipes_are_kept() -> None:
@@ -92,141 +119,178 @@ def test_indentation_a_prompt_line_continuations_and_pipes_are_kept() -> None:
         'echo hola | python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" stdin',
     )
     out, report = rewrite(src, ctx())
+    p = f'python3 "{DIR}/scripts/gestor-facturas.py"'
     expected = fence(
-        "   " + cmd("scripts/gestor-facturas.py", " create \\"),
-        "      --id x",
-        "$ " + cmd("scripts/gestor-facturas.py", " list | head"),
-        "cd x && " + cmd("scripts/gestor-facturas.py", " audit"),
-        "echo hola | " + cmd("scripts/gestor-facturas.py", " stdin"),
+        f"   {p} create \\", "      --id x", f"$ {p} list | head", f"cd x && {p} audit", f"echo hola | {p} stdin"
     )
     assert out == expected
-    assert len(report.scripts) == 4
+    assert len(report.calls) == 4
 
 
-def test_a_call_inside_an_inline_code_span_is_rewritten() -> None:
-    src = "Para crearla: `python3 ${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py --out x` y listo.\n"
-    out, _ = rewrite(src, ctx())
-    assert out == f"Para crearla: `{cmd('scripts/gestor-facturas.py', ' --out x')}` y listo.\n"
+def test_a_direct_call_is_resolved_and_recorded_without_interpreter() -> None:
+    out, report = rewrite(fence('"${CLAUDE_SKILL_DIR}/scripts/run.sh" init <slug>'), ctx())
+    assert out == fence(f'"{DIR}/scripts/run.sh" init <slug>')
+    assert report.calls == [(None, "scripts/run.sh")]
 
 
-def test_a_direct_call_is_rewritten_in_a_code_block_and_in_a_span_with_arguments() -> None:
-    out, _ = rewrite(
-        fence('"${CLAUDE_SKILL_DIR}/scripts/run.sh" init <slug>', "${CLAUDE_SKILL_DIR}/scripts/run.sh"), ctx()
-    )
-    assert out == fence(cmd("scripts/run.sh", " init <slug>"), cmd("scripts/run.sh"))
-    out, _ = rewrite("Ejecuta `${CLAUDE_SKILL_DIR}/scripts/run.sh init <slug>` (ver §8).\n", ctx())
-    assert out == f"Ejecuta `{cmd('scripts/run.sh', ' init <slug>')}` (ver §8).\n"
-
-
-def test_a_direct_call_needs_an_extension_run_script_knows_or_a_declared_executable() -> None:
-    out, _ = rewrite(fence('"${CLAUDE_SKILL_DIR}/scripts/sin-extension" x'), ctx())
-    assert out == fence(cmd("scripts/sin-extension", " x")), "declarado ejecutable en el paquete"
-    out, _ = rewrite(fence('"${CLAUDE_SKILL_DIR}/scripts/sin-extension" x'), ctx(executable=frozenset()))
-    assert "CLAUDE_SKILL_DIR" in out
-
-
-def test_a_lone_path_in_prose_a_heading_or_a_span_is_a_mention_not_a_command() -> None:
+def test_calls_in_inline_code_and_mentions_everywhere_are_resolved() -> None:
     src = (
         "### CLI (`${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py`)\n"
-        "Usa `${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py` como primer filtro.\n"
-        "Y también ${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py en texto.\n"
-        '# comentario: "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" aquí\n'
+        "Crea: `python3 ${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py --out x` y mira ${CLAUDE_SKILL_DIR}/a.md.\n"
     )
     out, report = rewrite(src, ctx())
-    assert out == src
-    assert report.unresolved == 4
-    assert report.scripts == []
+    assert out == (
+        f"### CLI (`{DIR}/scripts/gestor-facturas.py`)\n"
+        f"Crea: `python3 {DIR}/scripts/gestor-facturas.py --out x` y mira {DIR}/a.md.\n"
+    )
+    assert report.unresolved == 0
+    assert report.calls == [("python3", "scripts/gestor-facturas.py")], "una mención no es una llamada"
 
 
 @pytest.mark.parametrize(
-    ("interpreter", "script", "rewritten"),
+    ("interpreter", "script", "recorded"),
     [
         ("python3", "scripts/gestor-facturas.py", True),
-        ("python", "scripts/gestor-facturas.py", True),
         ("bash", "scripts/run.sh", True),
         ("sh", "scripts/run.sh", True),
         ("node", "scripts/app.js", True),
-        ("python3", "scripts/run.sh", False),  # intérprete que no corresponde al script
-        ("node", "scripts/gestor-facturas.py", False),
-        ("bash", "scripts/gestor-facturas.py", False),
-        ("python3", "scripts/sin-extension", False),  # el ejecutor no sabría con qué ejecutarlo
+        ("python3", "scripts/run.sh", False),  # intérprete que no corresponde: se resuelve la ruta, no se anota
+        ("python3", "scripts/no-esta.py", False),  # el script no está en el paquete
     ],
 )
-def test_the_interpreter_must_match_what_run_script_would_use(interpreter: str, script: str, rewritten: bool) -> None:
-    src = fence(f'{interpreter} "${{CLAUDE_SKILL_DIR}}/{script}" a')
-    out, _ = rewrite(src, ctx())
-    assert (out != src) is rewritten
-    if rewritten:
-        assert f"skills/gestor/{script} -- a" in out
+def test_only_calls_matching_a_script_of_the_package_are_recorded(
+    interpreter: str, script: str, recorded: bool
+) -> None:
+    out, report = rewrite(fence(f'{interpreter} "${{CLAUDE_SKILL_DIR}}/{script}" a'), ctx())
+    assert f'{interpreter} "{DIR}/{script}" a' in out
+    assert bool(report.calls) is recorded
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        'python3 -u "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" x',  # opciones entre el intérprete y el script
-        'FOO=1 python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" x',  # variables de entorno delante
-        'time python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" x',
-        "python3 '${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py' x",  # comillas simples: el shell no expandiría
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/otro.py" x',  # no está en el paquete
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/../gestor-facturas.py" x',
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/./gestor-facturas.py" x',
-        'python3 "${CLAUDE_SKILL_DIR}/../facturacion/scripts/x.py" x',  # de otra skill
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/$NOMBRE.py" x',
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/a b.py" x',
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py"extra x',
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py',  # comilla sin cerrar
-        "python3 scripts/gestor-facturas.py x",  # ruta relativa: no se sabe a qué carpeta se refiere
-        'python3 "${CLAUDE_SKILL_DIR}/templates/informe.py" x',  # no está bajo scripts/
-    ],
-)
-def test_what_is_not_recognised_with_certainty_is_left_intact(line: str) -> None:
-    src = fence(line)
-    out, report = rewrite(src, ctx())
-    assert out == src
-    assert report.scripts == []
+def test_the_folder_is_never_substituted_without_a_safe_absolute_path() -> None:
+    src = fence('python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" x') + "[l](${CLAUDE_SKILL_DIR}/a.md)\n"
+    for bad in (None, "relativa/dir", '/home/a"b', "/home/$HOME", "/home/a`id`", "/home/a%b"):
+        out, report = rewrite(src, ctx(skill_dir=bad))
+        assert out == src, bad
+        assert report.unresolved == 2
 
 
-def test_the_leftovers_are_counted_so_the_sync_can_warn() -> None:
-    src = fence(
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/otro.py" x',
-        "python3 scripts/gestor-facturas.py x",
-        'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" ok',
-    )
-    _, report = rewrite(src, ctx())
-    assert report.unresolved == 1
-    assert report.relative_scripts == 1
-    assert report.scripts == ["scripts/gestor-facturas.py"]
-    assert report.runner_candidates == 2, "cuenta lo que parece una llamada, se reescriba o no"
-
-
-def test_without_a_usable_runner_nothing_is_rewritten() -> None:
-    src = fence('python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" x')
-    out, report = rewrite(src, ctx(runner=None))
-    assert out == src
-    assert report.unresolved == 1
-
-
-@pytest.mark.parametrize(
-    "bad", ['/opt/a"b/baas.py', "/opt/$HOME/baas.py", "/opt/`id`/baas.py", "/opt/a\nb/baas.py", "/opt/a%b/baas.py"]
-)
-def test_a_baas_py_path_with_shell_special_characters_is_refused(bad: str) -> None:
-    assert safe_runner("python3", bad, "antigravity") is None
+@pytest.mark.parametrize("bad", ['/opt/a"b', "/opt/$HOME/x", "/opt/`id`", "/opt/a\nb", "/opt/a%b", "relativa", ""])
+def test_a_folder_with_shell_special_characters_is_refused(bad: str) -> None:
+    assert safe_dir(bad) is None
 
 
 def test_paths_with_spaces_parentheses_and_windows_separators_are_accepted() -> None:
-    win = safe_runner("python", "C:\\Program Files (x86)\\baas plugin\\scripts\\baas.py", "antigravity", windows=True)
-    assert win is not None
-    out, _ = rewrite(fence('python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" x'), ctx(runner=win))
-    assert out.startswith('```bash\npython "C:\\Program Files (x86)\\baas plugin\\scripts\\baas.py" run-script')
-    assert safe_runner("python3", "/home/a b/(x)/baas.py", "antigravity") is not None
+    assert safe_dir("/home/a b/(x)/skills/demo-x") == "/home/a b/(x)/skills/demo-x"
+    assert safe_dir("C:\\Users\\Ana María\\.gemini\\config\\skills\\demo-x", windows=True) is not None
+    assert safe_dir("/opt/a\\b", windows=False) is None, "una barra invertida en POSIX es un escape"
+    assert safe_dir("relativa/dir", windows=True) is None
 
 
-def test_a_backslash_in_a_posix_path_is_refused() -> None:
-    assert safe_runner("python3", "/opt/a\\b/baas.py", "antigravity", windows=False) is None
-    assert safe_runner("python", "C:\\a\\baas.py", "antigravity", windows=True) is not None
+def test_on_windows_the_interpreter_of_the_recognised_calls_is_python() -> None:
+    src = fence(
+        'python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" a',
+        'python3 "${CLAUDE_SKILL_DIR}/scripts/no-esta.py" b',
+        'bash "${CLAUDE_SKILL_DIR}/scripts/run.sh" c',
+    )
+    win = "C:\\Users\\Ana\\skills\\demo-gestor"
+    out, report = rewrite(src, ctx(windows=True, skill_dir=win))
+    assert f'python "{win}/scripts/gestor-facturas.py" a' in out
+    assert f'python3 "{win}/scripts/no-esta.py" b' in out, "solo las llamadas reconocidas"
+    assert f'bash "{win}/scripts/run.sh" c' in out
+    assert report.calls == [("python", "scripts/gestor-facturas.py"), ("bash", "scripts/run.sh")]
 
 
-def test_the_interpolated_names_cannot_inject_anything() -> None:
+# --- rutas relativas «desde la carpeta de la skill» ------------------------------------------------------
+
+
+def test_a_relative_call_is_resolved_when_the_same_line_says_to_run_it_from_the_skill_folder() -> None:
+    src = "Ejecuta el script desde la carpeta de la skill: `python3 scripts/gestor-facturas.py`.\n"
+    out, report = rewrite(src, ctx())
+    assert out == f'Ejecuta el script desde la carpeta de la skill: `python3 "{DIR}/scripts/gestor-facturas.py"`.\n'
+    assert report.calls == [("python3", "scripts/gestor-facturas.py")]
+    assert report.relative_scripts == 0
+
+
+@pytest.mark.parametrize(
+    "hint",
+    [
+        "Ejecuta desde la carpeta de la skill:",
+        "Desde el directorio de la skill:",
+        "Run it from the skill directory:",
+        "From the skill folder:",
+    ],
+)
+def test_the_line_before_a_code_block_can_carry_the_hint(hint: str) -> None:
+    src = f"{hint}\n\n```bash\npython3 scripts/gestor-facturas.py status\n./scripts/run.sh init\n```\n"
+    out, report = rewrite(src, ctx())
+    assert f'python3 "{DIR}/scripts/gestor-facturas.py" status' in out
+    assert f'"{DIR}/scripts/run.sh" init' in out
+    assert [c[1] for c in report.calls] == ["scripts/gestor-facturas.py", "scripts/run.sh"]
+
+
+def test_cd_to_the_skill_folder_on_the_same_line_or_earlier_in_the_block_sets_the_directory() -> None:
+    src = fence(
+        'cd "${CLAUDE_SKILL_DIR}" && python3 scripts/gestor-facturas.py a',
+        "cd ${CLAUDE_SKILL_DIR}; python3 scripts/gestor-facturas.py b",
+    )
+    out, _ = rewrite(src, ctx())
+    assert out == fence(
+        f'cd "{DIR}" && python3 "{DIR}/scripts/gestor-facturas.py" a',
+        f'cd {DIR}; python3 "{DIR}/scripts/gestor-facturas.py" b',
+    )
+    block = fence(
+        'cd "${CLAUDE_SKILL_DIR}"',
+        "python3 scripts/gestor-facturas.py c",
+        "cd /otro/sitio",
+        "python3 scripts/gestor-facturas.py d",
+    )
+    out, report = rewrite(block, ctx())
+    assert f'python3 "{DIR}/scripts/gestor-facturas.py" c' in out
+    assert "python3 scripts/gestor-facturas.py d" in out, "tras otro `cd` ya no se sabe"
+    assert report.relative_scripts == 1
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "Ejecuta `python3 scripts/gestor-facturas.py status`.\n",  # sin pista
+        fence("python3 scripts/gestor-facturas.py status"),
+        "Desde la carpeta de la skill:\n\nOtro párrafo.\n\n```bash\npython3 scripts/gestor-facturas.py x\n```\n",
+        "Desde la carpeta de la skill: `python3 scripts/no-esta.py`.\n",  # el script no está en el paquete
+        "Desde la carpeta de la skill: `node scripts/gestor-facturas.py`.\n",  # intérprete que no corresponde
+        "Desde otra carpeta: `python3 scripts/gestor-facturas.py`.\n",
+    ],
+)
+def test_a_relative_call_without_certainty_is_left_intact_and_counted(src: str) -> None:
+    out, report = rewrite(src, ctx())
+    assert out == src
+    assert report.calls == []
+    assert report.relative_scripts >= 1
+
+
+def test_a_bare_path_or_a_call_with_options_is_not_a_call_the_rewriter_recognises() -> None:
+    src = (
+        "Desde la carpeta de la skill: `scripts/run.sh init` y `bash -x scripts/run.sh` y `python3 -u scripts/x.py`.\n"
+    )
+    out, report = rewrite(src, ctx())
+    assert out == src
+    assert report.calls == []
+
+
+def test_without_a_safe_folder_relative_calls_are_not_rewritten() -> None:
+    src = "Desde la carpeta de la skill: `python3 scripts/gestor-facturas.py`.\n"
+    out, _ = rewrite(src, ctx(skill_dir=None))
+    assert out == src
+
+
+def test_the_report_says_whether_the_text_depends_on_the_folder() -> None:
+    assert rewrite("sin nada\n", ctx())[1].uses_dir is False
+    assert rewrite("`${CLAUDE_SKILL_DIR}/a.md`\n", ctx())[1].uses_dir is True
+    assert rewrite("Desde la carpeta de la skill: `python3 scripts/gestor-facturas.py`\n", ctx())[1].uses_dir is True
+    assert rewrite("`python3 scripts/otro.py` suelto\n", ctx())[1].uses_dir is True
+
+
+def test_the_names_that_enter_the_text_cannot_inject_anything() -> None:
     for kwargs in ({"org": 'demo"; rm -rf /; "'}, {"skill": "ges tor"}, {"org": "Demo"}, {"skill": "../x"}):
         with pytest.raises(ValueError, match="no válido"):
             rewrite(fence('python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" x'), ctx(**kwargs))
@@ -284,11 +348,11 @@ def test_citations_that_do_not_match_exactly_a_synced_skill_are_left_alone(src: 
     assert report.citations == 0
 
 
-def test_nothing_is_rewritten_inside_fenced_blocks_except_the_script_calls() -> None:
+def test_nothing_is_rewritten_inside_fenced_blocks_except_the_folder_variable() -> None:
     src = (
         "```markdown\n"
         "Ejemplo ajeno: [x](../facturacion/SKILL.md) y `/gestor`\n"
-        '${CLAUDE_SKILL_DIR}/templates/a.docx y python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" ok\n'
+        "${CLAUDE_SKILL_DIR}/templates/a.docx\n"
         "```\n"
         "~~~\n[y](../gestor/SKILL.md)\n~~~\n"
     )
@@ -296,7 +360,7 @@ def test_nothing_is_rewritten_inside_fenced_blocks_except_the_script_calls() -> 
     assert "(../facturacion/SKILL.md)" in out
     assert "`/gestor`" in out
     assert "(../gestor/SKILL.md)" in out
-    assert "${CLAUDE_SKILL_DIR}/templates/a.docx" in out
+    assert f"{DIR}/templates/a.docx" in out
 
 
 def test_links_inside_inline_code_are_examples_not_links() -> None:
@@ -306,8 +370,7 @@ def test_links_inside_inline_code_are_examples_not_links() -> None:
 
 
 def test_reference_style_definitions_are_rewritten() -> None:
-    src = "Ver [fact][f].\n\n[f]: ../facturacion/SKILL.md\n"
-    out, _ = rewrite(src, ctx())
+    out, _ = rewrite("Ver [fact][f].\n\n[f]: ../facturacion/SKILL.md\n", ctx())
     assert out == "Ver [fact][f].\n\n[f]: ../demo-facturacion/SKILL.md\n"
 
 
@@ -318,8 +381,7 @@ def test_an_unclosed_fence_swallows_the_rest_and_nothing_else_is_rewritten_there
 
 
 def test_the_report_lists_the_candidate_names_whether_or_not_they_are_synced() -> None:
-    src = "[x](../otra/SKILL.md) [y](../facturacion/SKILL.md) `/tampoco` `/gestor`\n"
-    _, report = rewrite(src, ctx())
+    _, report = rewrite("[x](../otra/SKILL.md) [y](../facturacion/SKILL.md) `/tampoco` `/gestor`\n", ctx())
     assert report.refs == ["facturacion", "gestor", "otra", "tampoco"]
 
 
@@ -330,14 +392,13 @@ def test_rewriting_is_deterministic_and_idempotent() -> None:
     src = (
         "Ver [f](../facturacion/SKILL.md) y `/gestor`.\n"
         + fence('python3 "${CLAUDE_SKILL_DIR}/scripts/gestor-facturas.py" list', "python3 scripts/x.py")
-        + "Tras: `python3 ${CLAUDE_SKILL_DIR}/scripts/otro.py`.\n"
+        + "Desde la carpeta de la skill: `python3 scripts/gestor-facturas.py`\n"
     )
     once, _ = rewrite(src, ctx())
-    again, _ = rewrite(src, ctx())
-    assert once == again
-    twice, report = rewrite(once, ctx())
+    assert once == rewrite(src, ctx())[0]
+    assert "CLAUDE_SKILL_DIR" not in once
+    twice, _ = rewrite(once, ctx())
     assert twice == once, "lo ya reescrito no vuelve a cambiar"
-    assert report.scripts == []
 
 
 def test_crlf_files_keep_their_line_endings() -> None:
@@ -347,7 +408,7 @@ def test_crlf_files_keep_their_line_endings() -> None:
     )
     out, _ = rewrite(src, ctx())
     assert out == (
-        "[f](../demo-facturacion/SKILL.md)\r\n```bash\r\n" + cmd("scripts/gestor-facturas.py", " x") + "\r\n```\r\n"
+        f'[f](../demo-facturacion/SKILL.md)\r\n```bash\r\npython3 "{DIR}/scripts/gestor-facturas.py" x\r\n```\r\n'
     )
 
 
@@ -355,15 +416,4 @@ def test_a_document_without_anything_to_rewrite_is_returned_unchanged() -> None:
     src = "# Título\n\nTexto normal con `código` y [web](https://example.com).\n"
     out, report = rewrite(src, ctx())
     assert out == src
-    assert (report.scripts, report.links, report.citations, report.unresolved) == ([], 0, 0, 0)
-
-
-@pytest.mark.parametrize(
-    "hostile", ["scripts/../gestor-facturas.py", "scripts/./gestor-facturas.py", "scripts/a/../../x.py"]
-)
-def test_dot_segments_are_refused_even_if_a_manifest_listed_them(hostile: str) -> None:
-    """El manifiesto ya los rechaza al leerlo; aquí se comprueba la segunda barrera, la de la propia orden."""
-    src = fence(f'python3 "${{CLAUDE_SKILL_DIR}}/{hostile}" x')
-    out, report = rewrite(src, ctx(scripts=SCRIPTS | {hostile}))
-    assert out == src
-    assert report.scripts == []
+    assert (report.calls, report.links, report.citations, report.unresolved) == ([], 0, 0, 0)

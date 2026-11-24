@@ -259,61 +259,54 @@ def test_a_managed_skill_that_becomes_manual_only_is_removed(env: Env) -> None:
 # --- scripts: nunca listos para ejecutarse ----------------------------------------------------
 
 
-def test_scripts_and_executables_are_not_copied_and_the_user_is_told(env: Env) -> None:
-    env.publish(
-        files={
-            "SKILL.md": "---\nname: facturacion\ndescription: x\n---\n# t\n",
-            "scripts/run.sh": "#!/bin/sh\necho hola\n",
-            "scripts/lib/util.py": "X = 1\n",
-            "scripts/LEEME.md": "# datos dentro de scripts/\n",
-            "otro.py": "print(1)\n",
-            "bin/herramienta": "binario\n",
-            "doc/disfrazado.txt": "#!/usr/bin/env python3\nprint(1)\n",
-            "instalar.bat": "echo hola\n",
-            "references/a.md": "# a\n",
-            "templates/informe.docx": BINARY,
-        },
-        executable=["bin/herramienta"],
-    )
+PACKAGE = {
+    "SKILL.md": "---\nname: facturacion\ndescription: x\n---\n# t\n",
+    "scripts/run.sh": "#!/bin/sh\necho hola\n",
+    "scripts/lib/util.py": "X = 1\n",
+    "scripts/LEEME.md": "# datos dentro de scripts/\n",
+    "otro.py": "print(1)\n",
+    "bin/herramienta": b"\x7fELF-binario\n",
+    "doc/disfrazado.txt": "#!/usr/bin/env python3\nprint(1)\n",
+    "instalar.bat": "echo hola\n",
+    "references/a.md": "# a\n",
+    "templates/informe.docx": BINARY,
+}
+
+
+def test_scripts_and_executables_are_copied_with_their_exact_content(env: Env) -> None:
+    pkg = env.publish(files=dict(PACKAGE), executable=["scripts/run.sh", "bin/herramienta"])
     code, out = env.run()
     assert code == 0, out
-    files = env.tree(env.root / "demo-facturacion")
-    assert sorted(files) == ["SKILL.md", "references/a.md", "templates/informe.docx"]
-    for rel in (
-        "scripts/run.sh",
-        "scripts/lib/util.py",
-        "scripts/LEEME.md",
-        "otro.py",
-        "bin/herramienta",
-        "doc/disfrazado.txt",
-        "instalar.bat",
-    ):
-        assert rel in out, f"{rel} debe figurar como omitido"
-    assert "no funcionará completa" in out
-    omitted = {o["path"] for o in env.control()["skills"]["facturacion"]["omitted"]}
-    assert omitted == {
-        "scripts/run.sh",
-        "scripts/lib/util.py",
-        "scripts/LEEME.md",
-        "otro.py",
-        "bin/herramienta",
-        "doc/disfrazado.txt",
-        "instalar.bat",
-    }
+    base = env.root / "demo-facturacion"
+    copied = env.tree(base)
+    assert sorted(copied) == sorted(PACKAGE), "se copia el paquete entero, como Claude Code"
+    for rel, original in pkg.files.items():
+        if rel != "SKILL.md":  # el SKILL.md se adapta; lo demás, byte a byte
+            assert copied[rel] == original.content, rel
+    assert "no se copian" not in out
+    assert "omitted" not in env.control()["skills"]["facturacion"]
+    recorded = {f["path"]: f for f in env.control()["skills"]["facturacion"]["files"]}
+    assert sorted(recorded) == sorted(PACKAGE)
+    assert recorded["scripts/run.sh"]["sha256"] == hashlib.sha256(copied["scripts/run.sh"]).hexdigest()
 
 
 @posix_only
-def test_nothing_written_is_executable_and_modes_are_private(env: Env) -> None:
-    env.publish(files={"SKILL.md": "---\nname: facturacion\ndescription: x\n---\n#\n", "references/a.md": "a"})
+def test_only_what_the_manifest_marks_as_executable_is_executable_and_everything_is_private(env: Env) -> None:
+    env.publish(files=dict(PACKAGE), executable=["scripts/run.sh", "bin/herramienta"])
     assert env.run()[0] == 0
-    for dirpath, dirs, files in os.walk(env.root / "demo-facturacion"):
+    base = env.root / "demo-facturacion"
+    for dirpath, dirs, files in os.walk(base):
         for d in dirs:
-            assert stat.S_IMODE((Path(dirpath) / d).stat().st_mode) == 0o700
+            assert stat.S_IMODE((Path(dirpath) / d).stat().st_mode) == 0o700, d
         for f in files:
-            assert stat.S_IMODE((Path(dirpath) / f).stat().st_mode) == 0o600
-    assert stat.S_IMODE((env.root / "demo-facturacion").stat().st_mode) == 0o700
+            rel = (Path(dirpath) / f).relative_to(base).as_posix()
+            expected = 0o700 if rel in ("scripts/run.sh", "bin/herramienta") else 0o600
+            assert stat.S_IMODE((Path(dirpath) / f).stat().st_mode) == expected, rel
+    assert stat.S_IMODE(base.stat().st_mode) == 0o700
     assert stat.S_IMODE((env.root / CONTROL).stat().st_mode) == 0o600
     assert stat.S_IMODE(env.root.stat().st_mode) == 0o700  # la creó el plugin
+    recorded = {f["path"]: f for f in env.control()["skills"]["facturacion"]["files"]}
+    assert {p for p, f in recorded.items() if f.get("executable")} == {"scripts/run.sh", "bin/herramienta"}
 
 
 # --- nombres ------------------------------------------------------------------------------------
@@ -751,3 +744,115 @@ def test_without_a_global_mcp_entry_the_user_is_told_the_skills_cannot_use_the_t
     assert code == 0, out
     assert "no hay un servidor `baas`" in out
     assert "setup antigravity --org demo" in out
+
+
+# --- scripts copiados: integridad, enlaces, retirada y ediciones del usuario (T22) ------------------------------
+
+
+def with_script(env: Env, name: str = "facturacion", body: str = "print('v1')\n"):
+    files = {
+        "SKILL.md": f"---\nname: {name}\ndescription: x\n---\n#\n",
+        "scripts/run.py": body,
+        "scripts/lib/u.py": "X=1\n",
+    }
+    return env.publish(name, files=files, executable=["scripts/run.py"])
+
+
+def test_a_script_with_a_wrong_hash_installs_nothing_of_a_new_skill(env: Env) -> None:
+    pkg = with_script(env)
+    pkg.files["scripts/run.py"] = PkgFile(b"print('malicioso')\n", sha256_override="0" * 64)
+    code, out = env.run()
+    assert code == 12, out
+    assert "SHA-256" in out
+    assert not (env.root / "demo-facturacion").exists()
+    assert not any(env.root.glob(".baas-tmp*")) if env.root.exists() else True
+
+
+def test_a_script_with_a_wrong_hash_keeps_the_previous_version_untouched(env: Env) -> None:
+    pkg = with_script(env)
+    assert env.run()[0] == 0
+    before = env.tree()
+    pkg.files["scripts/run.py"] = PkgFile(b"print('malicioso')\n", sha256_override="0" * 64)
+    code, out = env.run()
+    assert code == 12, out
+    assert env.tree() == before
+    assert (env.root / "demo-facturacion/scripts/run.py").read_text() == "print('v1')\n"
+    assert [p.name for p in env.root.iterdir() if p.name.startswith(".baas-tmp")] == []
+
+
+@pytest.mark.parametrize(
+    "bad", ["scripts/../../escape.py", "/etc/cron.d/x", "scripts/a/../../../x.sh", "scripts\\x.py"]
+)
+def test_a_script_path_outside_the_folder_installs_nothing(env: Env, bad: str, tmp_path: Path) -> None:
+    pkg = with_script(env)
+    pkg.files[bad] = PkgFile(b"print(1)\n")
+    code, out = env.run()
+    assert code == 12, out
+    assert not (env.root / "demo-facturacion").exists()
+    assert not (env.root.parent / "escape.py").exists()
+    assert not (tmp_path / "escape.py").exists()
+
+
+@posix_only
+def test_a_symlinked_scripts_folder_counts_as_a_modification_and_is_never_followed(env: Env, tmp_path: Path) -> None:
+    pkg = with_script(env)
+    assert env.run()[0] == 0
+    outside = tmp_path / "ajeno"
+    outside.mkdir()
+    (outside / "run.py").write_text("print('ajeno')\n")
+    skill = env.root / "demo-facturacion"
+    for p in sorted((skill / "scripts").rglob("*"), reverse=True):
+        p.unlink() if p.is_file() else p.rmdir()
+    (skill / "scripts").rmdir()
+    (skill / "scripts").symlink_to(outside, target_is_directory=True)
+    pkg.files["scripts/run.py"] = PkgFile(b"print('v2')\n")
+    code, out = env.run()
+    assert code == 0, out
+    assert "enlace simbólico" in out or "falta" in out
+    assert (skill / "scripts").is_symlink()
+    assert (outside / "run.py").read_text() == "print('ajeno')\n"
+    code, out = env.run("--force")
+    assert code == 0, out
+    assert not (skill / "scripts").is_symlink()
+    assert (outside / "run.py").read_text() == "print('ajeno')\n", "lo de fuera no se toca ni con --force"
+
+
+def test_retiring_a_skill_removes_its_scripts_with_it(env: Env) -> None:
+    with_script(env)
+    with_script(env, "gestor")
+    assert env.run()[0] == 0
+    env.server.state.skills["demo"]["gestor"].roles = ["otro-rol"]
+    code, out = env.run()
+    assert code == 0, out
+    assert not (env.root / "demo-gestor").exists()
+    assert (env.root / "demo-facturacion/scripts/run.py").exists()
+    env.server.state.global_kill_switch = True
+    assert env.run()[0] == 0
+    assert not (env.root / "demo-facturacion").exists()
+
+
+def test_a_script_edited_by_the_user_is_not_overwritten_or_removed_without_force(env: Env) -> None:
+    pkg = with_script(env)
+    assert env.run()[0] == 0
+    script = env.root / "demo-facturacion/scripts/run.py"
+    script.write_text("print('mio')\n")
+    pkg.files["scripts/run.py"] = PkgFile(b"print('v2')\n")
+    code, out = env.run()
+    assert code == 0, out
+    assert "modificada" in out
+    assert script.read_text() == "print('mio')\n"
+    env.server.state.skills["demo"]["facturacion"].roles = ["otro-rol"]
+    assert env.run()[0] == 0
+    assert script.read_text() == "print('mio')\n", "tampoco se retira"
+    assert env.run("--force")[0] == 0
+    assert not script.exists()
+
+
+def test_a_new_script_file_added_by_the_user_counts_as_a_modification(env: Env) -> None:
+    pkg = with_script(env)
+    assert env.run()[0] == 0
+    (env.root / "demo-facturacion/scripts/extra.sh").write_text("echo hola\n")
+    pkg.files["scripts/run.py"] = PkgFile(b"print('v2')\n")
+    code, out = env.run()
+    assert code == 0, out
+    assert "has añadido scripts/extra.sh" in out

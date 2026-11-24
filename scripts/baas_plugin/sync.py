@@ -780,5 +780,15 @@ def add_sync_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore[ty
     p.add_argument(
         "--org", help="Con `--tool antigravity`: slug de la organización (obligatorio si perteneces a varias)"
     )
+    p.add_argument(
+        "--verify",
+        action="store_true",
+        help="Con `--tool antigravity`: recomprueba las skills copiadas contra el fichero de control (sin red)",
+    )
+    p.add_argument(
+        "--permissions",
+        action="store_true",
+        help="Con `--tool antigravity`: imprime la regla de permisos sugerida para `agy` (sin red; no la escribe)",
+    )
     add_claude_home_args(p)
     p.set_defaults(func=cmd_sync)
