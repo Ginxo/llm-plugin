@@ -157,3 +157,34 @@ def test_the_doc_no_longer_says_that_scripts_are_not_copied() -> None:
         "--synced-org <organización> skills/<skill>",
     ):
         assert stale not in doc, stale
+
+
+def test_the_doc_says_where_the_mcp_reads_are_counted_and_does_not_claim_they_are_audited() -> None:
+    doc = text()
+    assert "Uso → «Skills y conocimiento»" in doc
+    assert "Contenido escrito (MCP)" in doc
+    assert "no en Auditoría" in doc
+    for scope in ("escrituras", "accesos denegados", "kill switch", "administrador de plataforma"):
+        assert scope in doc, scope
+    assert not re.search(r"queda\s+\*\*auditado\*\*|la webapp registra la llamada", doc), "las lecturas no se auditan"
+
+
+def test_the_doc_records_what_was_checked_on_2026_11_24() -> None:
+    doc = " ".join(text().split())  # el documento parte las líneas
+    for needle in (
+        "2026-11-24",
+        "1.5.16",
+        "pide habilitar el workspace",
+        "~/.gemini/antigravity-cli/mcp/baas/instructions.md",
+        "15 tools",
+        "refuerzo",
+    ):
+        assert needle in doc, needle
+    assert "¿Usa el campo `instructions` del MCP?" not in doc, "ya está respondida"
+    assert "Sin comprobar** todavía: Windows y macOS, una carpeta sin confianza" not in doc
+
+
+def test_the_remaining_open_question_about_untrusted_folders_is_about_the_cli() -> None:
+    doc = text()
+    row = next(line for line in doc.splitlines() if line.startswith("| ¿Respeta `agy`"))
+    assert "sin confianza" in row

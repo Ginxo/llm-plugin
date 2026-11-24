@@ -1,8 +1,9 @@
 # Antigravity con BaaS-AI-IP
 
-> **Estado**: tarea T3 (#165) de «soporte de más herramientas». Comprobado a mano el **2026-11-23** en Linux con la
-> **extensión de VS Code 1.13.0** y la **CLI `agy` 1.5.15** (resultados en [Lo que se comprobó](#9-lo-que-se-comprobó)).
-> **Sin comprobar** todavía: Windows y macOS, una carpeta sin confianza y el campo `instructions` del MCP (al final).
+> **Estado**: tarea T3 (#165) de «soporte de más herramientas». Comprobado a mano en Linux con la **extensión de
+> VS Code 1.13.0** y la **CLI `agy`** (1.5.15 el 2026-11-23 y 1.5.16 el 2026-11-24; resultados en
+> [Lo que se comprobó](#9-lo-que-se-comprobó)). **Sin comprobar** todavía: Windows y macOS, la sintaxis exacta de las
+> reglas de permisos de `agy` y qué hace la CLI en una carpeta sin confianza (al final).
 
 Antigravity se usa como **extensión de VS Code** (`Google.google-antigravity`, VS Code 1.90 o posterior, cuenta de Google)
 y como **CLI `agy`** (Linux, macOS y Windows). La extensión arranca el mismo motor que la CLI (`~/.gemini/bin/agy`), pero
@@ -102,7 +103,9 @@ Es el equivalente de la skill `baas-brain` de Claude Code: la regla (`trigger: a
 enseña al agente las tools `baas_*` y a **detenerse** ante `AUTHORIZATION_DENIED` y `KILL_SWITCH_ACTIVE`, sin buscar el
 mismo contenido por otra vía. La regla es **de proyecto** también con el MCP global: Antigravity la lee en cada
 proyecto donde exista (comprobado con la extensión), así que ejecuta `setup` una vez por proyecto. Ocupa unos 5 KB;
-Antigravity admite 24 000 bytes por regla y trunca lo que pase. No usa `AGENTS.md` ni `GEMINI.md` para no pisar los
+Antigravity admite 24 000 bytes por regla y trunca lo que pase. Es un **refuerzo, no imprescindible**: la extensión y
+la CLI también usan el campo `instructions` del servidor MCP aun sin la regla (comprobado, apartado 9), así que el
+agente ya conoce las tools; la regla añade las normas (detenerse ante `AUTHORIZATION_DENIED`, scripts, sandbox…). No usa `AGENTS.md` ni `GEMINI.md` para no pisar los
 tuyos. Tampoco explica `/baas-sync`, que es de Claude Code. Sí explica las skills nativas y sus scripts: se ejecutan
 desde la carpeta de la skill (verificados al sincronizar), nunca copiando ni ejecutando a mano el contenido de
 `baas_get_script`; qué hacer si una orden falla dentro del sandbox; y que, si algo no cuadra, el usuario ejecute
@@ -291,6 +294,10 @@ La documentación de Antigravity **no admite `${VAR}`** en las cabeceras ni un c
   salir, no hay trazas en la webapp (W8) y el kill switch, el bloqueo y la pausa de la organización **no cortan el
   modelo**. Solo cortan el MCP (`KILL_SWITCH_ACTIVE`). No pegues datos que no pegarías en una herramienta sin
   protección. (La protección para su CLI con clave de Gemini es el trabajo de #178.)
+- **Auditoría de las lecturas.** Las lecturas del MCP (`baas_whoami`, `baas_list_skills`, `baas_get_script`…) **no
+  salen en la pantalla Auditoría** de la webapp: se cuentan en **Uso → «Skills y conocimiento»** (agregado por hora y por
+  skill). Auditoría registra las escrituras, los accesos denegados, el kill switch y los accesos de administrador de
+  plataforma.
 - **Varias organizaciones a la vez con el MCP**: las skills sí conviven, pero el global solo admite un MCP `baas` (apartado 5, «Varias organizaciones, un solo MCP»).
 - **Las skills de la organización como comandos del MCP.** El servidor `baas` las expone como *prompts* del MCP
   (`/mcp__baas__<skill>` en Claude Code) y la documentación de Antigravity no dice que los muestre: por eso se copian
@@ -332,6 +339,21 @@ Prueba manual del 2026-11-23, Linux, extensión de VS Code **1.13.0** y `agy` **
   conecta y `baas_whoami` responde. Por eso el ámbito por defecto es el global.
 - La extensión arranca `~/.gemini/bin/agy --hub … --add-dir=<proyecto>`: el motor es el mismo que el de la CLI; solo
   cambia qué configuración de MCP lee.
+
+Prueba manual del 2026-11-24, Linux, extensión **1.13.0** y `agy` **1.5.16**:
+
+- **Carpeta sin confianza.** En una carpeta sin confianza la extensión de VS Code **no se activa** (pide habilitar el
+  workspace), así que no conecta con el MCP. Qué hace la CLI en una carpeta sin confianza sigue sin comprobarse
+  (apartado 11).
+- **Campo `instructions` del MCP.** La extensión y la CLI lo usan aunque no exista `.agents/rules/baas.md`: en la CLI el
+  agente lee `~/.gemini/antigravity-cli/mcp/baas/instructions.md` (la caché que escribe `agy`) y en la extensión listó
+  correctamente las 15 tools sin la regla. La regla de proyecto es, por tanto, un **refuerzo** y no es imprescindible.
+- **Qué se audita.** Tras usar Antigravity, la pantalla Auditoría (`/audit`) de la webapp **no** mostraba las lecturas
+  (`baas_whoami`, `baas_list_skills`, `baas_get_script`…), solo escrituras (`Contenido escrito (MCP)`), inicios de sesión
+  y TOTP. Es lo esperado: el servidor MCP solo emite eventos de auditoría de escritura (`mcp.document.written`), de
+  acceso denegado (`mcp.access.denied`), de kill switch (`mcp.kill_switch.rejected`) y de acceso de administrador de
+  plataforma (`mcp.platform_admin.access`). Las lecturas se cuentan en el uso (`content.usage`, cada 60 s por
+  organización y usuario), que se ve en **Uso → «Skills y conocimiento»**, agregado por hora y por skill.
 
 ## 10. Lista de comprobación manual
 
@@ -382,22 +404,24 @@ Marca lo que compruebes (lo de Linux ya está hecho el 2026-11-23; falta Windows
 - [ ] Windows: `%USERPROFILE%\.gemini\config\skills\`, los nombres y las rutas salen bien; las órdenes reescritas usan `python` y la carpeta de la skill entre comillas funciona (con espacios).
 - [ ] El agente aplica la regla: ante una pregunta sobre la organización busca con `baas_search_knowledge`.
 - [ ] Con un recurso al que no tienes rol, el agente **se detiene** e informa de `AUTHORIZATION_DENIED` (sin buscar otra vía).
-- [ ] El acceso queda **auditado** (la webapp registra la llamada a la tool).
+- [ ] Las lecturas del MCP (`baas_whoami`, `baas_list_skills`…) se **cuentan en Uso → «Skills y conocimiento»**
+      (agregado por hora y por skill; puede tardar unos minutos), **no en Auditoría**. Auditoría registra escrituras
+      (`Contenido escrito (MCP)`), accesos denegados, kill switch y accesos de administrador de plataforma: para ver algo
+      ahí, provoca una escritura o un acceso denegado, no una lectura.
 - [ ] Con la organización pausada, `KILL_SWITCH_ACTIVE` y el agente se detiene.
 - [ ] La clave **no** aparece en el chat, en ningún `.gitignore` ni en ningún otro fichero.
 - [ ] Windows: las rutas (`%USERPROFILE%\.gemini\config`) y el JSON salen bien; anota los permisos reales del fichero.
 
 ## 11. Preguntas abiertas (la documentación no las responde)
 
-La de si la extensión lee el mismo fichero que la CLI está **respondida** (apartado 9). Quedan estas:
+Están **respondidas** (apartado 9) si la extensión lee el mismo fichero que la CLI, qué pasa con la extensión en una carpeta sin confianza y si usan el campo `instructions`. Quedan estas:
 
 | Pregunta | Cómo comprobarla |
 | :--- | :--- |
-| ¿Respeta el `.agents/mcp_config.json` de proyecto en una **carpeta sin confianza** (*Restricted Mode*)? | La extensión no lo lee ni con la confianza aceptada, así que el riesgo se limita a la CLI: abre una carpeta sin confianza con `agy` y mira si `baas` se conecta. Si lo hiciera, un repositorio ajeno podría traer su propio `.agents/mcp_config.json`: no confíes en uno que no hayas escrito tú |
+| ¿Respeta `agy` el `.agents/mcp_config.json` de un proyecto en una **carpeta sin confianza**? (la extensión ni se activa) | Abre una carpeta sin confianza con `agy` y mira si `baas` se conecta. Si lo hiciera, un repositorio ajeno podría traer su propio `.agents/mcp_config.json`: no confíes en uno que no hayas escrito tú |
 | ¿Ofrece la extensión las skills nativas como comando, o solo las usa el agente? | Tras `sync --tool antigravity`, mira en la extensión si aparece `/<skill>` o algún menú de skills; pídele al agente una tarea que encaje con la `description` y mira si la usa. Solo la CLI está documentada como comando |
 | ¿La CLI las lanza como `/<nombre>` (el de la carpeta, `<organización>-<skill>`) o con otro prefijo? | `/skills` en `agy` y prueba `/<skill>`. El plugin pone `name` = carpeta y no inventa otros prefijos |
 | ¿Qué sintaxis exacta tiene la regla `command(...)` con rutas entrecomilladas o con espacios, y admite `*` dentro de un patrón? | Lo que dice la documentación es solo prefijo palabra a palabra y `*` global. Prueba la regla sugerida en `agy` y anota qué órdenes casan |
 | ¿Cómo se comporta el sandbox en la extensión de VS Code? | Ejecuta una skill con scripts desde la extensión: ¿falla igual con `python3` envoltorio? ¿pide salir? |
-| ¿Usa el campo `instructions` del MCP? | La documentación solo dice que lo guarda en una caché (`instructions.md`); mira si el agente lo recibe sin la regla (borra `.agents/rules/baas.md` y pregúntale qué tools tiene) |
 
 Fuentes: <https://antigravity.google/docs/mcp>, <https://antigravity.google/docs/rules>, <https://antigravity.google/docs/skills>.
