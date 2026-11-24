@@ -11,21 +11,24 @@ y el renombrado atómico (`sync.swap_dir`), el bloqueo, y la revocación (lo que
 
 Lo que añade, porque aquí el destino es una carpeta **del usuario** y no un plugin propio:
 
-- **Nunca pisa lo del usuario.** Lo que el plugin gestiona se anota en `.baas-skills.json` (sin secretos: organización,
-  `package_sha256` y SHA-256 de lo escrito de cada skill). Una carpeta con el nombre de una skill de la organización que
-  no está ahí es del usuario: se deja como está y se cuenta (choque de nombre). Una skill gestionada que el usuario ha
-  editado (o a la que ha añadido ficheros o enlaces) tampoco se sobrescribe ni se retira, salvo con `--force`.
-- **Nombres.** La carpeta es el nombre del comando, sin prefijo de organización (así los enlaces `../<otra>/SKILL.md`
-  y las citas `/<otra>` de las propias skills siguen valiendo) y sin `:` (Windows). Solo minúsculas, dígitos y guiones;
-  lo demás no se instala y se cuenta. El global solo admite una organización: al cambiar de organización se retiran las
-  skills de la anterior.
+- **Nunca pisa lo del usuario.** Lo que el plugin gestiona de cada organización se anota en
+  `.baas-skills-<organización>.json` (sin secretos: `package_sha256` y SHA-256 de lo escrito de cada skill). Una carpeta
+  con el nombre de una skill de la organización que no está ahí es ajena (del usuario o, si los nombres se solapan, de
+  otra organización): se deja como está y se cuenta (choque de nombre). Una skill gestionada que el usuario ha editado
+  (o a la que ha añadido ficheros o enlaces) tampoco se sobrescribe ni se retira, salvo con `--force`.
+- **Nombres.** La carpeta y el comando son `<organización>-<skill>`: el prefijo es obligatorio porque un usuario puede
+  tener skills con el mismo nombre en varias organizaciones (como `/<org>:<skill>` en Claude Code), que conviven en
+  la misma carpeta. No es `<org>:<skill>` porque la documentación de Antigravity no dice que `:` valga en `name` (solo
+  «minúsculas» y «guiones») y Windows no lo admite en una carpeta. Solo minúsculas, dígitos y guiones; lo demás no se
+  instala y se cuenta. Cada organización tiene su fichero de control y retira solo lo suyo.
 - **Sin scripts.** No se copia nada que pueda ejecutarse sin la comprobación que hace el plugin al ejecutar
   (`run-script`): ficheros marcados como ejecutables, carpetas `scripts/`, extensiones de código o binarios y todo lo
   que empiece por `#!`. Se listan y se avisa de que esa skill no funcionará completa en la herramienta.
 - **`SKILL.md` adaptado.** Antigravity documenta `description` (obligatorio) y `name` (opcional): se escriben solo esos
-  dos (`name` = la carpeta; `when_to_use` se une a la descripción) y el cuerpo queda tal cual. Los campos propios de
-  Claude Code se quitan y se avisa; una skill que pide invocación solo manual (`disable-model-invocation`) no se
-  instala porque Antigravity no puede respetarlo.
+  dos (`name` = la carpeta; `when_to_use` se une a la descripción) y el cuerpo queda tal cual, precedido de una nota que
+  dice a qué organización pertenece la skill (las tools `baas_*` son las del MCP configurado, que puede ser el de otra
+  organización). Los campos propios de Claude Code se quitan y se avisa; una skill que pide invocación solo manual
+  (`disable-model-invocation`) no se instala porque Antigravity no puede respetarlo.
 
 Solo toca `~/.gemini/config/skills/` (y `~/baas-ai-ip/sync.lock`). Un cambio se ve con `/skills reload` en `agy`.
 """
@@ -60,15 +63,13 @@ from .errors import (
 )
 from .package_fetch import Manifest
 
-CONTROL_FILE = ".baas-skills.json"
+CONTROL_PREFIX = ".baas-skills-"  # + `<organización>.json`
+MAX_FOLDER_NAME = 200  # los sistemas de ficheros admiten 255 bytes por nombre
 CONTROL_FORMAT = 1
 MANAGED_BY = "baas-llm-plugin"
 NATIVE_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MAX_SKILL_MD = 1024 * 1024  # un SKILL.md más grande no es una skill razonable (y se lee entero en memoria)
 SHOWN_OMITTED = 8  # ficheros omitidos que se nombran en pantalla (todos quedan en el fichero de control)
-WINDOWS_RESERVED = frozenset(
-    {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
-)
 # Código y binarios ejecutables: no se copian (ni siquiera sin el bit de ejecución: `python3 x.py` no lo necesita)
 EXECUTABLE_EXTENSIONS = frozenset(
     {
@@ -78,6 +79,12 @@ EXECUTABLE_EXTENSIONS = frozenset(
     }
 )  # fmt: skip
 FRONTMATTER_KEPT = ("name", "description", "when_to_use")
+# Las tools `baas_*` son las del MCP configurado en la herramienta, que puede ser el de otra organización
+ORG_NOTE = (
+    "> **Skill de la organización «{org}».** Usa las tools `baas_*` del servidor MCP `baas` configurado en esta"
+    " herramienta. Antes de actuar, comprueba con `baas_whoami` que la organización es «{org}». Detente e informa al"
+    " usuario si no lo es o si el MCP no está conectado, y no uses el parámetro `org` para saltártelo."
+)
 
 
 @dataclass(frozen=True)
@@ -87,7 +94,6 @@ class NativeSkillTarget:
     name: str  # valor de `--tool`
     label: str
     global_dir: tuple[str, ...]  # relativo al HOME; piezas, no una ruta POSIX
-    command_names: frozenset[str]  # comandos propios de la herramienta que una skill con ese nombre taparía
     reload_hint: str
     doc: str = "docs/antigravity.md"
 
@@ -96,9 +102,8 @@ ANTIGRAVITY = NativeSkillTarget(
     name="antigravity",
     label="Antigravity",
     global_dir=(".gemini", "config", "skills"),
-    command_names=frozenset({"mcp", "skills"}),  # los de la CLI que documenta Antigravity; la lista no es exhaustiva
     reload_hint=(
-        "En `agy`, ejecuta `/skills reload` o abre una conversación nueva; cada skill se invoca como `/<nombre>`."
+        "En `agy`, ejecuta `/skills reload` o abre una conversación nueva."
         " Cómo las ofrece la extensión de VS Code no está comprobado."
     ),
 )
@@ -108,14 +113,21 @@ TARGETS: dict[str, NativeSkillTarget] = {t.name: t for t in (ANTIGRAVITY,)}
 # --- qué se instala y cómo ------------------------------------------------------------------------
 
 
-def name_problem(target: NativeSkillTarget, name: str) -> str | None:
-    """Por qué `name` no puede ser el nombre de una skill nativa (y, con él, el del comando), o `None`."""
+def folder_name(org_slug: str, skill: str) -> str:
+    """La carpeta de una skill nativa y, con ella, el comando: `<organización>-<skill>` (sin `:`, por Windows)."""
+    return f"{org_slug}-{skill}"
+
+
+def name_problem(target: NativeSkillTarget, org_slug: str, name: str) -> str | None:
+    """Por qué la skill `name` de la organización no puede ser una skill nativa, o `None`.
+
+    Con el prefijo de organización ya no hay choques con comandos de la herramienta (`/mcp`, `/skills`) ni con nombres
+    reservados de Windows (`con`, `nul`…): la carpeta siempre lleva un guion.
+    """
     if not NATIVE_NAME_RE.match(name):
         return f"{target.label} espera nombres en minúsculas, dígitos y guiones, y «{name}» no lo es"
-    if name in WINDOWS_RESERVED:
-        return f"«{name}» es un nombre reservado de Windows"
-    if name in target.command_names:
-        return f"«{name}» taparía un comando de {target.label} (`/{name}`)"
+    if len(folder_name(org_slug, name).encode()) > MAX_FOLDER_NAME:
+        return f"«{folder_name(org_slug, name)}» es demasiado largo para el nombre de una carpeta"
     return None
 
 
@@ -147,8 +159,9 @@ def _yaml_string(value: str) -> str:
     return text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").replace("\x85", "\\x85")
 
 
-def adapt_skill_md(text: str, name: str) -> tuple[str, list[str]]:
-    """El `SKILL.md` con la cabecera de Antigravity (`name` y `description`) y el cuerpo intacto.
+def adapt_skill_md(text: str, name: str, org_slug: str) -> tuple[str, list[str]]:
+    """El `SKILL.md` con la cabecera de Antigravity (`name` y `description`), una nota con la organización y el cuerpo
+    intacto.
 
     Devuelve `(texto, campos de Claude Code que se han quitado)`. Lanza `PackageError` si no tiene una cabecera o una
     `description` válidas y `NotAdaptable` si pide invocación solo manual.
@@ -174,7 +187,8 @@ def adapt_skill_md(text: str, name: str) -> tuple[str, list[str]]:
         description = f"{description} {when}"
     description = " ".join(description.split())
     _, body = skillmeta.split_frontmatter(text)
-    adapted = f"---\nname: {name}\ndescription: {_yaml_string(description)}\n---\n{body}"
+    note = ORG_NOTE.format(org=org_slug)
+    adapted = f"---\nname: {name}\ndescription: {_yaml_string(description)}\n---\n\n{note}\n\n{body}"
     dropped = [str(k) for k in data if k not in FRONTMATTER_KEPT]
     return adapted, dropped
 
@@ -232,16 +246,21 @@ def local_changes(folder: Path, entry: dict[str, Any]) -> str | None:
     return None
 
 
-# --- estado: .baas-skills.json -----------------------------------------------------------------------
+# --- estado: .baas-skills-<organización>.json -----------------------------------------------------------------------
 
 
-def read_control(root: Path) -> dict[str, Any] | None:
+def control_path(root: Path, org_slug: str) -> Path:
+    """El fichero de control de una organización: cada una gestiona solo lo suyo."""
+    return root / f"{CONTROL_PREFIX}{org_slug}.json"
+
+
+def read_control(root: Path, org_slug: str) -> dict[str, Any] | None:
     """El fichero de control, `None` si no existe. Si no es nuestro o no se entiende, se aborta sin tocar nada."""
-    path = root / CONTROL_FILE
+    path = control_path(root, org_slug)
 
     def foreign(why: str) -> ForeignDirectoryError:
         return ForeignDirectoryError(
-            f"{path} {why}: no sé qué skills de esta carpeta gestiona BaaS y no se toca nada.",
+            f"{path} {why}: no sé qué skills de la organización «{org_slug}» gestiona BaaS y no se toca nada.",
             hint="Revisa o borra ese fichero (las skills ya copiadas quedarán como tuyas) y repite el comando.",
         )
 
@@ -268,7 +287,7 @@ def write_control(root: Path, org: str, mcp_url: str, skills: dict[str, Any], wa
         "skills": skills,
         "warnings": warnings,
     }
-    claude_home.write_json_atomic(root / CONTROL_FILE, data)
+    claude_home.write_json_atomic(control_path(root, org), data)
 
 
 # --- resultado --------------------------------------------------------------------------------------
@@ -281,6 +300,10 @@ class NativeResult(sync.SyncResult):
     modified: dict[str, str] = field(default_factory=dict)  # skill gestionada editada por el usuario → qué
     excluded: dict[str, str] = field(default_factory=dict)  # skill que no se instala → por qué
     omitted: dict[str, list[dict[str, str]]] = field(default_factory=dict)  # skill → ficheros que no se copian
+
+    def cmd(self, skill: str) -> str:
+        """El nombre de la carpeta y del comando de la skill (`<organización>-<skill>`)."""
+        return folder_name(self.org, skill)
 
     def render(self) -> list[str]:
         if self.skipped:
@@ -299,14 +322,14 @@ class NativeResult(sync.SyncResult):
             ("~", self.updated, "actualizada"),
             ("-", self.removed, "retirada"),
         ):
-            lines += [f"  {mark} {n} ({label}{self.details.get(n, '')})" for n in names]
-        lines += [f"  ! {n}: NO instalada ({why})" for n, why in sorted(self.failed.items())]
+            lines += [f"  {mark} {self.cmd(n)} ({label}{self.details.get(n, '')})" for n in names]
+        lines += [f"  ! {self.cmd(n)}: NO instalada ({why})" for n, why in sorted(self.failed.items())]
         lines += [
-            f"  = {n}: {why}: no la toco (renombra la tuya si quieres la de la organización)"
+            f"  = {self.cmd(n)}: {why}: no la toco (renombra la tuya si quieres la de la organización)"
             for n, why in sorted(self.collisions.items())
         ]
         lines += [
-            f"  ? {n}: modificada en tu equipo ({why}): no la toco (`--force` la sobrescribe o la retira)"
+            f"  ? {self.cmd(n)}: modificada en tu equipo ({why}): no la toco (`--force` la sobrescribe o la retira)"
             for n, why in sorted(self.modified.items())
         ]
         lines += [f"  · {n}: no se instala ({why})" for n, why in sorted(self.excluded.items())]
@@ -314,8 +337,8 @@ class NativeResult(sync.SyncResult):
             shown = ", ".join(f["path"] for f in files[:SHOWN_OMITTED])
             more = f" y {len(files) - SHOWN_OMITTED} más" if len(files) > SHOWN_OMITTED else ""
             lines.append(
-                f"AVISO: «{name}»: no se copian {len(files)} fichero(s) ejecutables o scripts ({shown}{more}): esta"
-                f" skill no funcionará completa en {self.tool.label}."
+                f"AVISO: «{self.cmd(name)}»: no se copian {len(files)} fichero(s) ejecutables o scripts"
+                f" ({shown}{more}): esta skill no funcionará completa en {self.tool.label}."
             )
         lines += [f"AVISO: {w}" for w in self.warnings]
         lines += self.notes
@@ -325,6 +348,10 @@ class NativeResult(sync.SyncResult):
             lines.append(f"Todo al día: sin cambios ({count} {'skill' if count == 1 else 'skills'} sincronizadas).")
         elif not self.dry_run and self.changed:
             lines.append(self.tool.reload_hint)
+            installed = sorted([*self.added, *self.updated, *self.unchanged])
+            if installed:
+                shown = ", ".join(f"/{self.cmd(n)}" for n in installed[:6])
+                lines.append(f"Se invocan como {shown}{' …' if len(installed) > 6 else ''}")
         return lines
 
 
@@ -332,7 +359,7 @@ class NativeResult(sync.SyncResult):
 
 
 def _stage_skill(
-    client: Any, tmp_root: Path, name: str, manifest: Manifest
+    client: Any, tmp_root: Path, org_slug: str, name: str, manifest: Manifest
 ) -> tuple[Path, list[dict[str, str]], list[dict[str, str]], list[str]]:
     """Descarga lo copiable de la skill a un temporal y la deja lista para renombrar.
 
@@ -350,7 +377,8 @@ def _stage_skill(
         raise PackageError("el paquete no tiene SKILL.md.")
     if skill_md.size > MAX_SKILL_MD:
         raise PackageError(f"el SKILL.md es demasiado grande ({skill_md.size} bytes; el máximo es {MAX_SKILL_MD}).")
-    staged = tmp_root / f"new-{name}"
+    folder = folder_name(org_slug, name)
+    staged = tmp_root / f"new-{folder}"
     # El SHA-256 de cada fichero se verifica al descargarlo (`package_fetch`); solo se pide lo que se va a copiar.
     package_fetch.fetch_to_dir(client, dataclasses.replace(manifest, files=kept), staged)
     for f in kept:  # un script con otro nombre (`#!` al principio) tampoco se copia
@@ -366,7 +394,7 @@ def _stage_skill(
         text = md_path.read_bytes().decode("utf-8")
     except UnicodeDecodeError:
         raise PackageError("el SKILL.md no es UTF-8.") from None
-    adapted, dropped = adapt_skill_md(text, name)
+    adapted, dropped = adapt_skill_md(text, folder, org_slug)
     md_path.write_bytes(adapted.encode("utf-8"))
     return staged, tree_records(staged), sorted(omitted, key=lambda o: o["path"]), dropped
 
@@ -385,27 +413,37 @@ def sync_native(
 ) -> NativeResult:
     from .mcp_client import McpClient
 
-    result = NativeResult(org.slug, root, dry_run=opts.dry_run, tool=target)
+    slug = sync.validate_slug(org.slug)  # entra en el nombre de una carpeta: solo minúsculas, dígitos y guiones
+    result = NativeResult(slug, root, dry_run=opts.dry_run, tool=target)
     with sync._lock(baas, enabled=not opts.dry_run) as acquired:
         if not acquired:
             result.skipped = "Otra sincronización está en curso; no se hace nada. Vuelve a intentarlo en unos segundos."
             return result
         if root.exists() and not root.is_dir():
             raise ConfigError(f"{root} existe y no es una carpeta.", hint="Muévelo y repite el comando.")
-        state = read_control(root) if root.is_dir() else None
+        state = read_control(root, slug) if root.is_dir() else None
         managed = sync.local_skills(state)
         with McpClient(org.mcp_url, api_key, timeout=opts.timeout) as client:  # sin MCP no se ha tocado nada
             plans: dict[str, sync.SkillPlan] = {}
             try:
                 listed = sync.list_skills(client, result.notes)
                 for name in sorted(listed):
-                    problem = name_problem(target, name)
+                    problem = name_problem(target, slug, name)
                     if problem:
                         result.excluded[name] = problem
                         del listed[name]
-                plans = sync.resolve_plans(client, listed, managed, root, opts, result, skills_dir=root)
+                plans = sync.resolve_plans(
+                    client,
+                    listed,
+                    managed,
+                    root,
+                    opts,
+                    result,
+                    skills_dir=root,
+                    folder_of=lambda n: folder_name(slug, n),
+                )
                 for name in sorted(plans):  # una dependencia con un nombre que la herramienta no admite
-                    problem = name_problem(target, name)
+                    problem = name_problem(target, slug, name)
                     if problem:
                         result.excluded[name] = problem
                         del plans[name]
@@ -422,6 +460,7 @@ def sync_native(
 
 def _classify(
     root: Path,
+    org_slug: str,
     managed: dict[str, dict[str, Any]],
     plans: dict[str, sync.SkillPlan],
     opts: sync.SyncOptions,
@@ -430,11 +469,11 @@ def _classify(
     """`(a instalar, a retirar)`: separa lo ajeno (choques) y lo editado por el usuario, que no se toca."""
     to_install: list[str] = []
     for name, plan in sorted(plans.items()):
-        final = root / name
+        final = root / folder_name(org_slug, name)
         entry = managed.get(name)
         exists = final.is_symlink() or final.exists()
         if entry is None and exists:
-            result.collisions[name] = "choca con una skill tuya del mismo nombre"
+            result.collisions[name] = "choca con una carpeta que no es de esta organización (tuya o de otra skill)"
             continue
         if (
             entry is not None and exists and (plan.action != "keep" or opts.force)
@@ -449,7 +488,7 @@ def _classify(
     for name, entry in sorted(managed.items()):
         if name in plans:
             continue
-        final = root / name
+        final = root / folder_name(org_slug, name)
         if not (final.is_symlink() or final.exists()):
             continue
         change = local_changes(final, entry)
@@ -471,7 +510,8 @@ def _apply(
     opts: sync.SyncOptions,
     result: NativeResult,
 ) -> None:
-    to_install, to_retire = _classify(root, managed, plans, opts, result)
+    slug = org.slug
+    to_install, to_retire = _classify(root, slug, managed, plans, opts, result)
     result.unchanged = sorted(
         n for n, p in plans.items() if p.action == "keep" and n not in result.failed and n not in result.modified
     )
@@ -505,21 +545,23 @@ def _apply(
     result.omitted = {}
     try:
         for name in to_retire:  # primero lo local: no depende de que las descargas salgan bien
-            sync._remove(root / name)
+            sync._remove(root / folder_name(slug, name))
             skills.pop(name, None)
-        for name in [n for n in managed if n not in plans and n not in to_retire and not (root / n).exists()]:
+        for name in [
+            n for n in managed if n not in plans and n not in to_retire and not (root / folder_name(slug, n)).exists()
+        ]:
             skills.pop(name, None)  # ya no está en disco ni en el servidor: se olvida
         tmp_root.mkdir(mode=0o700)
         for name in to_install:
             plan = plans[name]
             assert plan.manifest is not None
             try:
-                staged, files, omitted, dropped = _stage_skill(client, tmp_root, name, plan.manifest)
+                staged, files, omitted, dropped = _stage_skill(client, tmp_root, slug, name, plan.manifest)
             except NotAdaptable as exc:
                 result.excluded[name] = str(exc)
                 result.added = [n for n in result.added if n != name]
                 result.updated = [n for n in result.updated if n != name]
-                if name in managed and not _retire_managed(root, name, managed[name], opts, result):
+                if name in managed and not _retire_managed(root, slug, name, managed[name], opts, result):
                     continue
                 skills.pop(name, None)
                 continue
@@ -531,13 +573,14 @@ def _apply(
             except (PackageError, ScriptIntegrityError) as exc:
                 result.failed[name] = exc.message
                 continue
-            sync.swap_dir(staged, root / name, tmp_root / f"old-{name}")
+            folder = folder_name(slug, name)
+            sync.swap_dir(staged, root / folder, tmp_root / f"old-{folder}")
             _managed_state(skills, name, plan, files=files, omitted=omitted)
             if omitted:
                 result.omitted[name] = omitted
             if dropped:
                 result.notes.append(
-                    f"«{name}»: se quitan del SKILL.md los campos de Claude Code que {target.label} no documenta:"
+                    f"«{folder}»: se quitan del SKILL.md los campos de Claude Code que {target.label} no documenta:"
                     f" {', '.join(dropped)}."
                 )
     finally:
@@ -555,9 +598,11 @@ def _apply(
             write_control(root, org.slug, org.mcp_url, skills, warnings)
 
 
-def _retire_managed(root: Path, name: str, entry: dict[str, Any], opts: sync.SyncOptions, result: NativeResult) -> bool:
+def _retire_managed(
+    root: Path, org_slug: str, name: str, entry: dict[str, Any], opts: sync.SyncOptions, result: NativeResult
+) -> bool:
     """Retira una skill gestionada que ya no se puede instalar (salvo que el usuario la haya modificado)."""
-    final = root / name
+    final = root / folder_name(org_slug, name)
     if not (final.is_symlink() or final.exists()):
         return True
     change = local_changes(final, entry)
@@ -616,13 +661,20 @@ def cmd_sync_native(args: Any) -> int:
             print(line)
         if mcp_url and mcp_url != org.mcp_url:
             print(
-                f"AVISO: el MCP global de {target.label} apunta a otra organización ({mcp_url}): las skills y el"
-                " MCP no coincidirán. Para cambiar también el MCP: `setup antigravity --replace --org <slug>`."
+                f"AVISO: el MCP global de {target.label} apunta a otra organización ({mcp_url}): las skills de"
+                f" «{org.slug}» usarían las tools `baas_*` de esa otra organización y actuarían sobre ella (cada"
+                " SKILL.md lo recuerda al agente). El global solo admite un MCP: para cambiarlo,"
+                f" `setup antigravity --replace --org {org.slug}`."
+            )
+        elif not mcp_url:
+            print(
+                f"AVISO: no hay un servidor `baas` en el mcp_config.json global de {target.label}: las skills no"
+                f" podrán usar las tools `baas_*` hasta que ejecutes `setup antigravity --org {org.slug}`."
             )
         for warning in handshake.kill_switch_warnings(hs, org):
             print(f"AVISO: {warning}")
     if result.failed:
-        why = "; ".join(f"{n}: {w}" for n, w in sorted(result.failed.items()))
+        why = "; ".join(f"{result.cmd(n)}: {w}" for n, w in sorted(result.failed.items()))
         error = SyncIncompleteError(
             f"No se pudieron sincronizar {len(result.failed)} skill(s): {why}.",
             hint="El resto se aplicó. Avisa al administrador de la organización si persiste.",

@@ -30,7 +30,9 @@ Este proyecto está conectado a una organización de BaaS-AI-IP. Su conocimiento
 
 ## Skills de la organización y sus scripts
 
-Las skills de la organización pueden aparecer también en tu lista de skills de esta herramienta (y como `/<nombre>`): las copia el usuario con `baas.py sync --tool antigravity` en una terminal; no lo ejecutes tú. Llegan **sin sus scripts** y con la cabecera reducida a `name` y `description`, porque no se copia nada ejecutable a propósito. La versión vigente de una skill es siempre la de `baas_get_skill`.
+Las skills de la organización pueden aparecer también en tu lista de skills de esta herramienta, con el nombre `<organización>-<skill>` (por ejemplo `/demo-gestor`; puede haber skills de varias organizaciones): las copia el usuario con `baas.py sync --tool antigravity` en una terminal; no lo ejecutes tú. Llegan **sin sus scripts** y con la cabecera reducida a `name` y `description`, porque no se copia nada ejecutable a propósito. La versión vigente de una skill es siempre la de `baas_get_skill`.
+
+**Una skill nativa usa las tools `baas_*` del servidor MCP configurado, que puede ser de otra organización.** Antes de seguir una skill nativa, comprueba con `baas_whoami` que la organización es la de su prefijo. Si no lo es, o el MCP no está conectado, detente e informa al usuario: no sigas la skill con el MCP de otra organización y no uses el parámetro `org` para saltártelo.
 
 Los scripts de una skill de la organización **no se ejecutan desde esta herramienta**: no reconstruyas un script que falta con `baas_get_script` o `baas_get_skill_files`, ni copies su contenido a un fichero y lo ejecutes, porque se saltaría la comprobación del SHA-256 y el confinamiento que aplica el plugin. Si una skill necesita ejecutar un script, díselo al usuario y explícale qué script es y que esa skill no funciona completa en esta herramienta.
 

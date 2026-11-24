@@ -84,7 +84,9 @@ def test_the_doc_explains_the_native_skills_command_and_its_limits() -> None:
         "/skills reload",
         "sin sus scripts",
         "disable-model-invocation",
-        "sin prefijo",
+        "prefijo obligatorio",
+        "<slug>-<skill>",
+        ".baas-skills-<organización>.json",
         "--force",
         "no la toco",
         "SHA-256",
@@ -102,3 +104,17 @@ def test_the_doc_no_longer_lists_native_skills_as_a_follow_up_and_asks_to_check_
 def test_the_readme_mentions_the_native_skills_command() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "sync --tool antigravity" in readme
+
+
+def test_the_doc_states_the_multi_organization_limitation_and_recommends_an_option() -> None:
+    doc = text()
+    for needle in (
+        "Varias organizaciones, un solo MCP",
+        "baas-<slug>",
+        "actuaría sobre",
+        "baas_whoami",
+        "no documenta",
+        "`:`",
+        "Recomendada",
+    ):
+        assert needle in doc, needle

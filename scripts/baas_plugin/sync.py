@@ -45,7 +45,7 @@ import shutil
 import signal
 import sys
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -295,13 +295,16 @@ def resolve_plans(
     opts: SyncOptions,
     result: SyncResult,
     skills_dir: Path | None = None,
+    folder_of: Callable[[str], str] | None = None,
 ) -> dict[str, SkillPlan]:
     """Las skills que deben quedar instaladas: las listadas y, de forma transitiva, sus dependencias accesibles.
 
-    `skills_dir` es donde está cada skill (por omisión `<plugin_dir>/skills`); las skills nativas de otras
-    herramientas (`native_skills`) comparten esta resolución con otra carpeta.
+    `skills_dir` es donde está cada skill (por omisión `<plugin_dir>/skills`) y `folder_of` da el nombre de su carpeta
+    (por omisión, el de la skill); las skills nativas de otras herramientas (`native_skills`) comparten esta
+    resolución con otra carpeta y otros nombres.
     """
     base = skills_dir if skills_dir is not None else plugin_dir / "skills"
+    folder_of = folder_of or (lambda name: name)
     plans: dict[str, SkillPlan] = {}
     queue: deque[tuple[str, str | None]] = deque((name, None) for name in sorted(listed))
     unreachable: set[tuple[str, str]] = set()
@@ -317,7 +320,7 @@ def resolve_plans(
             continue
         entry = local.get(name)
         server_hash = listed.get(name)
-        intact = (base / name / "SKILL.md").is_file()
+        intact = (base / folder_of(name) / "SKILL.md").is_file()
         if not opts.force and entry and server_hash and entry.get("package_sha256") == server_hash and intact:
             deps = [d for d in entry.get("depends_on") or [] if isinstance(d, str)]
             plans[name] = SkillPlan(name, "keep", server_hash, depends_on=deps)

@@ -570,6 +570,9 @@ def test_the_rule_explains_native_skills_and_that_they_come_without_scripts(home
     assert run(setup(project), capsys)[0] == 0
     text = (project / RULE).read_text(encoding="utf-8")
     assert "sync --tool antigravity" in text
+    assert "<organización>-<skill>" in text, "el nombre del comando lleva el prefijo de la organización"
+    assert "baas_whoami" in text
+    assert "otra organización" in text, "una skill de otra organización no debe actuar con el MCP de esta"
     assert "sin sus scripts" in text
     assert "no lo ejecutes tú" in text, "traer contenido remoto al disco lo decide el usuario, no el agente"
     assert "baas_get_script" in text

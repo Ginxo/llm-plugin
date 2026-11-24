@@ -20,7 +20,12 @@ from fake_baas import FakeBaasServer, PkgFile, dev_api_key
 
 from baas_plugin import cli, envfile
 
-CONTROL = ".baas-skills.json"
+
+def control_name(org: str = "demo") -> str:
+    return f".baas-skills-{org}.json"
+
+
+CONTROL = control_name()  # el de la organización `demo`
 posix_only = pytest.mark.skipif(os.name != "posix", reason="los permisos POSIX solo se comprueban en POSIX")
 BINARY = bytes(range(256)) * 4  # no es UTF-8 válido
 
@@ -47,8 +52,8 @@ class Env:
         kwargs.setdefault("roles", ["analista"])
         return self.server.state.add_skill(org, name, files, **kwargs)
 
-    def control(self) -> dict:
-        return json.loads((self.root / CONTROL).read_text(encoding="utf-8"))
+    def control(self, org: str = "demo") -> dict:
+        return json.loads((self.root / control_name(org)).read_text(encoding="utf-8"))
 
     def tree(self, base: Path | None = None) -> dict[str, bytes]:
         base = base or self.root
@@ -86,9 +91,9 @@ def test_new_skill_is_installed_as_a_native_skill_with_a_control_file(env: Env) 
     pkg = env.publish()
     code, out = env.run()
     assert code == 0, out
-    skill = env.root / "facturacion" / "SKILL.md"
+    skill = env.root / "demo-facturacion" / "SKILL.md"
     meta = frontmatter(skill.read_text(encoding="utf-8"))
-    assert meta == {"name": "facturacion", "description": "Emite facturas"}
+    assert meta == {"name": "demo-facturacion", "description": "Emite facturas"}
     control = env.control()
     assert control["managed_by"] == "baas-llm-plugin"
     assert control["org"] == "demo"
@@ -96,8 +101,9 @@ def test_new_skill_is_installed_as_a_native_skill_with_a_control_file(env: Env) 
     recorded = {f["path"]: f["sha256"] for f in control["skills"]["facturacion"]["files"]}
     assert recorded == {"SKILL.md": sha(skill.read_bytes())}, "se registra lo escrito (ya adaptado), no lo del servidor"
     assert env.key not in json.dumps(control)
-    assert "+ facturacion" in out
+    assert "+ demo-facturacion" in out
     assert "/skills reload" in out
+    assert "/demo-facturacion" in out
     assert [p.name for p in env.root.iterdir() if p.name.startswith(".baas-tmp")] == []
 
 
@@ -112,7 +118,7 @@ def test_the_command_is_the_folder_name_and_other_files_of_the_skill_are_copied(
     )
     code, out = env.run()
     assert code == 0, out
-    base = env.root / "facturacion"
+    base = env.root / "demo-facturacion"
     assert (base / "references/normativa.md").read_text() == "# Normativa\n"
     assert (base / "templates/informe.docx").read_bytes() == BINARY
     assert (base / ".env.example").read_text() == "A=1\n"
@@ -137,9 +143,9 @@ def test_a_changed_skill_is_updated(env: Env) -> None:
     del pkg.files["old.md"]
     code, out = env.run()
     assert code == 0, out
-    assert "~ facturacion" in out
-    assert frontmatter((env.root / "facturacion/SKILL.md").read_text())["description"] == "v2"
-    assert not (env.root / "facturacion/old.md").exists()
+    assert "~ demo-facturacion" in out
+    assert frontmatter((env.root / "demo-facturacion/SKILL.md").read_text())["description"] == "v2"
+    assert not (env.root / "demo-facturacion/old.md").exists()
     assert env.control()["skills"]["facturacion"]["package_sha256"] == pkg.package_sha256
 
 
@@ -154,9 +160,9 @@ def test_a_revoked_skill_is_removed_and_the_users_own_skills_are_left_alone(env:
     env.server.state.skills["demo"]["gestor"].roles = ["otro-rol"]  # el usuario pierde el acceso
     code, out = env.run()
     assert code == 0, out
-    assert "- gestor" in out
-    assert not (env.root / "gestor").exists()
-    assert (env.root / "facturacion/SKILL.md").exists()
+    assert "- demo-gestor" in out
+    assert not (env.root / "demo-gestor").exists()
+    assert (env.root / "demo-facturacion/SKILL.md").exists()
     assert (mine / "SKILL.md").read_text() == "---\ndescription: mia\n---\nmia\n"
     assert (env.root / "notas.txt").read_text() == "mis notas"
     assert sorted(env.control()["skills"]) == ["facturacion"]
@@ -205,13 +211,15 @@ def test_skill_md_keeps_only_name_and_description_and_the_body_byte_for_byte(env
     env.publish(files={"SKILL.md": original})
     code, out = env.run()
     assert code == 0, out
-    written = (env.root / "facturacion/SKILL.md").read_text(encoding="utf-8")
+    written = (env.root / "demo-facturacion/SKILL.md").read_text(encoding="utf-8")
     meta = frontmatter(written)
     assert set(meta) == {"name", "description"}
-    assert meta["name"] == "facturacion", "el nombre es el de la carpeta, que es el del comando"
+    assert meta["name"] == "demo-facturacion", "el nombre es el de la carpeta, que es el del comando"
     assert "Use this skill to invoice. Second line: with colon." in meta["description"]
     assert "Cuando pidan una factura" in meta["description"]
-    assert written.endswith("---" + body)
+    assert written.endswith(body[1:]), "el cuerpo original queda intacto al final"
+    assert "baas_whoami" in written
+    assert "«demo»" in written, "avisa de con qué organización actúa la skill"
     for dropped in ("allowed-tools", "hooks", "argument-hint"):
         assert dropped in out, f"se avisa de que se quita {dropped}"
 
@@ -226,17 +234,17 @@ def test_a_skill_md_without_description_is_not_installed(env: Env, content: str)
     code, out = env.run()
     assert code == 12, out
     assert "description" in out
-    assert not (env.root / "facturacion").exists()
-    assert (env.root / "buena/SKILL.md").exists(), "el resto sí se instala"
+    assert not (env.root / "demo-facturacion").exists()
+    assert (env.root / "demo-buena/SKILL.md").exists(), "el resto sí se instala"
 
 
 def test_a_skill_that_asks_for_manual_invocation_only_is_not_installed(env: Env) -> None:
     env.publish(files={"SKILL.md": "---\nname: facturacion\ndescription: x\ndisable-model-invocation: true\n---\n#\n"})
     code, out = env.run()
     assert code == 0, out
-    assert not (env.root / "facturacion").exists()
+    assert not (env.root / "demo-facturacion").exists()
     assert "disable-model-invocation" in out
-    assert "facturacion" not in env.control()["skills"] if (env.root / CONTROL).exists() else True
+    assert not (env.root / CONTROL).exists() or "facturacion" not in env.control()["skills"]
 
 
 def test_a_managed_skill_that_becomes_manual_only_is_removed(env: Env) -> None:
@@ -245,7 +253,7 @@ def test_a_managed_skill_that_becomes_manual_only_is_removed(env: Env) -> None:
     pkg.files["SKILL.md"] = PkgFile(b"---\nname: facturacion\ndescription: x\ndisable-model-invocation: true\n---\n#\n")
     code, out = env.run()
     assert code == 0, out
-    assert not (env.root / "facturacion").exists()
+    assert not (env.root / "demo-facturacion").exists()
 
 
 # --- scripts: nunca listos para ejecutarse ----------------------------------------------------
@@ -269,7 +277,7 @@ def test_scripts_and_executables_are_not_copied_and_the_user_is_told(env: Env) -
     )
     code, out = env.run()
     assert code == 0, out
-    files = env.tree(env.root / "facturacion")
+    files = env.tree(env.root / "demo-facturacion")
     assert sorted(files) == ["SKILL.md", "references/a.md", "templates/informe.docx"]
     for rel in (
         "scripts/run.sh",
@@ -298,12 +306,12 @@ def test_scripts_and_executables_are_not_copied_and_the_user_is_told(env: Env) -
 def test_nothing_written_is_executable_and_modes_are_private(env: Env) -> None:
     env.publish(files={"SKILL.md": "---\nname: facturacion\ndescription: x\n---\n#\n", "references/a.md": "a"})
     assert env.run()[0] == 0
-    for dirpath, dirs, files in os.walk(env.root / "facturacion"):
+    for dirpath, dirs, files in os.walk(env.root / "demo-facturacion"):
         for d in dirs:
             assert stat.S_IMODE((Path(dirpath) / d).stat().st_mode) == 0o700
         for f in files:
             assert stat.S_IMODE((Path(dirpath) / f).stat().st_mode) == 0o600
-    assert stat.S_IMODE((env.root / "facturacion").stat().st_mode) == 0o700
+    assert stat.S_IMODE((env.root / "demo-facturacion").stat().st_mode) == 0o700
     assert stat.S_IMODE((env.root / CONTROL).stat().st_mode) == 0o600
     assert stat.S_IMODE(env.root.stat().st_mode) == 0o700  # la creó el plugin
 
@@ -311,25 +319,42 @@ def test_nothing_written_is_executable_and_modes_are_private(env: Env) -> None:
 # --- nombres ------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["Mi_Skill", "con", "mcp", "skills", "a.b", "Upper"])
+@pytest.mark.parametrize("name", ["Mi_Skill", "a.b", "Upper"])
 def test_names_antigravity_cannot_use_are_skipped_and_reported(env: Env, name: str) -> None:
     env.publish(name)
     env.publish("buena")
     code, out = env.run()
     assert code == 0, out
     assert name in out
-    assert not (env.root / name).exists()
-    assert (env.root / "buena/SKILL.md").exists()
+    assert not (env.root / f"demo-{name}").exists()
+    assert (env.root / "demo-buena/SKILL.md").exists()
 
 
-def test_no_organization_prefix_so_the_skills_own_links_keep_working(env: Env) -> None:
-    env.publish(
-        "facturacion", files={"SKILL.md": "---\nname: facturacion\ndescription: x\n---\n[g](../gestor/SKILL.md)\n"}
-    )
+@pytest.mark.parametrize("name", ["con", "mcp", "skills"])
+def test_with_the_prefix_a_skill_can_no_longer_clash_with_a_command_or_a_reserved_name(env: Env, name: str) -> None:
+    env.publish(name)
+    code, out = env.run()
+    assert code == 0, out
+    assert (env.root / f"demo-{name}/SKILL.md").exists()
+
+
+def test_the_folder_and_the_command_are_org_slug_dash_skill_and_never_use_a_colon(env: Env) -> None:
     env.publish("gestor")
     assert env.run()[0] == 0
-    assert (env.root / "facturacion/../gestor/SKILL.md").exists()
+    assert [p.name for p in env.root.iterdir() if not p.name.startswith(".")] == ["demo-gestor"]
+    meta = frontmatter((env.root / "demo-gestor/SKILL.md").read_text())
+    assert meta["name"] == "demo-gestor", "`:` no está documentado como válido en `name`: se usa el guion"
     assert ":" not in "".join(p.name for p in env.root.iterdir()), "ningún nombre lleva `:` (Windows)"
+
+
+def test_the_adapted_skill_md_tells_the_agent_which_organization_it_belongs_to(env: Env) -> None:
+    env.publish("gestor", files={"SKILL.md": "---\nname: gestor\ndescription: x\n---\n# Gestor\n"})
+    assert env.run()[0] == 0
+    written = (env.root / "demo-gestor/SKILL.md").read_text(encoding="utf-8")
+    note = written.split("\n---\n", 1)[1]
+    assert note.index("«demo»") < note.index("# Gestor"), "la nota va antes del cuerpo original"
+    assert "baas_whoami" in note
+    assert "Detente" in note, "con otro MCP configurado, la skill no debe actuar sobre otra organización"
 
 
 # --- choques con lo del usuario -----------------------------------------------------------------
@@ -338,7 +363,7 @@ def test_no_organization_prefix_so_the_skills_own_links_keep_working(env: Env) -
 def test_a_users_skill_with_the_same_name_is_never_touched(env: Env) -> None:
     env.publish("facturacion")
     env.publish("gestor")
-    mine = env.root / "facturacion"
+    mine = env.root / "demo-facturacion"
     mine.mkdir(parents=True)
     (mine / "SKILL.md").write_text("---\ndescription: la mia\n---\n")
     (mine / "extra.md").write_text("mio")
@@ -348,7 +373,7 @@ def test_a_users_skill_with_the_same_name_is_never_touched(env: Env) -> None:
     assert env.tree(mine) == before
     assert "facturacion" in out
     assert "no la toco" in out
-    assert (env.root / "gestor/SKILL.md").exists()
+    assert (env.root / "demo-gestor/SKILL.md").exists()
     assert "facturacion" not in env.control()["skills"], "lo ajeno no se registra como gestionado"
     again, out2 = env.run()
     assert again == 0, out2
@@ -362,10 +387,10 @@ def test_a_users_symlinked_skill_is_not_followed(env: Env, tmp_path: Path) -> No
     outside.mkdir()
     (outside / "SKILL.md").write_text("---\ndescription: ajena\n---\n")
     env.root.mkdir(parents=True)
-    (env.root / "facturacion").symlink_to(outside, target_is_directory=True)
+    (env.root / "demo-facturacion").symlink_to(outside, target_is_directory=True)
     code, out = env.run()
     assert code == 0, out
-    assert (env.root / "facturacion").is_symlink()
+    assert (env.root / "demo-facturacion").is_symlink()
     assert sorted(p.name for p in outside.iterdir()) == ["SKILL.md"]
     assert (outside / "SKILL.md").read_text() == "---\ndescription: ajena\n---\n"
 
@@ -380,13 +405,13 @@ def test_a_symlinked_skills_root_is_written_through(env: Env, tmp_path: Path) ->
     code, out = env.run()
     assert code == 0, out
     assert env.root.is_symlink()
-    assert (real / "facturacion/SKILL.md").exists()
+    assert (real / "demo-facturacion/SKILL.md").exists()
 
 
 def test_a_managed_skill_edited_by_the_user_is_not_overwritten_or_removed_without_force(env: Env) -> None:
     pkg = env.publish()
     assert env.run()[0] == 0
-    skill = env.root / "facturacion"
+    skill = env.root / "demo-facturacion"
     (skill / "SKILL.md").write_text("---\ndescription: editada\n---\nmi version\n")
     (skill / "mio.md").write_text("mio")
     pkg.files["SKILL.md"] = PkgFile(b"---\nname: facturacion\ndescription: nueva\n---\n#\n")
@@ -408,15 +433,15 @@ def test_force_overwrites_a_modified_managed_skill_but_never_a_foreign_one(env: 
     pkg = env.publish()
     env.publish("gestor")
     assert env.run()[0] == 0
-    (env.root / "facturacion/SKILL.md").write_text("editada")
-    mine = env.root / "propia"
+    (env.root / "demo-facturacion/SKILL.md").write_text("editada")
+    mine = env.root / "demo-propia"
     mine.mkdir()
     (mine / "SKILL.md").write_text("propia")
     env.publish("propia")
     pkg.files["SKILL.md"] = PkgFile(b"---\nname: facturacion\ndescription: nueva\n---\n#\n")
     code, out = env.run("--force")
     assert code == 0, out
-    assert frontmatter((env.root / "facturacion/SKILL.md").read_text())["description"] == "nueva"
+    assert frontmatter((env.root / "demo-facturacion/SKILL.md").read_text())["description"] == "nueva"
     assert (mine / "SKILL.md").read_text() == "propia"
 
 
@@ -428,14 +453,14 @@ def test_a_symlink_inside_a_managed_skill_counts_as_a_modification_and_is_never_
     assert env.run()[0] == 0
     outside = tmp_path / "secreto.txt"
     outside.write_text("no tocar")
-    (env.root / "facturacion/enlace").symlink_to(outside)
+    (env.root / "demo-facturacion/enlace").symlink_to(outside)
     pkg.files["SKILL.md"] = PkgFile(b"---\nname: facturacion\ndescription: nueva\n---\n#\n")
     code, out = env.run()
     assert code == 0, out
-    assert (env.root / "facturacion/enlace").is_symlink()
+    assert (env.root / "demo-facturacion/enlace").is_symlink()
     code, out = env.run("--force")
     assert code == 0, out
-    assert not (env.root / "facturacion/enlace").exists()
+    assert not (env.root / "demo-facturacion/enlace").exists()
     assert outside.read_text() == "no tocar"
 
 
@@ -450,10 +475,10 @@ def test_a_path_outside_the_skill_in_the_manifest_installs_nothing_of_it(env: En
     code, out = env.run()
     assert code == 12, out
     assert "facturacion" in out
-    assert not (env.root / "facturacion").exists()
+    assert not (env.root / "demo-facturacion").exists()
     assert not (env.root.parent / "escape.txt").exists()
     assert not (tmp_path / "escape.txt").exists()
-    assert (env.root / "buena/SKILL.md").exists()
+    assert (env.root / "demo-buena/SKILL.md").exists()
 
 
 def test_a_wrong_hash_keeps_the_previous_version(env: Env) -> None:
@@ -473,7 +498,7 @@ def test_a_wrong_hash_on_a_new_skill_leaves_nothing(env: Env) -> None:
     pkg.files["SKILL.md"] = PkgFile(b"hola", sha256_override="1" * 64)
     code, out = env.run()
     assert code == 12, out
-    assert not (env.root / "facturacion").exists()
+    assert not (env.root / "demo-facturacion").exists()
 
 
 def test_a_package_without_skill_md_is_not_installed(env: Env) -> None:
@@ -483,19 +508,19 @@ def test_a_package_without_skill_md_is_not_installed(env: Env) -> None:
     code, out = env.run()
     assert code == 12, out
     assert "SKILL.md" in out
-    assert not (env.root / "facturacion").exists()
+    assert not (env.root / "demo-facturacion").exists()
 
 
 def test_a_corrupt_control_file_aborts_without_touching_anything(env: Env) -> None:
     env.publish()
     env.root.mkdir(parents=True)
     (env.root / CONTROL).write_text("{no es json")
-    (env.root / "facturacion").mkdir()
-    (env.root / "facturacion/SKILL.md").write_text("mia")
+    (env.root / "demo-facturacion").mkdir()
+    (env.root / "demo-facturacion/SKILL.md").write_text("mia")
     code, out = env.run()
     assert code == 13, out
     assert (env.root / CONTROL).read_text() == "{no es json"
-    assert (env.root / "facturacion/SKILL.md").read_text() == "mia"
+    assert (env.root / "demo-facturacion/SKILL.md").read_text() == "mia"
 
 
 # --- dependencias -------------------------------------------------------------------------------
@@ -507,8 +532,8 @@ def test_dependencies_the_user_cannot_read_are_warned_and_not_granted(env: Env) 
     code, out = env.run()
     assert code == 0, out
     assert "secreta" in out
-    assert (env.root / "principal/SKILL.md").exists()
-    assert not (env.root / "secreta").exists()
+    assert (env.root / "demo-principal/SKILL.md").exists()
+    assert not (env.root / "demo-secreta").exists()
 
 
 # --- modo de ensayo, red y organización ----------------------------------------------------------
@@ -519,7 +544,7 @@ def test_dry_run_writes_nothing_and_shows_what_would_happen(env: Env) -> None:
     code, out = env.run("--dry-run")
     assert code == 0, out
     assert "Simulación" in out
-    assert "+ facturacion" in out
+    assert "+ demo-facturacion" in out
     assert not (env.home / ".gemini").exists()
 
 
@@ -536,42 +561,99 @@ def test_quiet_fails_open_when_the_mcp_is_down_and_touches_nothing(env: Env) -> 
     assert env.tree() == before
 
 
-def test_several_organizations_need_an_explicit_choice_and_nothing_is_written(env: Env) -> None:
+def multi(env: Env) -> None:
+    """El usuario `multi@demo.test` es miembro de `demo` y de `otra`; las dos tienen una skill `gestor`."""
     envfile.update_env(envfile.BaasPaths.default(), {"BAAS_API_KEY": dev_api_key("multi@demo.test")})
-    env.publish("de-demo")
-    env.publish("de-otra", org="otra")
+    env.publish("gestor")
+    env.publish("gestor", org="otra")
+
+
+def test_several_organizations_need_an_explicit_choice_and_nothing_is_written(env: Env) -> None:
+    multi(env)
     code, out = env.run()
     assert code == 3, out
     assert "--org" in out
     assert not (env.home / ".gemini").exists()
     code, out = env.run("--org", "otra")
     assert code == 0, out
-    assert (env.root / "de-otra/SKILL.md").exists()
-    assert not (env.root / "de-demo").exists()
-    assert env.control()["org"] == "otra"
+    assert (env.root / "otra-gestor/SKILL.md").exists()
+    assert not (env.root / "demo-gestor").exists()
+    assert env.control("otra")["org"] == "otra"
 
 
 def test_the_organization_of_the_global_mcp_entry_is_the_default(env: Env) -> None:
-    envfile.update_env(envfile.BaasPaths.default(), {"BAAS_API_KEY": dev_api_key("multi@demo.test")})
-    env.publish("de-demo")
-    env.publish("de-otra", org="otra")
+    multi(env)
     config = env.home / ".gemini" / "config" / "mcp_config.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({"mcpServers": {"baas": {"serverUrl": f"{env.server.url}/org/otra/mcp"}}}))
     code, out = env.run()
     assert code == 0, out
-    assert (env.root / "de-otra/SKILL.md").exists()
+    assert (env.root / "otra-gestor/SKILL.md").exists()
 
 
-def test_switching_organization_retires_the_previous_organizations_skills(env: Env) -> None:
-    envfile.update_env(envfile.BaasPaths.default(), {"BAAS_API_KEY": dev_api_key("multi@demo.test")})
-    env.publish("de-demo")
-    env.publish("de-otra", org="otra")
+def test_skills_of_several_organizations_live_together_with_their_own_control_files(env: Env) -> None:
+    multi(env)
     assert env.run("--org", "demo")[0] == 0
-    code, out = env.run("--org", "otra")
+    assert env.run("--org", "otra")[0] == 0
+    assert sorted(p.name for p in env.root.iterdir() if not p.name.startswith(".")) == ["demo-gestor", "otra-gestor"]
+    assert sorted(p.name for p in env.root.iterdir() if p.name.startswith(".baas-skills")) == [
+        control_name("demo"),
+        control_name("otra"),
+    ]
+    assert sorted(env.control("demo")["skills"]) == ["gestor"]
+    assert sorted(env.control("otra")["skills"]) == ["gestor"]
+    assert "baas_whoami" in (env.root / "otra-gestor/SKILL.md").read_text()
+    assert "«otra»" in (env.root / "otra-gestor/SKILL.md").read_text()
+
+
+def test_syncing_one_organization_never_touches_the_skills_or_the_control_of_another(env: Env) -> None:
+    multi(env)
+    assert env.run("--org", "demo")[0] == 0
+    assert env.run("--org", "otra")[0] == 0
+    other = env.tree(env.root / "otra-gestor")
+    control = env.root / control_name("otra")
+    stamp = (control.stat().st_ino, control.stat().st_mtime_ns)
+    env.server.state.skills["demo"]["gestor"].roles = ["otro-rol"]  # el usuario pierde `gestor` en demo
+    code, out = env.run("--org", "demo")
     assert code == 0, out
-    assert not (env.root / "de-demo").exists()
-    assert (env.root / "de-otra/SKILL.md").exists()
+    assert "- demo-gestor" in out
+    assert not (env.root / "demo-gestor").exists()
+    assert env.tree(env.root / "otra-gestor") == other
+    assert (control.stat().st_ino, control.stat().st_mtime_ns) == stamp
+    assert env.control("demo")["skills"] == {}
+    assert sorted(env.control("otra")["skills"]) == ["gestor"]
+
+
+def test_the_kill_switch_of_one_organization_retires_only_its_skills(env: Env) -> None:
+    multi(env)
+    assert env.run("--org", "demo")[0] == 0
+    assert env.run("--org", "otra")[0] == 0
+    env.server.state.orgs["demo"].blocked = True
+    code, out = env.run("--org", "demo")
+    assert code == 0, out
+    assert "KILL_SWITCH_ACTIVE" in out
+    assert not (env.root / "demo-gestor").exists()
+    assert (env.root / "otra-gestor/SKILL.md").exists()
+
+
+def test_an_org_with_a_slug_that_is_a_prefix_of_another_cannot_overwrite_its_folder(env: Env) -> None:
+    """`demo` + `x-y` y `demo-x` + `y` dan la misma carpeta, `demo-x-y`: la segunda organización la ve como ajena."""
+    from fake_baas import Membership, OrgState
+
+    envfile.update_env(envfile.BaasPaths.default(), {"BAAS_API_KEY": dev_api_key("multi@demo.test")})
+    env.server.state.orgs["demo-x"] = OrgState("demo-x", "Demo X")
+    env.server.state.skills["demo-x"] = {}
+    user = next(u for u in env.server.state.users if u.email == "multi@demo.test")
+    user.memberships.append(Membership("demo-x", "USER", ["analista"]))
+    env.publish("x-y", files={"SKILL.md": "---\nname: x-y\ndescription: de demo\n---\n"})
+    env.publish("y", org="demo-x", files={"SKILL.md": "---\nname: y\ndescription: de demo-x\n---\n"})
+    assert env.run("--org", "demo")[0] == 0
+    before = env.tree(env.root / "demo-x-y")
+    code, out = env.run("--org", "demo-x")
+    assert code == 0, out
+    assert "no la toco" in out
+    assert env.tree(env.root / "demo-x-y") == before
+    assert not (env.root / control_name("demo-x")).exists(), "no se registra como suya una carpeta ajena"
 
 
 def test_an_explicit_organization_different_from_the_global_mcp_entry_is_warned(env: Env) -> None:
@@ -584,6 +666,7 @@ def test_an_explicit_organization_different_from_the_global_mcp_entry_is_warned(
     assert code == 0, out
     assert "AVISO" in out
     assert "MCP global" in out
+    assert "otra organización" in out
 
 
 def test_without_key_nothing_is_written(env: Env) -> None:
@@ -637,14 +720,14 @@ def test_a_managed_skill_replaced_by_a_symlink_is_not_followed_or_replaced(env: 
     pkg = env.publish()
     assert env.run()[0] == 0
     moved = tmp_path / "movida"
-    (env.root / "facturacion").rename(moved)
-    (env.root / "facturacion").symlink_to(moved, target_is_directory=True)  # mismo contenido, pero es un enlace
+    (env.root / "demo-facturacion").rename(moved)
+    (env.root / "demo-facturacion").symlink_to(moved, target_is_directory=True)  # mismo contenido, pero es un enlace
     before = env.tree(moved)
     pkg.files["SKILL.md"] = PkgFile(b"---\nname: facturacion\ndescription: nueva\n---\n#\n")
     code, out = env.run()
     assert code == 0, out
     assert "enlace simbólico" in out
-    assert (env.root / "facturacion").is_symlink()
+    assert (env.root / "demo-facturacion").is_symlink()
     assert env.tree(moved) == before
 
 
@@ -660,3 +743,11 @@ def test_an_unchanged_sync_rewrites_nothing_not_even_the_control_file(env: Env, 
     assert code == 0, out
     assert env.tree() == before
     assert (control.stat().st_ino, control.stat().st_mtime_ns) == stamp, "un ciclo sin novedades no escribe"
+
+
+def test_without_a_global_mcp_entry_the_user_is_told_the_skills_cannot_use_the_tools(env: Env) -> None:
+    env.publish()
+    code, out = env.run()
+    assert code == 0, out
+    assert "no hay un servidor `baas`" in out
+    assert "setup antigravity --org demo" in out
